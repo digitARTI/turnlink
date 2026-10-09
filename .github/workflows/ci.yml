@@ -29,6 +29,9 @@ jobs:
           cache: false
       - run: npm ci --ignore-scripts
       - run: npm run check
+      - name: Synthetic Windows helper invocation matrix
+        if: runner.os == 'Windows'
+        run: node deploy/diagnose-acl-helper.js
       - name: Compile Windows launcher
         shell: bash
         run: mkdir -p dist && GOOS=windows GOARCH=amd64 go -C launcher build -trimpath -o ../dist/agent-channel-codex.exe .
