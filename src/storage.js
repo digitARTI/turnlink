@@ -1,5 +1,5 @@
 import { constants, openSync, closeSync, writeFileSync, fsyncSync, renameSync, unlinkSync,
-  mkdirSync, lstatSync, fstatSync, readFileSync } from 'node:fs';
+  mkdirSync, mkdtempSync, lstatSync, fstatSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import lockfile from 'proper-lockfile';
@@ -17,6 +17,14 @@ function windowsPermissions(path, created = false) {
     { windowsHide: true, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
     verifiedWindows.add(path);
   } catch { throw new Error('Private Windows path needs owner/administrator/SYSTEM-only ACLs'); }
+}
+// Only a newly and exclusively created directory may have its ACL initialized.
+// Existing caller-supplied directories retain fail-closed verification.
+export function privateTemp(prefix) {
+  const path = mkdtempSync(prefix);
+  windowsPermissions(path, true);
+  privateDirectory(path);
+  return path;
 }
 
 export function privateDirectory(path) {

@@ -36,6 +36,17 @@ jobs:
         shell: bash
         run: GOOS=windows GOARCH=amd64 go -C launcher vet ./...
       - run: npm test
+      - name: Windows ACL helper diagnostics
+        if: failure() && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP ('turnlink-acl-diagnostic-' + [Guid]::NewGuid())
+          New-Item -ItemType Directory -Path $path | Out-Null
+          try {
+            & ./src/windows-permissions.ps1 -Path $path -Created true
+          } finally {
+            Remove-Item -LiteralPath $path -Recurse -Force
+          }
       - run: npm audit --audit-level=high
   secrets:
     runs-on: ubuntu-latest
