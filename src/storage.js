@@ -15,7 +15,9 @@ function windowsPermissions(path, created = false) {
   // Use only the matching Windows PowerShell built-in modules. A pwsh parent
   // can otherwise supply incompatible modules or a slow profile lookup path.
   for (const key of Object.keys(env)) if (['PSMODULEPATH', 'PSMODULEANALYSISCACHEPATH'].includes(key.toUpperCase())) delete env[key];
-  env.PSModulePath = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'Modules');
+  // Module auto-discovery is disabled; the helper imports its required system
+  // assemblies explicitly from $PSHOME.
+  env.PSModulePath = '';
   try {
     execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
       fileURLToPath(new URL('./windows-permissions.ps1', import.meta.url)), '-Path', path, '-Created', created ? 'true' : 'false'],
