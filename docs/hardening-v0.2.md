@@ -1,6 +1,6 @@
 # Protocol v2 hardening and migration
 
-Status: unreleased candidate. The active development bus remains on v0.1 until a coordinated adapter reload and fresh migration snapshot. Private vulnerability reporting is enabled on GitHub. The new workflow files must be committed/pushed before GitHub CI can run.
+Status: unreleased candidate. The v2 broker is staged alongside v0.1 for coordinated reload and wake verification. Private vulnerability reporting is enabled on GitHub. Published GitHub CI passed on Linux/macOS/Windows with Node22/24, including secret scanning.
 
 ## Ownership and trust
 
@@ -111,4 +111,8 @@ Review profile/root paths first. The resolver discovers installed official exten
 
 ## Verification
 
-The suite has 48 cases. The staged Windows installation passed its full 46-case run, followed by all 10 affected recovery/native-launcher cases after two final diagnostics/recursion tests were added. These use temporary fixture brokers/keys and no model tasks. Real-model v2 cutover and GitHub CI remain separate checks.
+The current suite has 53 cases. Earlier staged Windows verification passed 46 cases plus the affected recovery/native checks; subsequent published CI passed the complete current suite on supported platforms. Windows cases skip on other platforms. Real-model v2 cutover remains separate from fixture/CI results.
+
+## Recorded live cutover staging
+
+The active fleet has a separately supervised v2 broker on workstation loopback `47323` and game-server SSH-forwarded loopback `47324`. v0.1 remains on `47321`/`47322` for coordination/rollback until the live wake proof passes. Fresh credentials are bound to `workstation` and `gameserver`; the remote hello verified protocol2/hostId=gameserver/admin=false. Mac plugin options and Windows launcher/MCP configuration are journaled. Manual reload/resume of the same conversations is required; no game/client/FXServer/bridge lifecycle restart is part of this adapter transition.

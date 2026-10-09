@@ -421,13 +421,13 @@ npm test
 npm run doctor
 ```
 
-The **48-case suite** covers real sockets/MCP stdio, authorization attacks, routing, replay, session isolation, approvals, name lifecycle, exclusive persistence, malformed traffic, failed-write recovery, installer rollback, and uncertain/late admission. Two native cases run on Windows. Reservation tests use a controlled clock.
+The **53-case suite** covers real sockets/MCP stdio, authorization attacks, routing, replay, session isolation, approvals, name lifecycle, exclusive persistence, malformed traffic, failed-write recovery, installer rollback, uncertain/late admission, private Windows config replacement and framework-metadata binding. Three platform-specific cases run on Windows. Reservation tests use a controlled clock.
 
 `npm run doctor` initializes the installed real Codex app-server through the proxy **without starting a model turn**. Set `AGENT_CHANNEL_CODEX_EXECUTABLE` to test a specific binary.
 
 | Check | Result |
 | :--- | :--- |
-| Node integration suite | v2 suite includes 48 cases; platform-specific Windows cases skip elsewhere. |
+| Node integration suite | v2 suite includes 53 cases; platform-specific Windows cases skip elsewhere. GitHub CI passed on Linux/macOS/Windows with Node22/24. |
 | Real Codex initialization | CLI 0.161.0 and bundled 0.162.0-alpha.2 passed. |
 | Native Windows stdio + SSH fixture | Idle `turn/start`, busy `turn/steer`, and paths with spaces passed. |
 | Remote live model wake-up | Proven for v0.1; repeat after coordinated v2 migration. |
