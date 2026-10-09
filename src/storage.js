@@ -20,9 +20,9 @@ function windowsPermissions(path, created = false) {
   env.PSModulePath = '';
   try {
     execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
-      fileURLToPath(new URL('./windows-permissions.ps1', import.meta.url)), '-Path', path, '-Created', created ? 'true' : 'false'],
+      fileURLToPath(new URL('./windows-permissions.ps1', import.meta.url)), '-Path', path, '-Created', created === true ? 'true' : created === 'file' ? 'file' : 'false'],
     { env, windowsHide: true, timeout: 10000, stdio: ['ignore', 'ignore', 'ignore'] });
-    verifiedWindows.add(path);
+    if (created !== 'file') verifiedWindows.add(path);
   } catch { throw new Error('Private Windows path needs owner/administrator/SYSTEM-only ACLs'); }
 }
 // Only a newly and exclusively created directory may have its ACL initialized.
@@ -70,6 +70,7 @@ export function atomicWrite(path, value) {
   let fd;
   try {
     fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    if (process.platform === 'win32' && !verifiedWindows.has(dirname(path))) windowsPermissions(temporary, 'file');
     writeFileSync(fd, value); fsyncSync(fd); closeSync(fd); fd = undefined;
     renameSync(temporary, path);
     // Windows does not support fsync on directories. Unix rename durability does.
