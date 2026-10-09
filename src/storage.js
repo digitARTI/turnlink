@@ -11,10 +11,14 @@ const verifiedWindows = new Set();
 function windowsPermissions(path, created = false) {
   if (process.platform !== 'win32' || verifiedWindows.has(path)) return;
   const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const env = { ...process.env };
+  // A parent pwsh 7 process may supply module paths incompatible with the
+  // Windows PowerShell 5 ACL helper. Let that shell build its own defaults.
+  for (const key of Object.keys(env)) if (['PSMODULEPATH', 'PSMODULEANALYSISCACHEPATH'].includes(key.toUpperCase())) delete env[key];
   try {
     execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
       fileURLToPath(new URL('./windows-permissions.ps1', import.meta.url)), '-Path', path, '-Created', created ? 'true' : 'false'],
-    { windowsHide: true, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
+    { env, windowsHide: true, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
     verifiedWindows.add(path);
   } catch { throw new Error('Private Windows path needs owner/administrator/SYSTEM-only ACLs'); }
 }

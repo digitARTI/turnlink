@@ -44,6 +44,7 @@ jobs:
           New-Item -ItemType Directory -Path $path | Out-Null
           try {
             & ./src/windows-permissions.ps1 -Path $path -Created true
+            node -e "const cp=require('node:child_process'),path=require('node:path'); try { cp.execFileSync(path.join(process.env.SystemRoot||'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe'), ['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',path.resolve('src/windows-permissions.ps1'),'-Path',process.argv[1],'-Created','true'], {stdio:'inherit'}); } catch(e) {console.log('Synthetic helper status:',e.status,e.code);process.exitCode=1;}" $path
           } finally {
             Remove-Item -LiteralPath $path -Recurse -Force
           }
