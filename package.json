@@ -1,14 +1,15 @@
 {
   "name": "turnlink",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.22.2"
   },
   "scripts": {
     "start": "node src/broker.js",
-    "test": "node --test test/*.test.js",
+    "test": "node src/run-tests.js",
+    "check": "node src/check-source.js",
     "mcp": "node src/mcp.js",
     "doctor": "node src/doctor.js"
   },
@@ -16,6 +17,7 @@
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@opencode-ai/plugin": "^1.3.0",
     "jsonc-parser": "^3.3.1",
+    "proper-lockfile": "^4.1.2",
     "smol-toml": "^1.9.0",
     "ws": "^8.18.0",
     "zod": "^4.0.0"

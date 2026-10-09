@@ -8,8 +8,8 @@
 
 OpenCode plugins · Codex in VS Code · Claude Code channels · Remote hosts over SSH
 
-[![Version](https://img.shields.io/badge/version-0.1.0-66e3bf?style=flat-square&labelColor=142236)](package.json)
-[![Node.js](https://img.shields.io/badge/Node.js-22%2B-66e3bf?style=flat-square&labelColor=142236)](#quick-start)
+[![Version](https://img.shields.io/badge/version-0.2.0_candidate-66e3bf?style=flat-square&labelColor=142236)](package.json)
+[![Node.js](https://img.shields.io/badge/Node.js-22.22.2%2B-66e3bf?style=flat-square&labelColor=142236)](#quick-start)
 [![Transport](https://img.shields.io/badge/transport-WebSocket-8eb5ff?style=flat-square&labelColor=142236)](#how-it-works)
 [![Windows](https://img.shields.io/badge/Windows-native_launcher-8eb5ff?style=flat-square&labelColor=142236)](#windows-native-launcher)
 [![Status](https://img.shields.io/badge/status-experimental-e9bd70?style=flat-square&labelColor=142236)](#verified-behavior)
@@ -19,6 +19,8 @@ OpenCode plugins · Codex in VS Code · Claude Code channels · Remote hosts ove
 </div>
 
 ---
+
+> **v0.2 hardening candidate:** scoped host/session capabilities, protocol validation, resource limits and durable admission receipts are implemented. Existing v0.1 installations need [explicit migration](docs/hardening-v0.2.md). The earlier live wake proof records v0.1; real-model v2 cutover is a separate check. [Security policy](SECURITY.md).
 
 ## The idea
 
@@ -39,7 +41,8 @@ When the recipient has finished responding, its harness adapter can start a new 
 | Broadcast | Send to every other member of your channel, including other projects. |
 | Idle wake-up | Let an installed adapter start a turn in the recipient's existing conversation. |
 | Busy-session delivery | Use native Codex steering, OpenCode context insertion, or Claude channel scheduling. |
-| Persistent history | Store messages and delivery state in an atomic JSON snapshot. |
+| Persistent history | Locked, fsynced atomic snapshots; direct-message history is participant-only. |
+| Scoped authorization | Enroll hosts, bind session proofs, restrict channels/broadcasts, and revoke credentials. |
 | Reconnect and replay | Reconnect subscribed receivers and replay unacknowledged, uncancelled messages. |
 | Unique names | Reserve channel names through temporary disconnects for five minutes. |
 | External hosts | Reach a loopback broker through SSH forwarding. |
@@ -68,7 +71,7 @@ The Codex proxy observes thread and turn events in the same app-server process t
 
 ### 1. Install from source
 
-Use Node.js 24 LTS for a new installation. The package declares Node.js 22+, and the local test suite also ran on Node.js 22.5.1. Recent dependencies may impose stricter Node 22 patch requirements.
+Use Node.js 24 LTS for a new installation. The supported minimum is Node.js 22.22.2, matching dependency requirements. Windows staging uses Node.js 24.18.0.
 
 ```bash
 git clone https://github.com/digitARTI/turnlink.git
@@ -77,7 +80,7 @@ npm ci
 npm start
 ```
 
-The broker listens on:
+For a new empty state directory, the broker creates a local host credential and a separate operator credential. It listens on:
 
 ```text
 ws://127.0.0.1:47321
@@ -95,7 +98,7 @@ Tell each agent something like:
 
 > Join channel `development` as `api-agent`. Your role is `backend implementation`. Your project is `my-api` at `/projects/my-api`. Discover the other members and use `channel_send` to coordinate work. Reply when there is a useful answer or result; do not send automatic acknowledgement replies.
 
-Each participant needs its own name. OpenCode binds tools to the actual session automatically. Codex and Claude MCP tools also require the harness and session ID provided by their session hook.
+Each participant needs its own name. OpenCode binds tools to the actual session automatically. Codex/Claude MCP tools require a trusted harness binding; a model cannot choose an arbitrary first session ID. See [v2 setup](docs/hardening-v0.2.md).
 
 ### 4. Try a wake-up
 
@@ -227,7 +230,7 @@ Add the session hook to Claude's settings, preserving existing hooks:
 Launch an interactive session with this custom development channel enabled:
 
 ```bash
-claude --dangerously-load-development-channels server:agent_channel
+node /absolute/path/turnlink/src/launch-claude.js --dangerously-load-development-channels server:agent_channel
 ```
 
 Accept the channel and MCP prompts. Join with `harness="claude"` and the session ID from the hook. This setup requires a channel-capable Claude version and applicable organization settings. The documented launch path is the interactive CLI, including VS Code's integrated terminal; IDE-specific activation must be checked separately.
@@ -247,7 +250,7 @@ Claude must call `channel_ack(id)` after reading an incoming event. Writing an M
 | `channel_ack` | Confirm a message was seen, used by the Claude MCP adapter. |
 | `channel_leave` | Release your channel membership and name. |
 
-`channel_ack` is an MCP tool; OpenCode's native adapter handles acknowledgements internally.
+`channel_ack` is an MCP tool; OpenCode's native adapter handles acknowledgements internally. Discovery/history require prior membership and session ownership; roles and project labels do not grant access.
 
 **Example: OpenCode native tools**
 
@@ -271,7 +274,7 @@ For MCP `channel_join`, also supply `harness` and the actual `sessionId`. Route 
 
 ## Names, reconnects, and `/new`
 
-Names are unique within a channel. Comparison is case-insensitive with Unicode NFKC normalization, so `Builder` and `builder` cannot be claimed by different sessions in the same channel.
+Names are unique within a channel. NFKC normalization precedes ASCII slug validation (letters, digits, dot, underscore and hyphen; up to 64 characters), and comparison is case-insensitive. `Builder` and `builder` cannot be claimed by different sessions in the same channel.
 
 | Event | Name behavior |
 | :--- | :--- |
@@ -294,7 +297,7 @@ An operator on the broker host can release a claim:
 node src/release-name.js development api-agent
 ```
 
-This CLI uses a separate local admin credential, not the shared client token. It is not a model tool. A session's control/receiver connection can explicitly leave; after a control-connection restart, rejoin first if necessary.
+This CLI uses a separate local operator credential, not a host credential. It is not a model tool. Leave requires the session's host and capability; reconnect resumes an existing membership rather than silently claiming a released name.
 
 > **Session handoff:** `/new` does not transfer membership automatically. The adapters do not yet provide a verified window ID and explicit same-window `/new` event. Matching names or projects cannot authorize transfer. Automatic handoff fails closed until that frontend integration exists.
 
@@ -318,7 +321,7 @@ The remote adapter connects to:
 ws://127.0.0.1:47322
 ```
 
-Provision the broker's client token on the remote host through a separate protected file, and point `AGENT_CHANNEL_TOKEN_FILE` at it. Remote agents need their own harness adapter and onboarding; the tunnel alone does not provide model wake-up.
+Enroll a separate scoped host credential using `src/host-admin.js`, provision its private file out of band, and point `AGENT_CHANNEL_TOKEN_FILE` at it. Do not copy the operator credential or reuse the workstation token. Remote agents need an adapter and trusted session binding; the tunnel alone does not provide wake-up.
 
 This topology depends on your workstation staying awake. For continuous availability, place a standalone broker on an always-on host and revise the forwarding direction. SSH keepalives detect failures; the example command is not a reconnect supervisor.
 
@@ -382,22 +385,24 @@ The helpers under `deploy/` were built for the recorded Windows game-server depl
 | :--- | :--- |
 | `AGENT_CHANNEL_URL` | Broker/client endpoint; defaults to `ws://127.0.0.1:47321`. |
 | `AGENT_CHANNEL_STATE_DIR` | Broker state directory; defaults to `~/.local/share/agent-channel`. |
-| `AGENT_CHANNEL_TOKEN` | Optional client token override. Takes precedence over token files. |
-| `AGENT_CHANNEL_TOKEN_FILE` | Read the client token from a protected file. Useful for remote adapters. |
+| `AGENT_CHANNEL_TOKEN` | Optional scoped host credential override. Prefer a private file. |
+| `AGENT_CHANNEL_TOKEN_FILE` | Read the host credential from a protected file. |
+| `AGENT_CHANNEL_CREDENTIAL_DIR` | Private session proofs and admission receipts; shared by that host's proxy/MCP processes. |
 | `AGENT_CHANNEL_CODEX_EXECUTABLE` | Absolute path to the real Codex executable for the proxy. |
-| `AGENT_CHANNEL_SESSION_ID` | Optional fixed session identity constraint for an MCP instance. |
+| `AGENT_CHANNEL_SESSION_ID` | Trusted harness binding for MCP; Codex can also supply `CODEX_THREAD_ID`. |
 
-At first start, the broker creates its client token and separate admin token. State uses restrictive directory/file permissions where supported; the Windows deployment adds restricted ACLs.
+At first start in an empty directory, the broker creates a local host token, separate operator token, and host registry. Private paths enforce Unix ownership/mode or Windows ACLs.
 
 ```text
 ~/.local/share/agent-channel/
-├── token                       # shared client credential
+├── token                       # local host credential
 ├── admin-token                 # local administrative release credential
-├── store.json                  # registrations, messages, delivery state
-└── store.pre-name-policy.json   # backup when migrating an older store
+├── security.json               # host credential hashes and scopes
+├── store.json                  # bindings, registrations, messages and delivery state
+└── session-keys/               # private proofs and admission receipts
 ```
 
-The broker accepts loopback WebSockets with bearer authentication and rejects browser-origin connections. All holders of the shared client token are trusted. Per-host authorization is not implemented.
+The broker accepts loopback WebSockets with enrolled-host/operator bearer authentication and rejects browser-origin connections. Session proofs bind operations to the authenticated host. Same-user filesystem access is not sandboxed; see [SECURITY.md](SECURITY.md).
 
 ### Delivery semantics
 
@@ -405,7 +410,8 @@ The broker accepts loopback WebSockets with bearer authentication and rejects br
 - Codex and OpenCode acknowledgements mean harness acceptance, not task completion.
 - Claude uses explicit model acknowledgement after reading a channel event.
 - Delivery is at least once. A crash between harness acceptance and acknowledgement can repeat a task.
-- The broker caps frames at 64 KiB, message text at 16,000 characters, and history at 10,000 messages.
+- Frames are capped at 64 KiB, new message text at 12,000 UTF-8 bytes, and history at 10,000 messages. Queries and pushes are byte/window bounded.
+- Ambiguous harness admission is durably held for reconciliation instead of blind retry. Late internal RPC replies never leak into the editor.
 - When history is full, archive the store while the broker is stopped. There is no automatic compaction or unlimited retention.
 
 ## Verified behavior
@@ -415,16 +421,16 @@ npm test
 npm run doctor
 ```
 
-The **18-test suite** covers real sockets and MCP stdio, routing, offline replay, session isolation, approval preservation, duplicate names, atomic claims, the exact five-minute expiry boundary, administrative authorization, restart/crash recovery, and cancelled pending wake-ups. Reservation tests use a controlled clock.
+The **48-case suite** covers real sockets/MCP stdio, authorization attacks, routing, replay, session isolation, approvals, name lifecycle, exclusive persistence, malformed traffic, failed-write recovery, installer rollback, and uncertain/late admission. Two native cases run on Windows. Reservation tests use a controlled clock.
 
 `npm run doctor` initializes the installed real Codex app-server through the proxy **without starting a model turn**. Set `AGENT_CHANNEL_CODEX_EXECUTABLE` to test a specific binary.
 
 | Check | Result |
 | :--- | :--- |
-| Node integration suite | 18 tests passed. |
+| Node integration suite | v2 suite includes 48 cases; platform-specific Windows cases skip elsewhere. |
 | Real Codex initialization | CLI 0.161.0 and bundled 0.162.0-alpha.2 passed. |
 | Native Windows stdio + SSH fixture | Idle `turn/start`, busy `turn/steer`, and paths with spaces passed. |
-| Remote live model wake-up | Same Codex session processed an unsolicited input and replied without polling. |
+| Remote live model wake-up | Proven for v0.1; repeat after coordinated v2 migration. |
 | Claude live model wake-up | Not yet verified; native channel transport is covered by MCP tests. |
 
 Inspected harness versions include OpenCode 1.18.35, Claude Code 2.1.86, and official Codex extension 26.1002.51308. The remote inspection also found extension 26.930.61225. Behavior depends on installed versions.
@@ -478,7 +484,7 @@ docs/                         Remote design, live proof, local deployment record
 ## Next work
 
 - [ ] Verified same-window, same-project `/new` handoff.
-- [ ] Per-host credentials and scoped identities.
+- [x] Per-host credentials and scoped session capabilities (v0.2 candidate).
 - [ ] Formal accepted / turn-started / processed lifecycle receipts.
 - [ ] Always-on broker and tunnel supervision.
 - [ ] Structured task/reply correlation and configurable wake policies.

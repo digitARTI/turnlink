@@ -11,3 +11,10 @@ private/
 token
 admin-token
 store*.json
+*.token
+security.json
+session-keys/
+*.key
+*.admissions.json
+config-journal.json
+migration.json

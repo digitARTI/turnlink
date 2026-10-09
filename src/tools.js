@@ -18,6 +18,7 @@ export class ToolSession {
   constructor(client, { harness, sessionId, onJoin } = {}) { Object.assign(this, { client, harness, sessionId, onJoin }); }
   async call(name, args) {
     if (name === 'channel_join') {
+      if (!this.harness || !this.sessionId) throw new Error('Harness-supplied session binding is required; the model cannot choose its session identity');
       if (this.harness && args.harness !== this.harness) throw new Error('Wrong harness');
       if (this.sessionId && args.sessionId !== this.sessionId) throw new Error('Wrong session');
       if (this.agentId && this.agentId !== identity(args.harness, args.sessionId)) throw new Error('MCP instance already bound to another session');
@@ -26,9 +27,9 @@ export class ToolSession {
       await this.onJoin?.(result.agent);
       return result;
     }
-    if (name === 'channel_members') return this.client.request('members', args);
-    if (name === 'channel_history') return this.client.request('history', args);
     if (!this.agentId) throw new Error('Call channel_join first');
+    if (name === 'channel_members') return this.client.request('members', { ...args, agentId: this.agentId });
+    if (name === 'channel_history') return this.client.request('history', { ...args, agentId: this.agentId });
     if (name === 'channel_send') return this.client.request('send', { ...args, agentId: this.agentId, messageId: args.messageId || randomUUID() });
     if (name === 'channel_ack') return this.client.request('ack', { ...args, agentId: this.agentId });
     if (name === 'channel_leave') {

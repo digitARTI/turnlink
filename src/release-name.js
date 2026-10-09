@@ -3,7 +3,7 @@ import { ChannelClient } from './client.js';
 import { adminToken } from './config.js';
 const [channel, name] = process.argv.slice(2);
 if (!channel || !name) throw new Error('Usage: node src/release-name.js <channel> <name>');
-const client = new ChannelClient();
+const client = new ChannelClient({ token: adminToken() });
 try {
-  console.log(JSON.stringify(await client.request('release', { channel, name, adminToken: adminToken() })));
+  console.log(JSON.stringify(await client.request('release', { channel, name })));
 } finally { client.close(); }

@@ -1,0 +1,10 @@
+import { readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+const directory = fileURLToPath(new URL('../test/', import.meta.url));
+const tests = readdirSync(directory).filter(name => name.endsWith('.test.js')).sort().map(name => join(directory, name));
+const child = spawn(process.execPath, ['--test', ...tests], { stdio: 'inherit' });
+child.on('error', () => { process.exitCode = 1; });
+child.on('exit', code => { process.exitCode = code ?? 1; });
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal));

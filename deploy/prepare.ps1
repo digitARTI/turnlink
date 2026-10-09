@@ -1,8 +1,9 @@
+param([string]$Root = 'C:\ProgramData\agent-channel')
 $ErrorActionPreference = 'Stop'
-$root = 'C:\ProgramData\agent-channel'
+$root = $Root
 if (-not (Test-Path 'C:\ProgramData' -PathType Container)) { throw 'ProgramData missing' }
 New-Item -ItemType Directory -Path $root -Force | Out-Null
-foreach ($folder in @('src', 'deploy', 'bin', 'private')) {
+foreach ($folder in @('src', 'deploy', 'bin', 'private', 'adapters', 'test', 'test\fixtures', 'dist', 'launcher')) {
   New-Item -ItemType Directory -Path (Join-Path $root $folder) -Force | Out-Null
 }
 # Only local administrators and SYSTEM can read the credential/deployment files.

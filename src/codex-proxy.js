@@ -3,13 +3,28 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
+import { realpathSync, statSync } from 'node:fs';
 import { ChannelClient } from './client.js';
 import { identity, render } from './config.js';
+import { AdmissionLedger, fingerprint } from './admissions.js';
+import { diagnosticCode } from './diagnostics.js';
+import { resolveExecutable } from './executable.js';
 
-const executable = process.env.AGENT_CHANNEL_CODEX_EXECUTABLE;
-if (!executable) { console.error('Set AGENT_CHANNEL_CODEX_EXECUTABLE to the real Codex executable (not this proxy).'); process.exit(1); }
+let executable;
+try { executable = resolveExecutable(process.env.AGENT_CHANNEL_CODEX_EXECUTABLE || ''); }
+catch { console.error('Set AGENT_CHANNEL_CODEX_EXECUTABLE to an available real Codex executable (not this proxy).'); process.exit(1); }
 const args = process.argv.slice(2);
-const child = spawn(executable, args, { stdio: ['pipe', 'pipe', 'inherit'] });
+try {
+  const target = statSync(executable), self = statSync(process.argv[1]);
+  if (realpathSync(executable) === realpathSync(process.argv[1]) ||
+      (target.ino !== 0 && target.ino === self.ino && target.dev === self.dev)) {
+    console.error('Turnlink: recursive Codex executable'); process.exit(1);
+  }
+} catch { /* spawn reports an unavailable executable without exposing the path */ }
+const childEnv = { ...process.env };
+for (const key of ['AGENT_CHANNEL_TOKEN', 'AGENT_CHANNEL_ADMIN_TOKEN']) delete childEnv[key];
+const child = spawn(executable, args, { stdio: ['pipe', 'pipe', 'inherit'], env: childEnv, windowsHide: true });
+child.stdin.on('error', () => child.kill());
 if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.startsWith('unix://'))) {
   process.stdin.pipe(child.stdin); child.stdout.pipe(process.stdout);
 } else {
@@ -19,10 +34,30 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
   const own = new Map();
   const approvals = new Map();
   const write = data => child.stdin.write(`${JSON.stringify(data)}\n`);
-  const rpc = (method, params) => new Promise((resolve, reject) => {
-    const id = `agent-channel-${randomUUID()}`;
-    const timer = setTimeout(() => { own.delete(id); reject(new Error(`Codex timeout: ${method}`)); }, 30000);
-    own.set(id, { resolve, reject, timer });
+  const timeoutMs = Number(process.env.AGENT_CHANNEL_RPC_TIMEOUT_MS || 30000);
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 300000) throw new Error('Invalid RPC timeout');
+  const receipt = (state, message, status, extra = {}) => state.ledger.set({
+    id: message.id, fingerprint: fingerprint(message), state: status, updatedAt: Date.now(), ...extra,
+  });
+  const accepted = async (threadId, state, message, generation, response) => {
+    receipt(state, message, 'accepted');
+    if (response?.turn?.id) state.turnId = response.turn.id;
+    if (state.generation !== generation) return;
+    state.queue = state.queue.filter(m => m.id !== message.id); state.seen.add(message.id);
+    await client.request('ack', { agentId: identity('codex', threadId), id: message.id });
+  };
+  const rpc = (method, params, context) => new Promise((resolve, reject) => {
+    if (own.size >= 128) { reject(new Error('Internal RPC limit reached')); return; }
+    const id = `turnlink-internal-${randomUUID()}`;
+    const pending = { resolve, reject, context, expired: false };
+    receipt(context.state, context.message, 'inflight', { rpcId: id, method });
+    pending.timer = setTimeout(() => {
+      pending.expired = true;
+      try { receipt(context.state, context.message, 'uncertain', { rpcId: id, method }); }
+      catch { /* prior inflight receipt remains conservative evidence */ }
+      const error = new Error('Codex admission uncertain; inspect receipt before retry'); error.code = 'ADMISSION_UNCERTAIN'; reject(error);
+    }, timeoutMs);
+    own.set(id, pending);
     write({ id, method, params });
   });
   const flush = async threadId => {
@@ -35,26 +70,37 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
         const generation = state.generation;
         const input = [{ type: 'text', text: render(message) }];
         try {
-          if (state.turnId) await rpc('turn/steer', { threadId, expectedTurnId: state.turnId, input });
-          else {
-            const response = await rpc('turn/start', { threadId, input });
-            state.turnId = response.turn?.id || state.turnId;
+          const previous = state.ledger.get(message.id);
+          if (previous && previous.fingerprint !== fingerprint(message)) throw new Error('Admission fingerprint mismatch');
+          if (previous?.state === 'accepted') {
+            await accepted(threadId, state, message, generation); continue;
           }
+          if (previous && ['inflight', 'uncertain'].includes(previous.state)) break;
+          const context = { threadId, state, message, generation };
+          let response;
+          if (state.turnId) response = await rpc('turn/steer', { threadId, expectedTurnId: state.turnId, input }, context);
+          else {
+            response = await rpc('turn/start', { threadId, input }, context);
+          }
+          await accepted(threadId, state, message, generation, response);
         } catch (error) {
-          console.error(`Agent channel: ${error.message}; message retained for retry`);
+          console.error(`Turnlink: admission unresolved (${diagnosticCode(error)}), message=${message.id}; inspect private receipt`);
           break;
         }
         if (state.generation !== generation) break;
-        state.queue.shift();
-        state.seen.add(message.id);
-        await client.request('ack', { agentId: identity('codex', threadId), id: message.id });
       }
-    } catch (error) { console.error(`Agent channel: ${error.message}`); }
+    } catch (error) { console.error(`Turnlink: delivery blocked (${diagnosticCode(error)})`); }
     finally { state.flushing = false; }
   };
-  const bind = threadId => {
+  const bind = async threadId => {
     if (!threads.has(threadId)) threads.set(threadId, { queue: [], seen: new Set(), turnId: null, flushing: false, generation: 0 });
-    client.subscribe(identity('codex', threadId)).catch(error => console.error(`Agent channel: ${error.message}`));
+    try {
+      await client.connect();
+      const state = threads.get(threadId);
+      if (!state) return;
+      state.ledger = new AdmissionLedger(client.hostId, identity('codex', threadId));
+      await client.subscribe(identity('codex', threadId));
+    } catch (error) { console.error(`Turnlink: receiver connection blocked (${diagnosticCode(error)})`); }
   };
   client.on('message', message => {
     for (const [threadId, state] of threads) {
@@ -91,9 +137,20 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
       const data = JSON.parse(line);
       if (own.has(data.id)) {
         const pending = own.get(data.id); own.delete(data.id); clearTimeout(pending.timer);
-        data.error ? pending.reject(new Error(data.error.message)) : pending.resolve(data.result);
+        const { threadId, state, message, generation } = pending.context;
+        try { if (data.error) {
+          // A definitive rejection permits retry. Error bodies are not logged.
+          receipt(state, message, 'not_admitted');
+          pending.reject(new Error('Codex rejected admission'));
+          if (pending.expired) void flush(threadId);
+        } else if (pending.expired) {
+          void accepted(threadId, state, message, generation, data.result).then(() => flush(threadId)).catch(error => console.error(`Turnlink: late receipt blocked (${diagnosticCode(error)})`));
+        } else pending.resolve(data.result); }
+        catch { pending.reject(new Error('Admission receipt could not be persisted; reconciliation required')); }
         return;
       }
+      // Never leak a late/internal response into the editor's RPC namespace.
+      if (typeof data.id === 'string' && data.id.startsWith('turnlink-internal-')) return;
       const request = requests.get(data.id);
       if (request && !data.method) {
         requests.delete(data.id);
@@ -123,6 +180,6 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
   retry.unref();
   child.on('exit', () => { clearInterval(retry); client.close(); for (const p of own.values()) clearTimeout(p.timer); });
 }
-child.on('error', error => { console.error(error.message); process.exit(1); });
+child.on('error', error => { console.error(`Turnlink: executable launch failed (${diagnosticCode(error)})`); process.exit(1); });
 child.on('exit', code => { process.stdin.destroy(); process.exitCode = code ?? 1; });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal));

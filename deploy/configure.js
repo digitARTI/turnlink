@@ -1,17 +1,24 @@
 // Merge only our settings, preserving existing JSONC and TOML text.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { join, dirname, isAbsolute } from 'node:path';
 import { parse, modify, applyEdits } from 'jsonc-parser';
 import { parse as parseToml } from 'smol-toml';
+import { applyConfiguration } from './config-transaction.js';
+import { atomicWrite, privateDirectory } from '../src/storage.js';
+
+if (process.platform !== 'win32') throw new Error('This installer is Windows-only; use explicit platform setup for other hosts');
 
 const root = process.argv[2] || 'C:\\ProgramData\\agent-channel';
-const profile = process.argv[3] || 'C:\\Users\\Administrator';
+const profile = process.argv[3] || process.env.USERPROFILE;
+if (!profile) throw new Error('An explicit user profile is required');
+if (!isAbsolute(root) || !isAbsolute(profile)) throw new Error('Root and profile must be absolute paths');
 const appData = join(profile, 'AppData', 'Roaming');
 const settingsPath = join(appData, 'Code', 'User', 'settings.json');
 const codexConfigPath = join(profile, '.codex', 'config.toml');
 const launcherPath = join(root, 'bin', 'agent-channel-codex.exe');
 const launcherConfigPath = join(root, 'bin', 'launcher.json');
-const statusPath = join(root, 'deployment-status.json');
+const privateRoot = join(root, 'private'); privateDirectory(privateRoot);
+const statusPath = join(privateRoot, 'config-journal.json');
 if (existsSync(statusPath)) throw new Error('Deployment already configured; inspect recorded backups before reconfiguring.');
 const settingsText = existsSync(settingsPath) ? readFileSync(settingsPath, 'utf8') : '{}\n';
 const errors = [];
@@ -20,9 +27,12 @@ if (errors.length || !settings || typeof settings !== 'object') throw new Error(
 if (settings['chatgpt.runCodexInWindowsSubsystemForLinux']) throw new Error('WSL mode enabled; native adapter cannot be installed');
 if (settings['chatgpt.cliExecutable']) throw new Error('Existing cliExecutable override present; coordinate before replacing it');
 const extensions = join(profile, '.vscode', 'extensions');
-const candidates = ['26.1002.51308', '26.930.61225'].map(v => join(extensions, `openai.chatgpt-${v}-win32-x64`, 'bin', 'windows-x86_64', 'codex.exe'));
-const codex = candidates.find(existsSync);
-if (!codex) throw new Error('Expected official extension binary not found');
+const candidates = readdirSync(extensions).filter(name => /^openai\.chatgpt-[0-9.]+-win32-x64$/.test(name))
+  .sort(new Intl.Collator('en', { numeric: true }).compare).reverse()
+  .map(name => join(extensions, name, 'bin', 'windows-x86_64', 'codex.exe'));
+const explicitIndex = process.argv.indexOf('--codex');
+const codex = explicitIndex >= 0 ? process.argv[explicitIndex + 1] : candidates.find(existsSync);
+if (!codex || !isAbsolute(codex) || !existsSync(codex) || !statSync(codex).isFile()) throw new Error('An absolute official extension binary is required');
 const node = 'C:\\Program Files\\nodejs\\node.exe';
 if (!existsSync(node) || !existsSync(launcherPath)) throw new Error('Node or launcher missing');
 const codexText = existsSync(codexConfigPath) ? readFileSync(codexConfigPath, 'utf8') : '';
@@ -34,23 +44,13 @@ parseToml(codexText + addition);
 const mergedSettings = applyEdits(settingsText, modify(settingsText, ['chatgpt.cliExecutable'], launcherPath, {
   formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\r\n' },
 }));
-const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-writeFileSync(launcherConfigPath, JSON.stringify({ node, root, codex, url: 'ws://127.0.0.1:47322', tokenFile: join(root, 'private', 'token') }, null, 2));
+atomicWrite(launcherConfigPath, JSON.stringify({ node, root, codex, url: 'ws://127.0.0.1:47322', tokenFile: join(root, 'private', 'token') }, null, 2));
 if (process.argv.includes('--prepare')) {
   console.log('Launcher configuration prepared; VS Code and Codex settings untouched.');
   process.exit(0);
 }
-const backups = [];
-for (const [path, old, updated] of [[settingsPath, settingsText, mergedSettings], [codexConfigPath, codexText, codexText + addition]]) {
+for (const path of [settingsPath, codexConfigPath]) {
   mkdirSync(dirname(path), { recursive: true });
-  const backup = `${path}.agent-channel-${stamp}.bak`;
-  writeFileSync(backup, old, { flag: 'wx' });
-  backups.push({ path, backup, existed: existsSync(path) });
 }
-// Record backups before editing either user file so rollback is possible on failure.
-writeFileSync(statusPath, JSON.stringify({ root, profile, launcherPath, backups, installedAt: new Date().toISOString() }, null, 2));
-for (const [path, updated] of [[settingsPath, mergedSettings], [codexConfigPath, codexText + addition]]) {
-  writeFileSync(`${path}.agent-channel.tmp`, updated);
-  renameSync(`${path}.agent-channel.tmp`, path);
-}
+applyConfiguration(statusPath, [{ path: settingsPath, content: mergedSettings }, { path: codexConfigPath, content: codexText + addition }]);
 console.log(JSON.stringify({ configured: true, launcherPath, userProfile: profile, settingsPath, codexConfigPath, codex }));
