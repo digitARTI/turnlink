@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 160 160" role="img" aria-labelledby="title">
+  <title id="title">Turnlink monochrome mark</title>
+  <g fill="none" stroke="#101c2c" stroke-linecap="round" stroke-linejoin="round" stroke-width="13">
+    <path d="M82 36H64C46 36 32 50 32 68s14 32 32 32h14"/>
+    <path d="M78 124h18c18 0 32-14 32-32S114 60 96 60H82"/>
+    <path d="M65 80h30" stroke-width="9"/>
+  </g>
+  <circle cx="94" cy="36" r="6" fill="#101c2c"/>
+</svg>

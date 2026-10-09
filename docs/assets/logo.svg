@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 160 160" role="img" aria-labelledby="title description">
+  <title id="title">Turnlink logo</title>
+  <desc id="description">Two offset conversation loops joined by a short link, with a small signal dot above.</desc>
+  <rect width="160" height="160" rx="36" fill="#101c2c"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="13">
+    <path d="M82 36H64C46 36 32 50 32 68s14 32 32 32h14" stroke="#66e3bf"/>
+    <path d="M78 124h18c18 0 32-14 32-32S114 60 96 60H82" stroke="#8eb5ff"/>
+    <path d="M65 80h30" stroke="#eef5ff" stroke-width="9"/>
+  </g>
+  <circle cx="94" cy="36" r="6" fill="#e9bd70"/>
+</svg>

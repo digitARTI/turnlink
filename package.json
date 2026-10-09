@@ -1,5 +1,5 @@
 {
-  "name": "agent-channel",
+  "name": "turnlink",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -21,6 +21,7 @@
     "zod": "^4.0.0"
   },
   "bin": {
+    "turnlink-codex": "./src/codex-proxy.js",
     "agent-channel-codex": "./src/codex-proxy.js"
   }
 }

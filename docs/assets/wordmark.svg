@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="160" viewBox="0 0 640 160" role="img" aria-labelledby="title">
+  <title id="title">Turnlink wordmark</title>
+  <rect width="640" height="160" rx="24" fill="#101c2c"/>
+  <g transform="translate(12 0)" fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="13">
+    <path d="M82 36H64C46 36 32 50 32 68s14 32 32 32h14" stroke="#66e3bf"/>
+    <path d="M78 124h18c18 0 32-14 32-32S114 60 96 60H82" stroke="#8eb5ff"/>
+    <path d="M65 80h30" stroke="#eef5ff" stroke-width="9"/>
+    <circle cx="94" cy="36" r="6" fill="#e9bd70" stroke="none"/>
+  </g>
+  <text x="180" y="105" fill="#eef5ff" font-family="Arial, Helvetica, sans-serif" font-size="80" font-weight="700" letter-spacing="-3">Turnlink</text>
+</svg>
