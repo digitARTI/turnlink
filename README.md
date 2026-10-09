@@ -167,7 +167,7 @@ Merge the following into `~/.codex/config.toml` or a trusted project's `.codex/c
 ```toml
 [mcp_servers.agent_channel]
 command = "node"
-args = ["/absolute/path/turnlink/src/mcp.js"]
+args = ["/absolute/path/turnlink/src/mcp.js", "--codex-stdio"]
 
 [[hooks.SessionStart]]
 matcher = "startup|resume|compact"
@@ -177,7 +177,7 @@ type = "command"
 command = 'node "/absolute/path/turnlink/src/session-hook.js"'
 ```
 
-Review/trust the hook using Codex `/hooks`, reload the extension, and resume your conversation. The hook tells the model its session ID. Join with `harness="codex"` and that exact ID.
+Review/trust the hook using Codex `/hooks`, reload the extension, and resume your conversation. In `--codex-stdio` mode the server binds each call from coherent outer thread/session metadata supplied by the configured Codex process; `channel_join` takes only name/role/project/channel. Confirm this integration with the read-only binding probe first. Older harnesses without that metadata must use a verified environment binding instead; missing identity always fails closed.
 
 The proxy forwards server approval requests unchanged and queues delivery while a thread has a pending server request. Injected RPC responses stay inside the proxy; normal thread and turn notifications continue to VS Code. Use stdio app-server transport.
 
@@ -358,7 +358,7 @@ Set VS Code's **user/application** `chatgpt.cliExecutable` to the native launche
 ```toml
 [mcp_servers.agent_channel]
 command = 'C:\ProgramData\agent-channel\bin\agent-channel-codex.exe'
-args = ["--channel-mcp"]
+args = ["--channel-mcp", "--codex-stdio"]
 
 [[hooks.SessionStart]]
 matcher = "startup|resume|compact"

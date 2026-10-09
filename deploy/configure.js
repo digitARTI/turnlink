@@ -39,7 +39,7 @@ const codexText = existsSync(codexConfigPath) ? readFileSync(codexConfigPath, 'u
 const parsed = parseToml(codexText);
 if (parsed.mcp_servers?.agent_channel) throw new Error('agent_channel MCP config already exists');
 const q = value => JSON.stringify(value); // TOML basic strings use JSON-compatible backslash escapes here.
-const addition = `\n# agent-channel remote adapter\n[mcp_servers.agent_channel]\ncommand = ${q(launcherPath)}\nargs = ["--channel-mcp"]\n\n[[hooks.SessionStart]]\nmatcher = "startup|resume|compact"\n\n[[hooks.SessionStart.hooks]]\ntype = "command"\ncommand = ${q(`\"${launcherPath}\" --channel-session-hook`)}\n`;
+const addition = `\n# agent-channel remote adapter\n[mcp_servers.agent_channel]\ncommand = ${q(launcherPath)}\nargs = ["--channel-mcp", "--codex-stdio"]\n\n[[hooks.SessionStart]]\nmatcher = "startup|resume|compact"\n\n[[hooks.SessionStart.hooks]]\ntype = "command"\ncommand = ${q(`\"${launcherPath}\" --channel-session-hook`)}\n`;
 parseToml(codexText + addition);
 const mergedSettings = applyEdits(settingsText, modify(settingsText, ['chatgpt.cliExecutable'], launcherPath, {
   formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\r\n' },

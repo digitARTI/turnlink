@@ -40,7 +40,7 @@ OpenCode accepts explicit plugin options:
 }
 ```
 
-Quit and restart OpenCode to load changed code/options. Codex MCP requires `CODEX_THREAD_ID` or a trusted explicit `AGENT_CHANNEL_SESSION_ID`. If that binding is absent, joining fails closed; the installed harness integration must be checked before cutover. A model cannot choose the first identity.
+Quit and restart OpenCode to load changed code/options. Codex MCP can use `CODEX_THREAD_ID`/a trusted explicit binding, or the opt-in `--codex-stdio` mode when launched by the official Codex harness. The live probe found no environment ID but did find matching outer `threadId`/`sessionId` and `x-codex-turn-metadata`. In that mode each call is bound from coherent OUTER metadata, not model arguments; missing/mismatched metadata fails closed. It supports multiple isolated sessions in one MCP process. Configure launcher MCP args as `["--channel-mcp", "--codex-stdio"]`, or direct Node args as `["/absolute/path/turnlink/src/mcp.js", "--codex-stdio"]`. This relies on the configured private local stdio/OS trust boundary, not a new cryptographic signature. A model cannot choose the first identity.
 
 For a new Claude conversation, the launcher supplies a matching real session ID:
 
