@@ -1,0 +1,26 @@
+{
+  "name": "agent-channel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/broker.js",
+    "test": "node --test test/*.test.js",
+    "mcp": "node src/mcp.js",
+    "doctor": "node src/doctor.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@opencode-ai/plugin": "^1.3.0",
+    "jsonc-parser": "^3.3.1",
+    "smol-toml": "^1.9.0",
+    "ws": "^8.18.0",
+    "zod": "^4.0.0"
+  },
+  "bin": {
+    "agent-channel-codex": "./src/codex-proxy.js"
+  }
+}
