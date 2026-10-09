@@ -1,10 +1,11 @@
 // Merge only our settings, preserving existing JSONC and TOML text.
-import { readFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
 import { parse, modify, applyEdits } from 'jsonc-parser';
 import { parse as parseToml } from 'smol-toml';
 import { applyConfiguration } from './config-transaction.js';
 import { atomicWrite, privateDirectory } from '../src/storage.js';
+import { resolveCodexRuntime, stageCodexRuntime } from './codex-runtime.js';
 
 if (process.platform !== 'win32') throw new Error('This installer is Windows-only; use explicit platform setup for other hosts');
 
@@ -26,13 +27,9 @@ const settings = parse(settingsText, errors, { allowTrailingComma: true });
 if (errors.length || !settings || typeof settings !== 'object') throw new Error('VS Code settings are not valid JSONC');
 if (settings['chatgpt.runCodexInWindowsSubsystemForLinux']) throw new Error('WSL mode enabled; native adapter cannot be installed');
 if (settings['chatgpt.cliExecutable']) throw new Error('Existing cliExecutable override present; coordinate before replacing it');
-const extensions = join(profile, '.vscode', 'extensions');
-const candidates = readdirSync(extensions).filter(name => /^openai\.chatgpt-[0-9.]+-win32-x64$/.test(name))
-  .sort(new Intl.Collator('en', { numeric: true }).compare).reverse()
-  .map(name => join(extensions, name, 'bin', 'windows-x86_64', 'codex.exe'));
 const explicitIndex = process.argv.indexOf('--codex');
-const codex = explicitIndex >= 0 ? process.argv[explicitIndex + 1] : candidates.find(existsSync);
-if (!codex || !isAbsolute(codex) || !existsSync(codex) || !statSync(codex).isFile()) throw new Error('An absolute official extension binary is required');
+if (explicitIndex >= 0 && !process.argv[explicitIndex + 1]) throw new Error('--codex requires a path');
+const officialCodex = resolveCodexRuntime(profile, explicitIndex >= 0 ? process.argv[explicitIndex + 1] : undefined);
 const node = 'C:\\Program Files\\nodejs\\node.exe';
 if (!existsSync(node) || !existsSync(launcherPath)) throw new Error('Node or launcher missing');
 const codexText = existsSync(codexConfigPath) ? readFileSync(codexConfigPath, 'utf8') : '';
@@ -44,6 +41,7 @@ parseToml(codexText + addition);
 const mergedSettings = applyEdits(settingsText, modify(settingsText, ['chatgpt.cliExecutable'], launcherPath, {
   formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\r\n' },
 }));
+const codex = stageCodexRuntime(root, officialCodex);
 atomicWrite(launcherConfigPath, JSON.stringify({ node, root, codex, url: 'ws://127.0.0.1:47322', tokenFile: join(root, 'private', 'token') }, null, 2));
 if (process.argv.includes('--prepare')) {
   console.log('Launcher configuration prepared; VS Code and Codex settings untouched.');

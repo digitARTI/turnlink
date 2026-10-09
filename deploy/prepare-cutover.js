@@ -5,6 +5,7 @@ import { parse as jsonc, modify, applyEdits } from 'jsonc-parser';
 import { parse as toml } from 'smol-toml';
 import { applyConfiguration } from './config-transaction.js';
 import { atomicWrite } from '../src/storage.js';
+import { resolveCodexRuntime, stageCodexRuntime } from './codex-runtime.js';
 
 const [root, profile] = process.argv.slice(2);
 if (process.platform !== 'win32' || !root || !profile) throw new Error('Use on Windows with explicit staged root and actual profile');
@@ -29,13 +30,15 @@ updatedConfig = updatedConfig.split(oldHook).join(JSON.stringify(`"${launcher}" 
 toml(updatedConfig);
 const updatedSettings = applyEdits(settingsText, modify(settingsText, ['chatgpt.cliExecutable'], launcher,
   { formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\r\n' } }));
+const officialCodex = resolveCodexRuntime(profile);
 if (process.argv.includes('--plan-only')) {
-  console.log(JSON.stringify({ planned: true, settingsPath, configPath, launcher, endpoint: 'ws://127.0.0.1:47324', binding: 'Codex outer stdio metadata' }));
+  console.log(JSON.stringify({ planned: true, settingsPath, configPath, launcher, officialCodex, endpoint: 'ws://127.0.0.1:47324', binding: 'Codex outer stdio metadata' }));
   process.exit(0);
 }
 if (!existsSync(launcher) || !existsSync(join(root, 'private', 'gameserver.token'))) throw new Error('Staged executable/host credential missing');
 const previousLauncherConfig = JSON.parse(readFileSync('C:\\ProgramData\\agent-channel\\bin\\launcher.json', 'utf8'));
-atomicWrite(join(root, 'bin', 'launcher.json'), JSON.stringify({ ...previousLauncherConfig, root,
+const codex = stageCodexRuntime(root, officialCodex);
+atomicWrite(join(root, 'bin', 'launcher.json'), JSON.stringify({ ...previousLauncherConfig, root, codex,
   url: 'ws://127.0.0.1:47324', tokenFile: join(root, 'private', 'gameserver.token') }, null, 2));
 console.log(JSON.stringify(applyConfiguration(join(root, 'private', 'v2-cutover-journal.json'), [
   { path: settingsPath, content: updatedSettings }, { path: configPath, content: updatedConfig },

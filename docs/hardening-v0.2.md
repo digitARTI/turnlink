@@ -109,9 +109,13 @@ node deploy/rollback.js C:\ProgramData\turnlink-v0.2\private\config-journal.json
 
 Review profile/root paths first. The resolver discovers installed official extension versions or accepts an explicit absolute `--codex` path. Native launch checks recursion by file identity, filters stale credential environment variables, preserves args/exit status, hides console children, and uses a kill-on-close job.
 
+The Windows installer and cutover helper require a complete official runtime, including `codex-code-mode-host.exe`. They copy and hash-verify the entire runtime into a content-addressed `bin/runtime-<sha256>` directory, and place the same version's code-mode companion beside the launcher. `launcher.json` points to the copied `codex.exe`, so VS Code extension cleanup cannot remove the executable underneath an active adapter. Repeated preparation verifies existing files; a damaged runtime or different launcher companion fails before configuration changes. Runtime upgrades must be coordinated with a reload and backup rather than mixing companion versions.
+
+For an already-installed adapter, `deploy/repair-codex-runtime.ps1` is a one-time repair: it discovers the newest complete official extension, stages its runtime, and saves the previous launcher configuration as `private/launcher-before-runtime-repair.json`. Inspect existing runtime/companion/backup files before rerunning; it refuses replacement. After repair, reload the VS Code window and resume the same conversation. `--version` and `--channel-doctor` check passthrough/app-server startup; a harmless real Codex tool call is still required to verify code-mode host startup.
+
 ## Verification
 
-The current suite has 53 cases. Earlier staged Windows verification passed 46 cases plus the affected recovery/native checks; subsequent published CI passed the complete current suite on supported platforms. Windows cases skip on other platforms. Real-model v2 cutover remains separate from fixture/CI results.
+The current suite has 56 cases, including runtime staging/extension-cleanup regression fixtures. Published CI previously passed the 53-case suite on supported platforms. Windows cases skip on other platforms. Real-model v2 cutover remains separate from fixture/CI results.
 
 ## Recorded live cutover staging
 
