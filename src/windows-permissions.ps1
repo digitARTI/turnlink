@@ -1,8 +1,7 @@
 param([string]$Path, [string]$Created = 'false')
 $ErrorActionPreference = 'Stop'
-# Resolve the matching built-in binary module directly. A pwsh 7 parent can
-# leave Windows PowerShell 5 with incompatible module discovery/cache paths.
-Import-Module (Join-Path $PSHOME 'Microsoft.PowerShell.Security.dll') -Force -ErrorAction Stop
+# Use .NET ACL APIs directly: Get-Acl/Set-Acl module autoload can select a
+# PowerShell 7 assembly when this Windows PowerShell 5 process has a pwsh parent.
 $current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $system = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
 $admins = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
@@ -13,9 +12,13 @@ if ($Created -eq 'true') {
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
     $security.AddAccessRule($rule)
   }
-  Set-Acl -LiteralPath $Path -AclObject $security
+  [System.IO.Directory]::SetAccessControl($Path, $security)
 }
-$acl = Get-Acl -LiteralPath $Path
+$acl = if ([System.IO.Directory]::Exists($Path)) {
+  [System.IO.Directory]::GetAccessControl($Path)
+} else {
+  [System.IO.File]::GetAccessControl($Path)
+}
 $allowed = @($current.Value, $system.Value, $admins.Value, 'S-1-3-0')
 $members = $null
 foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
@@ -24,9 +27,9 @@ foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.S
   if ($allowed -contains $sid) { continue }
   # All local administrators already cross this filesystem trust boundary.
   if ($null -eq $members) {
-    Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.LocalAccounts\Microsoft.PowerShell.LocalAccounts.psd1') -Force -ErrorAction Stop
+    Import-Module ([System.IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.LocalAccounts\Microsoft.PowerShell.LocalAccounts.psd1')) -Force -ErrorAction Stop
     $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object { $_.SID.Value })
   }
   if ($members -notcontains $sid) { throw 'Private path grants access outside its owner, local administrators and SYSTEM' }
 }
-Write-Output 'ok'
+exit 0
