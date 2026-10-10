@@ -1,5 +1,7 @@
 # Live remote idle-wake proof
 
+## Original v0.1 Codex proof
+
 Verified 2026-10-09 (UTC). The Windows game-server Codex agent joined `development` and processed an unsolicited peer message in its existing conversation after its previous final response, without a relay/inbox poll.
 
 ## Identities
@@ -40,3 +42,36 @@ The model did not have access to its turn ID. It was obtained independently from
 The current broker does not persist a formal `accepted -> woken -> processed` state machine. Storage and delivery are broker evidence; turn start/completion are Codex evidence; processing is supported by the explicit model reply. This report correlates those sources without claiming nonexistent broker fields or historical proxy logs.
 
 Still separate checks/features: live busy-steering and approval behavior, repeat/reconnect handling under the real model, always-on broker/tunnel supervision, per-host authorization, and formal lifecycle acknowledgements. Protocol fixtures already exercise busy steering, session isolation, and approval preservation; they are not the live idle-wake proof above.
+
+## V2 fleet cutover and OpenCode idle wake
+
+Verified 2026-10-09 (UTC), after the runtime repair and adapter reloads. Native v2 membership showed all three original identities connected with claimed names:
+
+| Name | Agent ID | Enrolled host |
+| --- | --- | --- |
+| channel-builder | `opencode:ses_ee253d5d1ffeAl2nyMw3qIQ7Sm` | workstation |
+| banger-bridge | `opencode:ses_efebaa009ffe4g5Rsq4DZdrVMF` | workstation |
+| gameagent | `codex:01a106b0-4fee-7573-9f4d-00b486584757` | gameserver |
+
+The v2 workstation broker is loopback `47323`; the game-server uses forwarded loopback `47324`. Membership and replies below came from v2, not the retained legacy broker.
+
+### OpenCode correlation
+
+Sender: channel-builder. Recipient: banger-bridge in its original session. Nonce: `bridge-idle-v2-20261009T235831Z`.
+
+| UTC timestamp | Source | Evidence |
+| --- | --- | --- |
+| 23:58:11.184 | Read-only OpenCode message metadata | Prior assistant message `msg_1231a4b80001B4fEKOqAGfJv3R` completed with `finish=stop`. |
+| 23:58:36.583 | V2 broker send result | Nonce request `24f9da6c-201c-428f-a7ca-a86c1d802239` sent directly to the original bridge session. |
+| 23:58:36.659 | Read-only OpenCode message metadata | New user input `msg_1231aba720010hb3P94RsLHKV3`; its text part independently matches the exact broker message UUID. |
+| 23:58:38.228 | Read-only OpenCode message metadata | Assistant `msg_1231ac093001zJ0P0acR6VJ1I6` began with that input as its parent. |
+| 23:58:42.367 | V2 broker reply | ACK `5c5ca766-00f0-4216-9f51-aea611030869` contains the exact nonce and reports unsolicited new-turn delivery after the prior final. |
+| 23:58:48.328 | Read-only OpenCode message metadata | Final assistant message `msg_1231adbe3001SL4AOtAPUM7oTa` completed with `finish=stop`. |
+
+The only tool part in the nonce response was a completed `channel_send`; there was no history poll. Evidence was queried read-only from OpenCode's local database, selecting message IDs, timestamps, roles, parent IDs, completion status, matching-message presence and tool names rather than dumping transcript bodies. This verifies an actual v2 OpenCode idle wake in the preserved conversation.
+
+### Codex v2 scope and remaining checkpoint
+
+V2 message `9c5837e4-412a-4149-a62d-71bda0b056d7` was sent at 23:52:09.817, appears in the original persisted Codex session at 23:52:10.482, and received matching ACK `c866c5bb-3822-495b-930a-4bac9d902850` at 23:52:17.371. The agent explicitly reported automatic delivery during an already-active goal turn, without polling. This proves v2 delivery/processing in the existing session, not idle turn-start.
+
+After `READY_IDLE`, independent Codex lifecycle evidence showed automatic goal continuations: `task_complete` at 23:58:04.964 followed by `task_started` at 23:58:04.982, then another completion/start pair at 23:58:17.898/23:58:17.922. The new turns were therefore not a clean nonce-triggered idle test. The agent reports that its supported goal pause requires an explicit user request; peer coordination cannot authorize it. Preserve the checkpoint and obtain that request before the final Codex v2 idle-wake check. No goal was cancelled/reset and no game, desktop or service lifecycle action formed part of these tests.
