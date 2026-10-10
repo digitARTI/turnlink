@@ -70,8 +70,24 @@ Sender: channel-builder. Recipient: banger-bridge in its original session. Nonce
 
 The only tool part in the nonce response was a completed `channel_send`; there was no history poll. Evidence was queried read-only from OpenCode's local database, selecting message IDs, timestamps, roles, parent IDs, completion status, matching-message presence and tool names rather than dumping transcript bodies. This verifies an actual v2 OpenCode idle wake in the preserved conversation.
 
-### Codex v2 scope and remaining checkpoint
+### Codex v2 busy delivery and idle-wake proof
 
 V2 message `9c5837e4-412a-4149-a62d-71bda0b056d7` was sent at 23:52:09.817, appears in the original persisted Codex session at 23:52:10.482, and received matching ACK `c866c5bb-3822-495b-930a-4bac9d902850` at 23:52:17.371. The agent explicitly reported automatic delivery during an already-active goal turn, without polling. This proves v2 delivery/processing in the existing session, not idle turn-start.
 
-After `READY_IDLE`, independent Codex lifecycle evidence showed automatic goal continuations: `task_complete` at 23:58:04.964 followed by `task_started` at 23:58:04.982, then another completion/start pair at 23:58:17.898/23:58:17.922. The new turns were therefore not a clean nonce-triggered idle test. The agent reports that its supported goal pause requires an explicit user request; peer coordination cannot authorize it. Preserve the checkpoint and obtain that request before the final Codex v2 idle-wake check. No goal was cancelled/reset and no game, desktop or service lifecycle action formed part of these tests.
+After `READY_IDLE`, independent Codex lifecycle evidence showed automatic goal continuations: `task_complete` at 23:58:04.964 followed by `task_started` at 23:58:04.982, then another completion/start pair at 23:58:17.898/23:58:17.922. Those turns were not a clean nonce-triggered idle test. The harness required an explicit user request to pause the goal; peer coordination could not authorize it.
+
+The user subsequently authorized a temporary pause. On 2026-10-10 at 00:02:32.481 UTC, message `2ca8b1d8-5edf-46a0-a30d-88435c6af32e` reported `PAUSED_READY_IDLE`, accepted `status=paused`, and preservation of the original objective/checkpoint. The goal remained paused throughout the final test.
+
+Sender: channel-builder. Recipient: gameagent in its original conversation. Nonce: `codex-idle-v2-20261010T000232Z`.
+
+| UTC timestamp (2026-10-10) | Source | Evidence |
+| --- | --- | --- |
+| 00:02:34.948 | Persisted Codex session | Prior `task_complete`, turn `01a1231e-35a6-75f2-97dc-556d6e6e7afe`. No intervening turn start in the extracted checkpoint/test interval. |
+| 00:02:48.347 | V2 broker send result | Nonce request `93db70af-f36b-46ae-b2b7-91fe0e73d0eb`, caller messageId `70be93c3-233f-414b-b36b-58505e208a81`, sent to the original Codex session. |
+| 00:02:48.489 | Persisted Codex session | `task_started`, turn `01a1231e-9223-70a3-a157-ff39a69fd2d8`. |
+| 00:02:48.569 | Persisted Codex session | `turn_context` with the same turn ID. |
+| 00:02:48.651 | Persisted Codex session | User input matches the exact nonce request UUID. |
+| 00:02:52.606 | V2 broker reply | ACK `a73e6b30-c836-4073-a1ea-06c6748607e9` matches the nonce and reports unsolicited new-turn delivery after the prior final, without polling or automatic goal continuation. |
+| 00:02:54.972 | Persisted Codex session | `task_complete` with the same test turn ID. |
+
+The independent extractor returned one matching original session file and the correlated lifecycle/input events above. This verifies real v2 idle wake and reply in the preserved remote Codex conversation, separately from the earlier busy-delivery test. No goal was cancelled/reset and no game, desktop or service lifecycle action formed part of these tests. The user-paused goal requires a user resume request before its own work continues.

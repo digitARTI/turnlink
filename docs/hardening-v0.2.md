@@ -1,6 +1,6 @@
 # Protocol v2 hardening and migration
 
-Status: unreleased candidate. The v2 broker is staged alongside v0.1 for coordinated reload and wake verification. Private vulnerability reporting is enabled on GitHub. Published GitHub CI passed on Linux/macOS/Windows with Node22/24, including secret scanning.
+Status: v0.2 live fleet cutover and same-conversation OpenCode/Codex idle wakes verified. The legacy broker remains available for rollback. Private vulnerability reporting is enabled on GitHub. Published GitHub CI passed on Linux/macOS/Windows with Node22/24, including secret scanning.
 
 ## Ownership and trust
 
@@ -115,10 +115,10 @@ For an already-installed adapter, `deploy/repair-codex-runtime.ps1` is a one-tim
 
 ## Verification
 
-The current suite has 56 cases, including runtime staging/extension-cleanup regression fixtures. Published CI previously passed the 53-case suite on supported platforms. Windows cases skip on other platforms. Real-model v2 cutover remains separate from fixture/CI results.
+The current suite has 56 cases, including runtime staging/extension-cleanup regression fixtures. Published CI passed the 56-case suite on supported platforms for runtime-fix commit `2c94fac`, including the Windows native checks. Windows cases skip on other platforms. The live same-conversation OpenCode/Codex wake results are independently recorded rather than inferred from fixture/CI results.
 
-## Recorded live cutover staging
+## Recorded live cutover
 
-The active fleet has a separately supervised v2 broker on workstation loopback `47323` and game-server SSH-forwarded loopback `47324`. v0.1 remains on `47321`/`47322` for coordination/rollback until the live wake proof passes. Fresh credentials are bound to `workstation` and `gameserver`; the remote hello verified protocol2/hostId=gameserver/admin=false. Mac plugin options and Windows launcher/MCP configuration are journaled. Manual reload/resume of the same conversations is required; no game/client/FXServer/bridge lifecycle restart is part of this adapter transition.
+The active fleet uses a separately supervised v2 broker on workstation loopback `47323` and game-server SSH-forwarded loopback `47324`. v0.1 remains on `47321`/`47322` for rollback; legacy retirement has not been performed. Fresh credentials are bound to `workstation` and `gameserver`; the remote hello verified protocol2/hostId=gameserver/admin=false. Mac plugin options and Windows launcher/MCP configuration are journaled. Manual reload/resume of the same conversations was completed; no game/client/FXServer/bridge lifecycle restart formed part of this adapter transition.
 
-After coordinated reload/resume, all three original sessions were independently confirmed connected on v2 with claimed names and correct host ownership. The repaired Codex runtime passed an actual user-reported tool call and a live same-session v2 request/reply. The resumed bridge OpenCode session passed a nonce-only idle wake correlated with read-only harness message metadata. Codex's active goal automatically dispatches new turns immediately after final responses, so its v2 idle-wake check awaits an explicit user-authorized goal pause. See [the v2 evidence](remote-wake-proof.md#v2-fleet-cutover-and-opencode-idle-wake); retain legacy rollback until that remaining check is completed.
+After coordinated reload/resume, all three original sessions were independently confirmed connected on v2 with claimed names and correct host ownership. The repaired Codex runtime passed an actual user-reported tool call and a live same-session v2 request/reply. The resumed bridge OpenCode session passed a nonce-only idle wake correlated with read-only harness message metadata. After an explicit user-authorized pause of Codex's automatic goal dispatch, its nonce request independently correlated with a new turn start, exact persisted input, ACK and turn completion in the original conversation. See [the v2 evidence](remote-wake-proof.md#v2-fleet-cutover-and-opencode-idle-wake). The preserved Codex goal remains user-paused until a user resume request.
