@@ -34,7 +34,7 @@ When the recipient has finished responding, its harness adapter can start a new 
 
 ## What you get
 
-An opt-in [control-plane experiment](docs/control-plane.md) adds authenticated governance/task records and OpenCode/Codex supplemental master notices. Recovery execution, task dispatch and the dashboard are not enabled yet; normal installations are unchanged.
+An opt-in [control-plane experiment](docs/control-plane.md) adds authenticated governance/task records and OpenCode/Codex supplemental master notices. A separate experimental gate supports broker delivery pause/resume and never-offered cancellation. Task dispatch and the dashboard remain pending.
 
 | Capability | Behavior |
 | :--- | :--- |
@@ -497,7 +497,7 @@ docs/                         Remote design, live proof, local deployment record
 
 ## Next work
 
-- [x] Control-plane foundation and opt-in authenticated broker/OpenCode/Codex governance: transactional state, supplemental role notices and isolated OpenCode/Codex worktree capability gates. Effects and dashboard remain pending. [Implementation status and agreed behavior →](docs/control-plane.md)
+- [x] Control-plane foundation and opt-in authenticated broker/OpenCode/Codex governance, plus receipt-backed broker delivery effects. Task/worktree execution and dashboard remain pending. [Implementation status and agreed behavior →](docs/control-plane.md)
 - [ ] React/Mantine operations dashboard, broker/adapter control integration, channel master elections and operational task scheduling.
 - [ ] Verified same-window, same-project `/new` handoff.
 - [x] Per-host credentials and scoped session capabilities (v0.2 candidate).

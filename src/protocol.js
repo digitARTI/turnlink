@@ -65,10 +65,13 @@ const agent = z.object({ agentId: AgentID, hostId: HostID, harness: Harness, ses
 const message = z.object({ id: z.string().uuid(), messageId: bounded(128), to: z.union([AgentID, z.literal('*')]), channel: Channel,
   from: agent, text: z.string().min(1).max(16000), createdAt: z.string().datetime(),
   recipients: z.array(AgentID).max(32), delivered: z.array(AgentID).max(32),
-  cancelled: z.record(AgentID, z.string()).default({}) }).strict();
+  cancelled: z.record(AgentID, z.string()).default({}), offered: z.array(AgentID).max(32).optional() }).strict();
 export const Store = z.strictObject({ version: z.literal(3), agents: z.record(AgentID, agent),
   bindings: z.record(AgentID, z.strictObject({ hostId: HostID, proofHash: z.string().regex(/^[a-f0-9]{64}$/).nullable(), revoked: z.boolean().default(false) })),
-  messages: z.array(message).max(10000) });
+  messages: z.array(message).max(10000),
+  deliveryPauses: z.record(AgentID, z.strictObject({ channel: Channel, actionID: z.string().uuid() })).optional(),
+  effectReceipts: z.record(z.string().uuid(), z.strictObject({ id: z.string().uuid(), channel: Channel, target: AgentID,
+    fingerprint: z.string().regex(/^[a-f0-9]{64}$/), outcome: z.enum(['succeeded', 'failed']), at: z.number().int().nonnegative() })).optional() });
 export const Security = z.strictObject({ version: z.literal(1), hosts: z.record(HostID, z.strictObject({
   hostId: HostID, tokenHash: z.string().regex(/^[a-f0-9]{64}$/), channels: z.array(z.union([Channel, z.literal('*')])).min(1).max(32),
   broadcast: z.boolean(), revoked: z.boolean(),
@@ -79,6 +82,13 @@ export function validateState(value) {
   for (const [id, a] of Object.entries(state.agents)) {
     if (id !== a.agentId || id !== `${a.harness}:${a.sessionId}` || state.bindings[id]?.hostId !== a.hostId) throw new Error('Invalid stored identity binding');
   }
+  if (Object.keys(state.effectReceipts || {}).length > 4096 || Object.keys(state.deliveryPauses || {}).length > 4096) throw new Error('Stored effect limit exceeded');
+  for (const [id, pause] of Object.entries(state.deliveryPauses || {})) {
+    if (state.agents[id]?.channel !== pause.channel || !state.effectReceipts?.[pause.actionID] ||
+      state.effectReceipts[pause.actionID].target !== id || state.effectReceipts[pause.actionID].channel !== pause.channel ||
+      state.effectReceipts[pause.actionID].outcome !== 'succeeded') throw new Error('Invalid delivery pause');
+  }
+  for (const m of state.messages) if (m.offered && (new Set(m.offered).size !== m.offered.length || m.offered.some(id => !m.recipients.includes(id)))) throw new Error('Invalid delivery exposure');
   return state;
 }
 export function parseFrame(raw) {

@@ -5,6 +5,7 @@ import { ControlError, requireControl as check } from './policy.js';
 import { digest, matches } from '../config.js';
 import { MAX_RESPONSE_BYTES } from '../protocol.js';
 import { PARTICIPANT_OPERATIONS, OPERATOR_OPERATIONS, ADAPTER_OPERATIONS } from './operations.js';
+import { BROKER_EFFECT_OPERATIONS } from './effects.js';
 
 const participantOps = new Set(PARTICIPANT_OPERATIONS);
 const operatorOps = new Set(OPERATOR_OPERATIONS);
@@ -13,10 +14,12 @@ const masterOps = new Set(['action.request', 'incident.resolve', 'task.create', 
 
 // All identity/clock/membership inputs below originate in the broker. No caller can provide an Actor or scheduler role.
 export class ControlGateway {
-  constructor({ directory, now, members, member, receiver, messages, hosts, adminDigest, options }) {
+  constructor({ directory, now, members, member, receiver, messages, hosts, adminDigest, options, effectsEnabled = false }) {
     this.store = new ControlStore(directory, options);
     Object.assign(this, { now, members, member, receiver, messages, hosts, adminDigest });
+    this.effectsEnabled = effectsEnabled;
   }
+  capabilities() { return { effectsEnabled: this.effectsEnabled, effectOperations: this.effectsEnabled ? BROKER_EFFECT_OPERATIONS : [], taskDispatchEnabled: false }; }
   context(actor) { return { actor, now: this.now(), members: this.members() }; }
   boundMember(principal, agentId, proof, channel) {
     try { return this.member(principal, agentId, proof, channel); }
@@ -62,7 +65,7 @@ export class ControlGateway {
       }
     }
     // No action.begin/task.prepare endpoint: external effects and dispatch stay disabled until the executor gate.
-    return { ...this.store.apply(command, this.context(actor)), effectsEnabled: false };
+    return { ...this.store.apply(command, this.context(actor)), ...this.capabilities() };
   }
   query(socket, params) {
     const agent = socket.principal.admin ? undefined : this.boundMember(socket.principal, params.agentId, params.proof, params.channel);
@@ -76,7 +79,7 @@ export class ControlGateway {
       this.members().some(m => m.agentId === agent.agentId && m.channel === params.channel && m.connected);
     if (params.view === 'channel') {
       return { channel: { ...channel, active: verifiedActive },
-        members: this.members().filter(m => m.channel === params.channel), effectsEnabled: false };
+        members: this.members().filter(m => m.channel === params.channel), ...this.capabilities() };
     }
     if (params.view === 'messages') {
       check(socket.principal.admin || (master && params.generation === channel.active.generation), 'MASTER_MESSAGE_ACCESS_REQUIRED');
@@ -104,7 +107,7 @@ export class ControlGateway {
   }
   handle(socket, method, params) {
     try {
-      if (method === 'control_info') return { version: 1, enabled: true, effectsEnabled: false, adaptersRequireEnrollment: true };
+      if (method === 'control_info') return { version: 1, enabled: true, ...this.capabilities(), adaptersRequireEnrollment: true };
       if (method === 'control_command') return this.command(socket, params);
       if (method === 'control_adapter') return this.command(socket, params, true);
       if (method === 'control_query') return this.query(socket, params);

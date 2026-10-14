@@ -5,15 +5,16 @@ import { once } from 'node:events';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { rmSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import { privateTemp } from '../src/storage.js';
 import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
 
 const HOST = '1'.repeat(64), ADMIN = '2'.repeat(64), ADAPTER = '3'.repeat(64);
-async function fixture(t, enabled = true) {
+async function fixture(t, enabled = true, extra = {}) {
   const root = privateTemp(join(tmpdir(), 'turnlink-control-broker-'));
   let now = 1000;
-  const broker = createBroker({ directory: root, port: 0, secret: HOST, adminSecret: ADMIN, controlPlane: enabled, now: () => now });
+  const broker = createBroker({ directory: root, port: 0, secret: HOST, adminSecret: ADMIN, controlPlane: enabled, now: () => now, ...extra });
   await once(broker.server, 'listening');
   const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, credentialDirectory: join(root, 'proofs') };
   const clients = [];
@@ -56,6 +57,8 @@ test('broker derives roles and refuses caller-selected operator, adapter or sche
   await assert.rejects(f.run(f.a, 'opencode:a', 'channel.configure', { mode: 'automatic' }), /CONTROL_OPERATION_DISABLED/);
   await assert.rejects(f.run(f.a, 'opencode:a', 'evidence.record', { entityID: randomUUID(), kind: 'idle' }), /CONTROL_OPERATION_DISABLED/);
   await assert.rejects(f.run(f.admin, undefined, 'action.begin', { actionID: randomUUID() }), /CONTROL_OPERATION_DISABLED/);
+  await assert.rejects(f.run(f.admin, undefined, 'action.revalidate', { actionID: randomUUID() }), /CONTROL_OPERATION_DISABLED/);
+  await assert.rejects(f.run(f.a, 'opencode:a', 'action.reconcile', { actionID: randomUUID(), outcome: 'succeeded', evidenceID: randomUUID() }), /CONTROL_OPERATION_DISABLED/);
   await assert.rejects(f.run(f.a, 'opencode:a', 'master.volunteer', { eligible: true, actor: { kind: 'operator' } }), /Invalid request schema/);
   await assert.rejects(f.a.rpc('control_query', { agentId: 'opencode:b', proof: '0'.repeat(64), channel: 'dev', view: 'channel' }), /CONTROL_ACCESS_DENIED/);
   await f.run(f.admin, undefined, 'channel.configure', {}, 'other');
@@ -89,6 +92,10 @@ test('master activation requires a durable native role-notice receipt; ordinary 
   assert.equal((await f.query(f.a, 'opencode:a', 'messages', { generation })).entries[0].text, 'private peer exchange');
   assert.deepEqual(await f.a.request('history', { agentId: 'opencode:a', channel: 'dev' }), []);
   await assert.rejects(f.query(f.b, 'opencode:b', 'messages', { generation }), /MASTER_MESSAGE_ACCESS_REQUIRED/);
+  await f.run(f.a, 'opencode:a', 'action.request', { generation, operation: 'pause_delivery', target: 'opencode:b', evidence: 'not_applicable' });
+  await delay(75);
+  assert.equal(f.broker.store.deliveryPauses, undefined, 'effects must remain disabled by default');
+  assert.equal((await f.admin.request('control_info')).effectsEnabled, false);
   f.advance(120000);
   await assert.rejects(f.query(f.a, 'opencode:a', 'messages', { generation }), /MASTER_MESSAGE_ACCESS_REQUIRED/);
 });
@@ -116,4 +123,77 @@ test('bounded control pagination never returns another channel or credentials', 
   assert.ok(!JSON.stringify(page).includes(ADAPTER));
   const next = await f.query(f.a, 'opencode:a', 'tasks', { offset: page.next });
   assert.equal(next.entries.length + page.entries.length, 4);
+});
+
+test('opt-in broker effects pause, cancel only unoffered queued messages, and resume future delivery', async t => {
+  const f = await fixture(t, true, { controlEffects: true, sweepIntervalMs: 50 });
+  await f.enroll(); const { proposalID, notice } = await f.appoint();
+  await f.a.request('control_notice_ack', { agentId: 'opencode:a', credential: ADAPTER, id: notice.id, receiptID: 'msg_effect_role' });
+  await f.run(f.a, 'opencode:a', 'master.accept', { proposalID, promptVersion: 1 });
+  const generation = (await f.query()).channel.active.generation;
+  const waitAction = async id => {
+    for (let i = 0; i < 100; i++) {
+      const receipt = f.broker.store.effectReceipts?.[id];
+      if (receipt) return receipt;
+      await delay(25);
+    }
+    throw new Error('Broker effect did not settle');
+  };
+  const pause = await f.run(f.a, 'opencode:a', 'action.request', { generation, operation: 'pause_delivery', target: 'opencode:b', evidence: 'not_applicable' });
+  assert.equal((await waitAction(pause.commandID)).outcome, 'succeeded');
+  const seen = []; f.b.on('message', message => seen.push(message));
+  const queued = await f.a.request('send', { agentId: 'opencode:a', to: 'opencode:b', text: 'queued', messageId: 'queued' });
+  const held = await f.a.request('send', { agentId: 'opencode:a', to: 'opencode:b', text: 'held until resume', messageId: 'held' });
+  assert.deepEqual(f.broker.store.messages.find(m => m.id === queued.id).offered, []);
+  await delay(75); assert.equal(seen.length, 0);
+  const cancel = await f.run(f.a, 'opencode:a', 'action.request', { generation, operation: 'cancel_queued', target: 'opencode:b', messageID: queued.id, evidence: 'not_applicable' });
+  await delay(75); assert.equal(f.broker.store.effectReceipts[cancel.commandID], undefined);
+  await f.run(f.admin, undefined, 'action.approve', { actionID: cancel.commandID });
+  assert.equal((await waitAction(cancel.commandID)).outcome, 'succeeded');
+  const resume = await f.run(f.a, 'opencode:a', 'action.request', { generation, operation: 'resume_delivery', target: 'opencode:b', evidence: 'not_applicable' });
+  await waitAction(resume.commandID);
+  for (let i = 0; i < 100 && !seen.some(m => m.id === held.id); i++) await delay(25);
+  assert.ok(seen.some(m => m.id === held.id));
+  const pushed = once(f.b, 'message');
+  await f.a.request('send', { agentId: 'opencode:a', to: 'opencode:b', text: 'new delivery', messageId: 'new' });
+  const [message] = await pushed; assert.equal(message.text, 'new delivery'); assert.equal(message.offered, undefined);
+  assert.ok(!seen.some(m => m.id === queued.id));
+  assert.deepEqual((await f.admin.request('control_info')).effectOperations, ['pause_delivery', 'resume_delivery', 'cancel_queued']);
+});
+
+test('an offered broker message cannot be cancelled by master assertion or human approval', async t => {
+  const f = await fixture(t, true, { controlEffects: true, sweepIntervalMs: 50 });
+  await f.enroll(); const { proposalID, notice } = await f.appoint();
+  await f.a.request('control_notice_ack', { agentId: 'opencode:a', credential: ADAPTER, id: notice.id, receiptID: 'msg_effect_role' });
+  await f.run(f.a, 'opencode:a', 'master.accept', { proposalID, promptVersion: 1 });
+  const generation = (await f.query()).channel.active.generation;
+  const message = await f.a.request('send', { agentId: 'opencode:a', to: 'opencode:b', text: 'possibly admitted', messageId: 'offered' });
+  const cancel = await f.run(f.a, 'opencode:a', 'action.request', { generation, operation: 'cancel_queued', target: 'opencode:b', messageID: message.id, evidence: 'known_unadmitted' });
+  await f.run(f.admin, undefined, 'action.approve', { actionID: cancel.commandID });
+  for (let i = 0; i < 100 && !f.broker.store.effectReceipts?.[cancel.commandID]; i++) await delay(25);
+  assert.equal(f.broker.store.effectReceipts[cancel.commandID].outcome, 'failed');
+  assert.equal(f.broker.store.messages.find(m => m.id === message.id).cancelled['opencode:b'], undefined);
+});
+
+test('real broker restart settles a committed effect receipt without reapplying its action', async t => {
+  const f = await fixture(t, true, { controlEffects: true, sweepIntervalMs: 50,
+    effectHooks: { afterEffect: () => { throw new Error('Simulated loss before SQLite settlement'); } } });
+  await f.enroll(); const { proposalID, notice } = await f.appoint();
+  await f.a.request('control_notice_ack', { agentId: 'opencode:a', credential: ADAPTER, id: notice.id, receiptID: 'msg_restart_role' });
+  await f.run(f.a, 'opencode:a', 'master.accept', { proposalID, promptVersion: 1 });
+  const generation = (await f.query()).channel.active.generation;
+  const action = await f.run(f.a, 'opencode:a', 'action.request', { generation, operation: 'pause_delivery', target: 'opencode:b', evidence: 'not_applicable' });
+  for (let i = 0; i < 100 && !f.broker.store.effectReceipts?.[action.commandID]; i++) await delay(25);
+  const receipt = f.broker.store.effectReceipts[action.commandID]; assert.ok(receipt);
+  await f.broker.close();
+  let reapplied = false;
+  const restarted = createBroker({ directory: join(f.options.credentialDirectory, '..'), port: 0, secret: HOST, adminSecret: ADMIN,
+    now: () => 1000, controlPlane: true, controlEffects: true, effectHooks: { afterEffect: () => { reapplied = true; } } });
+  await once(restarted.server, 'listening');
+  const admin = new ChannelClient({ token: ADMIN, url: `ws://127.0.0.1:${restarted.server.address().port}` });
+  t.after(async () => { admin.close(); await restarted.close(); });
+  const actions = await admin.request('control_query', { channel: 'dev', view: 'actions' });
+  assert.equal(actions.entries.find(a => a.id === action.commandID).status, 'succeeded');
+  assert.equal(reapplied, false); assert.deepEqual(restarted.store.effectReceipts[action.commandID], receipt);
+  admin.close(); await restarted.close();
 });

@@ -19,7 +19,7 @@ export const tools = [
 ];
 const ParticipantCommand = z.discriminatedUnion('op', Command.options.filter(schema => PARTICIPANT_OPERATIONS.includes(schema.shape.op.value)));
 export const controlTools = [
-  { name: 'channel_control', description: 'Opt-in Turnlink governance and task records. Identity is harness-bound. Only participant operations are offered; external effects/dispatch are not enabled yet.',
+  { name: 'channel_control', description: 'Opt-in Turnlink governance and task records. Identity is harness-bound. Only participant operations are offered; query channel status for supported broker effects. Task dispatch remains disabled.',
     inputSchema: schema({ command: z.toJSONSchema(ParticipantCommand) }) },
   { name: 'channel_status', description: 'Read authenticated channel state, tasks, incidents or audit events. Message bodies require the current master generation; ordinary history visibility is unchanged.',
     inputSchema: schema({ channel: str, view: { type: 'string', enum: ['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'notices'] },

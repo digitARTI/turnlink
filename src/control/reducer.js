@@ -188,6 +188,18 @@ export function reduceControl(previous, input, suppliedContext) {
       check(channel.mode !== 'approval' || value.approvedAt !== undefined, 'HUMAN_APPROVAL_REQUIRED');
       value.status = 'executing'; emit('action.executing', value.id, value.generation); break;
     }
+    case 'action.revalidate': {
+      scheduler(); const value = action(); currentAction(value);
+      check(value.status === 'executing', 'ACTION_NOT_EXECUTING');
+      check(channel.mode !== 'approval' || value.approvedAt !== undefined, 'HUMAN_APPROVAL_REQUIRED'); break;
+    }
+    case 'action.reconcile': {
+      scheduler(); const value = action(); check(value.status === 'executing', 'ACTION_NOT_EXECUTING');
+      check(['pause_delivery', 'resume_delivery', 'cancel_queued'].includes(value.operation), 'CONTROL_OPERATION_DISABLED');
+      value.status = command.outcome; value.evidenceID = command.evidenceID;
+      emit(`action.${command.outcome}`, value.id);
+      if (command.outcome === 'uncertain') incident('admission', value.id); break;
+    }
     case 'action.finish': {
       check(actor.kind === 'adapter', 'ADAPTER_REQUIRED'); const value = action();
       check(value.target === actor.agentId && value.status === 'executing', 'ACTION_NOT_EXECUTING');

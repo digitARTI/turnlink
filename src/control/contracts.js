@@ -54,6 +54,8 @@ export const Command = z.discriminatedUnion('op', [
   payload('action.approve', { actionID: UUID }),
   payload('action.reject', { actionID: UUID }),
   payload('action.begin', { actionID: UUID }),
+  payload('action.revalidate', { actionID: UUID }),
+  payload('action.reconcile', { actionID: UUID, outcome: z.enum(['succeeded', 'failed', 'uncertain']), evidenceID: UUID }),
   payload('action.finish', { actionID: UUID, outcome: z.enum(['succeeded', 'failed', 'uncertain']), evidenceID: UUID }),
   payload('incident.open', { category: z.enum(['connectivity', 'permission', 'question', 'admission', 'storage', 'deadline', 'capability']), entityID: UUID.optional() }),
   payload('incident.resolve', { incidentID: UUID, generation: Stamp.optional(), evidenceID: UUID }),

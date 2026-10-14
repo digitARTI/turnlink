@@ -3,7 +3,7 @@ import { constants, openSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { acquireStore, privateDirectory, assertPrivateFile } from '../storage.js';
-import { Command, Context, Event, Notice, Stamp, UUID, MASTER_PROMPT_VERSION, freshControlState, validateControlState, RETENTION_MS } from './contracts.js';
+import { Command, Context, Action, Event, Notice, Stamp, UUID, MASTER_PROMPT_VERSION, freshControlState, validateControlState, RETENTION_MS } from './contracts.js';
 import { HostID, Channel, AgentID } from '../protocol.js';
 import { reduceControl } from './reducer.js';
 import { ControlError, requireControl as check, masterInstructions } from './policy.js';
@@ -36,7 +36,7 @@ export class ControlStore {
       check(stat.nlink === 1, 'INSECURE_CONTROL_DATABASE');
       this.db = new DatabaseSync(path);
       const version = this.db.prepare('PRAGMA user_version').get().user_version;
-      check([0, 1, 2, 3].includes(version), 'UNSUPPORTED_CONTROL_SCHEMA');
+      check([0, 1, 2, 3, 4].includes(version), 'UNSUPPORTED_CONTROL_SCHEMA');
       if (version === 0) check(this.db.prepare("SELECT count(*) AS total FROM sqlite_master WHERE type='table'").get().total === 0, 'UNKNOWN_CONTROL_DATABASE');
       else this.snapshot(); // Reject unknown/corrupt state before changing journal mode or performing migrations.
       // Configure durability before the first schema/state transaction, not after bootstrapping.
@@ -65,6 +65,9 @@ export class ControlStore {
         CREATE TABLE credential_audit (sequence INTEGER PRIMARY KEY AUTOINCREMENT, host_id TEXT NOT NULL,
           action TEXT NOT NULL CHECK(action IN ('enrolled','revoked')), at INTEGER NOT NULL);
         PRAGMA user_version=3; COMMIT;`);
+      if (version < 4) this.db.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE effect_intents (id TEXT PRIMARY KEY, channel TEXT NOT NULL, body TEXT NOT NULL);
+        PRAGMA user_version=4; COMMIT;`);
       // Bound total database size. WAL is checkpointed after batches and private directory permissions protect sidecars.
       this.db.exec('PRAGMA max_page_count=32768; PRAGMA wal_autocheckpoint=100;');
       this.snapshot();
@@ -103,6 +106,10 @@ export class ControlStore {
       const insert = this.db.prepare('INSERT INTO events(id, channel, at, durable, body) VALUES(?,?,?,?,?)');
       for (const event of events) insert.run(event.id, event.channel, event.at, event.durable ? 1 : 0, JSON.stringify(event));
       this.enqueueNotices(previous, state, events);
+      for (const event of events.filter(e => e.type === 'action.executing')) {
+        const value = state.actions.find(a => a.id === event.entityID);
+        this.db.prepare('INSERT INTO effect_intents VALUES(?,?,?)').run(value.id, value.channel, JSON.stringify(value));
+      }
       // Persist a bounded receipt rather than a full state snapshot for every command.
       const result = { commandID: command.id, channel: command.channel, eventIDs: events.map(e => e.id) };
       this.db.prepare('INSERT INTO commands(id, fingerprint, result) VALUES(?,?,?)').run(command.id, fingerprint, JSON.stringify(result));
@@ -117,6 +124,15 @@ export class ControlStore {
     check(Number.isSafeInteger(after) && after >= 0 && Number.isInteger(limit) && limit >= 1 && limit <= 100, 'INVALID_EVENT_PAGE');
     const rows = this.db.prepare('SELECT sequence, body FROM events WHERE channel=? AND sequence>? ORDER BY sequence LIMIT ?').all(channel, after, limit);
     return { entries: rows.map(row => ({ sequence: row.sequence, ...Event.parse(JSON.parse(row.body)) })), next: rows.at(-1)?.sequence ?? after };
+  }
+  effectIntents() {
+    this.available();
+    return this.db.prepare('SELECT * FROM effect_intents ORDER BY rowid').all().map(row => {
+      check(Buffer.byteLength(row.body) <= 4096, 'INVALID_EFFECT_INTENT');
+      const value = Action.parse(JSON.parse(row.body));
+      check(value.id === row.id && value.channel === row.channel && value.status === 'executing', 'INVALID_EFFECT_INTENT');
+      return value;
+    });
   }
   enqueueNotices(previous, state, events) {
     for (const event of events.filter(e => ['master.proposed', 'master.activated', 'master.ended'].includes(e.type))) {
