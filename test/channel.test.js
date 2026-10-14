@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
-import plugin from '../adapters/opencode.js';
+import { openCodeFixture } from './fixtures/opencode.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
@@ -137,7 +137,7 @@ test('Codex proxy wakes same idle thread, steers busy thread, isolates sessions 
   assert.equal(stderr, '');
 });
 
-test('OpenCode plugin wakes idle existing session and inserts busy context', async t => {
+test('OpenCode V2 admits peer input in the existing session without overriding agent/model', async t => {
   const { options, make, broker } = await setup(t);
   const before = { url: process.env.AGENT_CHANNEL_URL, token: process.env.AGENT_CHANNEL_TOKEN, credentials: process.env.AGENT_CHANNEL_CREDENTIAL_DIR };
   process.env.AGENT_CHANNEL_URL = options.url; process.env.AGENT_CHANNEL_TOKEN = options.token;
@@ -147,27 +147,18 @@ test('OpenCode plugin wakes idle existing session and inserts busy context', asy
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
   });
-  const calls = []; let busy = false;
-  const hooks = await plugin({ directory: '/projects/b', client: {
-    session: {
-      status: async () => ({ data: { b: { type: busy ? 'busy' : 'idle' } } }),
-      messages: async () => ({ data: [{ info: { role: 'user', agent: 'plan', model: { providerID: 'fixture', modelID: 'test' }, tools: { edit: false } } }] }),
-      promptAsync: async input => { calls.push({ method: 'wake', input }); },
-      prompt: async input => { calls.push({ method: 'context', input }); },
-    }, app: { log: async () => {} },
-  } });
-  t.after(() => hooks.dispose());
-  await hooks.tool.channel_join.execute({ name: 'b', role: 'frontend', channel: 'development', project: { name: 'ui' } }, { sessionID: 'b' });
+  const { tools, calls } = await openCodeFixture(t, options);
+  await tools.channel_join.execute({ name: 'b', role: 'frontend', channel: 'development', project: { name: 'ui' } }, { sessionID: 'b' });
   const a = make(); await a.request('join', registration('a'));
   await a.request('send', { agentId: 'codex:a', to: 'opencode:b', text: 'wake', messageId: 'open-wake' });
   await eventually(() => calls.length === 1);
-  assert.equal(calls[0].method, 'wake'); assert.equal(calls[0].input.path.id, 'b');
-  assert.equal(calls[0].input.body.agent, 'plan'); assert.equal(calls[0].input.body.tools.edit, false);
+  assert.equal(calls[0].sessionID, 'b'); assert.equal(calls[0].delivery, 'steer'); assert.equal(calls[0].resume, true);
+  assert.equal(calls[0].agent, undefined); assert.equal(calls[0].model, undefined); assert.equal(calls[0].tools, undefined);
+  assert.match(calls[0].id, /^msg_turnlink_/);
   await eventually(() => broker.store.messages[0].delivered.includes('opencode:b'));
-  busy = true;
   await a.request('send', { agentId: 'codex:a', to: 'opencode:b', text: 'steer', messageId: 'open-steer' });
   await eventually(() => calls.length === 2);
-  assert.equal(calls[1].method, 'context'); assert.equal(calls[1].input.body.noReply, true);
+  assert.equal(calls[1].delivery, 'steer'); assert.notEqual(calls[0].id, calls[1].id);
 });
 
 test('Claude MCP channel pushes unsolicited messages and requires explicit model acknowledgement', async t => {
@@ -204,52 +195,41 @@ test('OpenCode leave clears pending wake before the harness has admitted the tas
   });
   let resumeStatus;
   const calls = [];
-  const hooks = await plugin({ directory: '/projects/b', client: {
-    session: {
-      status: () => new Promise(resolve => { resumeStatus = resolve; }),
-      promptAsync: async input => { calls.push(input); },
-      prompt: async input => { calls.push(input); },
-    }, app: { log: async () => {} },
+  const fixture = await openCodeFixture(t, options, { session: {
+    prompt: async input => { calls.push(input); return { id: input.id, sessionID: input.sessionID }; },
   } });
-  t.after(() => hooks.dispose());
+  fixture.ctx.permission.list = () => new Promise(resolve => { resumeStatus = resolve; });
   const context = { sessionID: 'b' };
-  await hooks.tool.channel_join.execute({ name: 'b', role: 'frontend', channel: 'development', project: { name: 'ui' } }, context);
+  await fixture.tools.channel_join.execute({ name: 'b', role: 'frontend', channel: 'development', project: { name: 'ui' } }, context);
   const a = make(); await a.request('join', registration('a'));
   await a.request('send', { agentId: 'codex:a', to: 'opencode:b', text: 'must not wake after leave', messageId: 'leave-race' });
   await eventually(() => !!resumeStatus);
-  await hooks.tool.channel_leave.execute({}, context);
-  resumeStatus({ data: { b: { type: 'idle' } } });
+  await fixture.tools.channel_leave.execute({}, context);
+  resumeStatus([]);
   await delay(30);
   assert.equal(calls.length, 0);
   assert.equal(broker.store.agents['opencode:b'], undefined);
   assert.equal(broker.store.messages[0].cancelled['opencode:b'], 'explicit_leave');
 });
 
-test('OpenCode v2 permission/question prompts remain blocking until both are answered', async t => {
+test('OpenCode V2 permissions/forms remain blocking until both are answered', async t => {
   const { options, make } = await setup(t);
   const calls = [];
   // Plugin credentials are supplied through a private synthetic host file, not the real user token.
   const file = join(options.credentialDirectory, '..', 'host.token');
   writeFileSync(file, TOKEN, { mode: 0o600 });
-  const configured = await plugin({ directory: '/test', client: {
-    session: {
-      status: async () => ({ data: { b: { type: 'idle' } } }),
-      messages: async () => ({ data: [{ info: { role: 'user', agent: 'plan', model: { providerID: 'fixture', modelID: 'test' } } }] }),
-      promptAsync: async args => calls.push(args), prompt: async args => calls.push(args),
-    }, app: { log: async () => {} },
-  } }, { url: options.url, credentialDirectory: options.credentialDirectory, tokenFile: file });
-  t.after(() => configured.dispose());
-  await configured.tool.channel_join.execute({ channel: 'development', name: 'b', role: 'worker', project: { name: 'test' } }, { sessionID: 'b' });
-  await configured.event({ event: { type: 'permission.v2.asked', properties: { sessionID: 'b', id: 'permission' } } });
-  await configured.event({ event: { type: 'question.v2.asked', properties: { sessionID: 'b', id: 'question' } } });
+  const configured = await openCodeFixture(t, { url: options.url, credentialDirectory: options.credentialDirectory, tokenFile: file }, { session: {
+    prompt: async input => { calls.push(input); return { id: input.id, sessionID: input.sessionID }; },
+  } });
+  await configured.tools.channel_join.execute({ channel: 'development', name: 'b', role: 'worker', project: { name: 'test' } }, { sessionID: 'b' });
+  configured.emit('permission.asked', { sessionID: 'b', id: 'permission' });
+  configured.emit('form.created', { form: { sessionID: 'b', id: 'question' } });
   const a = make(); await a.request('join', registration('a'));
   await a.request('send', { agentId: 'codex:a', to: 'opencode:b', text: 'pending approval wake', messageId: 'approval-v2' });
   await delay(30); assert.equal(calls.length, 0);
-  await configured.event({ event: { type: 'permission.v2.replied', properties: { sessionID: 'b', requestID: 'permission' } } });
-  await configured.event({ event: { type: 'session.idle', properties: { sessionID: 'b' } } });
+  configured.emit('permission.replied', { sessionID: 'b', requestID: 'permission' });
   await delay(30); assert.equal(calls.length, 0);
-  await configured.event({ event: { type: 'question.v2.replied', properties: { sessionID: 'b', requestID: 'question' } } });
-  await configured.event({ event: { type: 'session.idle', properties: { sessionID: 'b' } } });
+  configured.emit('form.replied', { sessionID: 'b', id: 'question' });
   await eventually(() => calls.length === 1);
-  assert.equal(calls[0].body.agent, 'plan');
+  assert.equal(calls[0].agent, undefined);
 });

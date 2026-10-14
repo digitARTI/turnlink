@@ -27,16 +27,16 @@ Enrollment writes a fresh credential to a new private file and prints only its l
 
 Use `AGENT_CHANNEL_TOKEN_FILE` for the host credential. `AGENT_CHANNEL_CREDENTIAL_DIR` selects the session-proof/admission-receipt directory. URLs cannot contain credentials or query parameters; remote plaintext WebSockets are rejected. Keep the endpoint loopback or SSH-forwarded.
 
-OpenCode accepts explicit plugin options:
+OpenCode V2 (>=2.0.28, <3) accepts explicit plugin options. This is independent of the Turnlink protocol-v2/state migration described here. The background service owns the plugin; save active work before restarting it if changed dependencies require it:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [["file:///absolute/path/turnlink/adapters/opencode.js", {
+  "plugins": [{ "package": "file:///absolute/path/turnlink/adapters/opencode", "options": {
     "url": "ws://127.0.0.1:47321",
     "tokenFile": "/private/workstation.token",
     "credentialDirectory": "/private/turnlink-session-keys"
-  }]]
+  }}]
 }
 ```
 
@@ -55,10 +55,10 @@ For Claude resume, use its real existing ID through the normal resume mechanism 
 Adapters persist message-ID/fingerprint receipts before requesting a turn. States are `inflight`, `uncertain`, `accepted` and `not_admitted`.
 
 - Acceptance is persisted before acknowledgement.
-- Timeout/lost response remains uncertain, including after restart. It is not blindly retried.
+- Timeout/lost response remains uncertain, including after restart. Codex and legacy receipts are held for reconciliation. OpenCode V2 retries only with its recorded stable native admission ID, letting the harness deduplicate admission.
 - Late Codex responses are consumed inside the proxy and reconcile the receipt without leaking internal RPC IDs into VS Code.
 - Accepted receipts deduplicate replay. Exactly-once arbitrary task effects are not promised.
-- OpenCode preserves its observed agent, model and tool restrictions. Unknown mode stays queued; legacy and v2 permission/question events remain blocking.
+- OpenCode V2 preserves the session's current agent, model and permissions without copying stale settings. Pending permissions, running questions and observed forms block admission; see [V2 recovery limitations](opencode-v2.md).
 - Claude still requires explicit model acknowledgement.
 
 Inspect a receipt, then resolve it only with actual harness evidence:

@@ -23,11 +23,11 @@ Add this plugin entry to your project's existing `opencode.json`, preserving oth
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["file:///Users/sandrovita/Progetti/agent-channel/adapters/opencode.js"]
+  "plugins": ["file:///Users/sandrovita/Progetti/agent-channel/adapters/opencode"]
 }
 ```
 
-Quit and restart OpenCode. Ask the agent to join a channel with its name, role and project. Native tools bind identity to the actual session automatically. Idle delivery uses `session.promptAsync`; busy delivery inserts context using `noReply`. Busy insertion is not a guarantee that a tool call already selected by the model will be reconsidered. Permission/question events pause delivery where exposed by the installed harness.
+Use OpenCode >=2.0.28 and <3; the adapter is V2-only. Configure the directory above, not the former JavaScript file URL. The background service owns the plugin; save active work before restarting it when necessary. Ask the agent to join a channel with its name, role and project. Native tools bind identity to the actual session automatically. Delivery uses durable `session.prompt` admission with `delivery: "steer"` and `resume: true`, preserving the session agent/model. Permissions, running questions and observed forms pause delivery. See [V2 migration and recovery](opencode-v2.md).
 
 ## Codex in the official VS Code extension
 

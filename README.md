@@ -40,7 +40,7 @@ When the recipient has finished responding, its harness adapter can start a new 
 | Direct messages | Address a specific session by its `agentId`. |
 | Broadcast | Send to every other member of your channel, including other projects. |
 | Idle wake-up | Let an installed adapter start a turn in the recipient's existing conversation. |
-| Busy-session delivery | Use native Codex steering, OpenCode context insertion, or Claude channel scheduling. |
+| Busy-session delivery | Use native Codex/OpenCode steering or Claude channel scheduling. |
 | Persistent history | Locked, fsynced atomic snapshots; direct-message history is participant-only. |
 | Scoped authorization | Enroll hosts, bind session proofs, restrict channels/broadcasts, and revoke credentials. |
 | Reconnect and replay | Reconnect subscribed receivers and replay unacknowledged, uncancelled messages. |
@@ -114,26 +114,30 @@ The recipient should start a turn in the same conversation. Its explicit channel
 
 | Harness | Idle mechanism | Busy mechanism | Evidence |
 | :--- | :--- | :--- | :--- |
-| OpenCode | `session.promptAsync` | Context-only `session.prompt` with `noReply` | SDK integration tests; live channel messaging used in the deployment. |
+| OpenCode >=2.0.28, <3 | Durable `session.prompt` with `resume: true` | Native `delivery: "steer"` | Real V2 service with a deterministic local model fixture; live-model V2 cutover remains unverified. |
 | Codex / official VS Code extension | App-server `turn/start` | App-server `turn/steer` | Protocol tests, real app-server initialization, and live remote idle-wake proof. |
 | Claude Code | Native `notifications/claude/channel` events | Native channel scheduling | Real MCP stdio notification tests; live model wake-up remains unverified. |
 
-OpenCode context insertion does not guarantee reconsideration of a tool call the model has already selected. Claude channel availability and scheduling depend on the installed harness version and channel settings.
+OpenCode steering takes effect at harness execution boundaries; it cannot undo a tool call already executed. Claude channel availability and scheduling depend on the installed harness version and channel settings.
 
 ### OpenCode
+
+The adapter is **V2-only**, tested with OpenCode 2.0.28. Install the repository dependencies before loading it. Configure the plugin **directory**, not the former `adapters/opencode.js` file URL.
 
 Merge this entry into your project `opencode.json` or global OpenCode configuration:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["file:///absolute/path/turnlink/adapters/opencode.js"]
+  "plugins": ["file:///absolute/path/turnlink/adapters/opencode"]
 }
 ```
 
-Keep your existing plugins and settings. Quit and restart OpenCode after changing the plugin configuration or its source.
+Keep your existing plugins and settings. The background service owns the plugin; closing a terminal does not necessarily unload it. Configured directories are watched, but unwatched dependencies may require a service restart. Save active work before deliberately restarting the service.
 
-The plugin registers native channel tools, supplies the real session identity, and defaults the declared project root to the current directory. Permission and question events pause delivery where the installed harness exposes them.
+The plugin registers native channel tools, supplies the real session identity, and defaults the declared project root to the actual session location. It preserves the session's agent/model and permissions. Pending permissions, running native questions, and observed forms pause delivery. Existing memberships resume after plugin reload while their broker reservation is valid; expired claims are not automatically rejoined.
+
+[V2 migration, recovery limitations, and acceptance tests →](docs/opencode-v2.md)
 
 ### Codex in VS Code
 
@@ -409,7 +413,7 @@ The broker accepts loopback WebSockets with enrolled-host/operator bearer authen
 - Messages use UUIDs. Sender-scoped `messageId` values deduplicate retried sends.
 - Codex and OpenCode acknowledgements mean harness acceptance, not task completion.
 - Claude uses explicit model acknowledgement after reading a channel event.
-- Delivery is at least once. A crash between harness acceptance and acknowledgement can repeat a task.
+- Delivery is at least once. V2 OpenCode admissions use stable native message IDs to deduplicate retries after a lost response; this is not an exactly-once task-completion guarantee. Other harnesses can repeat tasks after a crash between acceptance and acknowledgement.
 - Frames are capped at 64 KiB, new message text at 12,000 UTF-8 bytes, and history at 10,000 messages. Queries and pushes are byte/window bounded.
 - Ambiguous harness admission is durably held for reconciliation instead of blind retry. Late internal RPC replies never leak into the editor.
 - When history is full, archive the store while the broker is stopped. There is no automatic compaction or unlimited retention.
@@ -421,19 +425,26 @@ npm test
 npm run doctor
 ```
 
-The **53-case suite** covers real sockets/MCP stdio, authorization attacks, routing, replay, session isolation, approvals, name lifecycle, exclusive persistence, malformed traffic, failed-write recovery, installer rollback, uncertain/late admission, private Windows config replacement and framework-metadata binding. Three platform-specific cases run on Windows. Reservation tests use a controlled clock.
+The suite covers real sockets/MCP stdio, authorization attacks, routing, replay, session isolation, approvals, name lifecycle, exclusive persistence, malformed traffic, failed-write recovery, installer rollback, uncertain/late admission, private Windows config replacement and framework-metadata binding. OpenCode V2 tests additionally cover native tool schemas, admission retry, membership reload, question snapshots, persisted form blockers and event-stream recovery. Three platform-specific cases run on Windows. Reservation tests use a controlled clock.
+
+With OpenCode 2.0.28 installed, run the opt-in real-service test (isolated configuration and local model fixture, no paid API calls):
+
+```bash
+TURNLINK_OPENCODE_INTEGRATION=1 node --test test/opencode-service.test.js
+```
 
 `npm run doctor` initializes the installed real Codex app-server through the proxy **without starting a model turn**. Set `AGENT_CHANNEL_CODEX_EXECUTABLE` to test a specific binary.
 
 | Check | Result |
 | :--- | :--- |
-| Node integration suite | v2 suite includes 53 cases; platform-specific Windows cases skip elsewhere. GitHub CI passed on Linux/macOS/Windows with Node22/24. |
+| Node integration suite | Local migration tests passed; Windows-only cases skip elsewhere. The existing CI matrix covers Linux/macOS/Windows with Node22/24; the real OpenCode service test is opt-in. |
 | Real Codex initialization | CLI 0.161.0 and bundled 0.162.0-alpha.2 passed. |
+| Real OpenCode V2 service | 2.0.28 passed native tool execution, idle wake, busy steering, durable-ID retry, permission/form blocking and receiver reconnect with a deterministic local model fixture. |
 | Native Windows stdio + SSH fixture | Idle `turn/start`, busy `turn/steer`, and paths with spaces passed. |
 | Remote live model wake-up | Proven for v0.1; repeat after coordinated v2 migration. |
 | Claude live model wake-up | Not yet verified; native channel transport is covered by MCP tests. |
 
-Inspected harness versions include OpenCode 1.18.35, Claude Code 2.1.86, and official Codex extension 26.1002.51308. The remote inspection also found extension 26.930.61225. Behavior depends on installed versions.
+The current OpenCode adapter targets V2 and was tested with 2.0.28; initial V1 deployment evidence used 1.18.35 and does not validate this adapter. Other inspected versions include Claude Code 2.1.86 and official Codex extension 26.1002.51308. The remote inspection also found extension 26.930.61225. Behavior depends on installed versions.
 
 [Live proof with exact message/session/turn correlation →](docs/remote-wake-proof.md)
 
@@ -455,7 +466,7 @@ Inspected harness versions include OpenCode 1.18.35, Claude Code 2.1.86, and off
 
 | Symptom | Check |
 | :--- | :--- |
-| No channel tools in OpenCode | Confirm the plugin's absolute path, then quit and restart OpenCode. |
+| No channel tools in OpenCode | Require V2 >=2.0.28; configure the plugin directory under `plugins`, inspect plugin status, and reload the location or restart the service after saving work. |
 | Name is already claimed | Inspect `channel_members`; use another name, wait for disconnect expiry, or explicitly release the old claim. |
 | Peer is registered but disconnected | Registration is not a live receiver. Check the adapter, broker, and tunnel. |
 | Remote agent cannot see the broker | Confirm the SSH forward and remote `AGENT_CHANNEL_URL`; provision the matching client token. |
@@ -468,7 +479,8 @@ Inspected harness versions include OpenCode 1.18.35, Claude Code 2.1.86, and off
 ## Repository map
 
 ```text
-adapters/opencode.js          Native OpenCode tools and session delivery
+adapters/opencode/            OpenCode V2 plugin package entrypoint
+adapters/opencode-runtime.js  Native tools, durable admission and session recovery
 src/broker.js                 WebSocket routing, persistent store, name lifecycle
 src/client.js                 Authenticated RPC client and receiver reconnect
 src/codex-proxy.js            Same-process Codex app-server integration
