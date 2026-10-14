@@ -66,6 +66,17 @@ test('OpenCode V2 isolates two sessions in one location and never transfers memb
   assert.equal(f.calls.find(call => call.text.includes('first-only')).sessionID, 'b');
 });
 
+test('arbitrary OpenCode moves detach membership and cannot wake or automatically rebind the moved conversation', async t => {
+  const f = await setup(t);
+  f.emit('session.moved', { sessionID: 'b', directory: '/another-worktree' });
+  await eventually(() => f.broker.store.agents['opencode:b'].disconnectedAt !== null && !f.storage.has('memberships/b'));
+  const message = await f.send('must not follow an arbitrary move');
+  await delay(150);
+  assert.equal(f.calls.length, 0); assert.equal(f.broker.store.messages.find(m => m.id === message.id).delivered.length, 0);
+  f.ctx.session.get = async ({ sessionID }) => ({ id: sessionID, location: { directory: '/another-worktree' } });
+  await assert.rejects(f.tools.channel_send.execute({ to: '*', text: 'wrong location' }, { sessionID: 'b' }), /another plugin location/);
+});
+
 test('OpenCode V2 retries uncertain admission with the same native idempotency key', async t => {
   const calls = [], admitted = new Set();
   const f = await setup(t, { session: { prompt: async input => {

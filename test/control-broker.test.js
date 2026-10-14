@@ -197,3 +197,40 @@ test('real broker restart settles a committed effect receipt without reapplying 
   assert.equal(reapplied, false); assert.deepEqual(restarted.store.effectReceipts[action.commandID], receipt);
   admin.close(); await restarted.close();
 });
+
+test('worktree grants are receiver-bound, claim-fenced and cannot be issued by model or operator tools', async t => {
+  const f = await fixture(t, true, { worktreeGrants: true }); await f.enroll();
+  const task = await f.run(f.admin, undefined, 'task.create', { title: 'isolated task', instructions: 'work', criteria: 'tests', requiresWorktree: true });
+  await f.run(f.a, 'opencode:a', 'task.claim', { taskID: task.commandID });
+  const digest = 'a'.repeat(64), preview = { id: randomUUID(), channel: 'dev', op: 'worktree.preview', taskID: task.commandID,
+    from: '/project', to: '/worktree', configurationDigest: digest,
+    binding: { harness: 'opencode', projectID: 'project', sourceAuthorityDigest: digest, destinationAuthorityDigest: digest,
+      sources: [{ path: '/project/AGENTS.md', digest }] } };
+  const adapter = command => f.a.request('control_adapter', { agentId: 'opencode:a', credential: ADAPTER, command });
+  await adapter(preview);
+  assert.equal((await f.query(f.b, 'opencode:b', 'previews')).entries.length, 0);
+  const begin = { id: randomUUID(), channel: 'dev', op: 'worktree.begin', taskID: task.commandID, previewID: preview.id,
+    claimGeneration: 1, configurationDigest: digest, authorityDigest: digest };
+  await assert.rejects(adapter(begin), /STALE_WORKTREE_PREVIEW/);
+  await f.run(f.admin, undefined, 'worktree.approve', { taskID: task.commandID, previewID: preview.id });
+  for (const kind of ['capability', 'idle']) await adapter({ id: randomUUID(), channel: 'dev', op: 'evidence.record', entityID: task.commandID, kind,
+    ...(kind === 'capability' ? { sameConversationWorktree: true } : {}) });
+  await assert.rejects(f.run(f.a, 'opencode:a', 'worktree.begin', { ...begin, id: randomUUID() }), /CONTROL_OPERATION_DISABLED/);
+  await assert.rejects(f.admin.request('control_command', { command: begin }), /CONTROL_OPERATION_DISABLED/);
+  await assert.rejects(f.client().request('control_adapter', { agentId: 'opencode:a', credential: ADAPTER, command: begin }), /ADAPTER_RECEIVER_REQUIRED/);
+  await adapter(begin);
+  await assert.rejects(f.run(f.a, 'opencode:a', 'task.release', { taskID: task.commandID }), /WORKTREE_TRANSITION_UNRESOLVED/);
+  const settlement = { id: randomUUID(), channel: 'dev', op: 'worktree.settle', transitionID: begin.id, outcome: 'moved', actualLocation: '/elsewhere',
+    configurationDigest: digest, authorityDigest: digest, receiptID: randomUUID() };
+  await assert.rejects(adapter(settlement), /UNEXPECTED_WORKTREE_LOCATION/);
+  await adapter({ ...settlement, actualLocation: '/worktree' });
+  assert.equal((await f.query(f.a, 'opencode:a', 'transitions')).entries[0].status, 'moved');
+  assert.equal((await f.a.request('control_info')).worktreeExecutionEnabled, false);
+});
+
+test('worktree grant transport is disabled by default, including for enrolled adapters', async t => {
+  const f = await fixture(t); await f.enroll();
+  await assert.rejects(f.a.request('control_adapter', { agentId: 'opencode:a', credential: ADAPTER, command: { id: randomUUID(), channel: 'dev',
+    op: 'worktree.begin', taskID: randomUUID(), previewID: randomUUID(), claimGeneration: 1,
+    configurationDigest: 'a'.repeat(64), authorityDigest: 'a'.repeat(64) } }), /WORKTREE_GRANTS_DISABLED/);
+});

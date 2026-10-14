@@ -12,6 +12,12 @@ export const Stamp = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
 export const UUID = z.string().uuid();
 const text = max => z.string().trim().min(1).max(max).refine(value => Buffer.byteLength(value, 'utf8') <= max, 'UTF-8 byte limit exceeded');
 const absolutePath = text(2048).refine(value => !value.includes('\0') && (posix.isAbsolute(value) || win32.isAbsolute(value)), 'Absolute host path required');
+const Digest = z.string().regex(/^[a-f0-9]{64}$/);
+export const WorktreeBinding = z.strictObject({ harness: z.enum(['opencode', 'codex']), projectID: text(200),
+  sourceAuthorityDigest: Digest, destinationAuthorityDigest: Digest,
+  sources: z.array(z.strictObject({ path: absolutePath, digest: Digest })).min(1).max(128) })
+  .refine(value => Buffer.byteLength(JSON.stringify(value)) <= 24000, 'Worktree manifest byte limit exceeded')
+  .refine(value => value.sources.every((source, index) => !value.sources.slice(0, index).some(p => p.path === source.path && p.digest !== source.digest)), 'Conflicting worktree source hashes');
 export const Mode = z.enum(['automatic', 'safe', 'approval']);
 export const Operation = z.enum(['retry_delivery', 'pause_delivery', 'resume_delivery', 'change_wake_policy', 'cancel_queued', 'remove_member']);
 export const RecoveryEvidence = z.enum(['known_unadmitted', 'native_idempotent', 'ambiguous', 'not_applicable']);
@@ -68,8 +74,11 @@ export const Command = z.discriminatedUnion('op', [
   payload('task.prepare', { taskID: UUID, capabilityEvidenceID: UUID }),
   payload('evidence.record', { entityID: UUID, kind: EvidenceKind, attempt: Stamp.optional(),
     admissionID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/).optional(), sameConversationWorktree: z.boolean().optional() }),
-  payload('worktree.preview', { taskID: UUID, from: absolutePath, to: absolutePath, configurationDigest: z.string().regex(/^[a-f0-9]{64}$/) }),
+  payload('worktree.preview', { taskID: UUID, from: absolutePath, to: absolutePath, configurationDigest: Digest, binding: WorktreeBinding.optional() }),
   payload('worktree.approve', { taskID: UUID, previewID: UUID }),
+  payload('worktree.begin', { taskID: UUID, previewID: UUID, claimGeneration: Stamp, configurationDigest: Digest, authorityDigest: Digest }),
+  payload('worktree.settle', { transitionID: UUID, outcome: z.enum(['moved', 'failed', 'uncertain']), actualLocation: absolutePath,
+    configurationDigest: Digest, authorityDigest: Digest, receiptID: UUID }),
   payload('task.admission', { taskID: UUID, attempt: Stamp, outcome: z.enum(['admitted', 'unadmitted', 'uncertain']), receiptID: UUID }),
   payload('task.started', { taskID: UUID, attempt: Stamp, evidenceID: UUID }),
   payload('task.progress', { taskID: UUID, attempt: Stamp }),
@@ -96,7 +105,12 @@ export const Task = z.strictObject({ id: UUID, channel: Channel, title: text(200
   result: z.strictObject({ summary: text(4000), evidence: z.array(UUID).min(1).max(32) }).optional(),
   missedDecision: z.enum(['run', 'skip']).optional(), dispatchIntentID: UUID.optional() });
 export const WorktreePreview = z.strictObject({ id: UUID, channel: Channel, taskID: UUID, agentId: AgentID,
-  from: absolutePath, to: absolutePath, configurationDigest: z.string().regex(/^[a-f0-9]{64}$/), approved: z.boolean(), at: Stamp, claimGeneration: Stamp });
+  from: absolutePath, to: absolutePath, configurationDigest: Digest, approved: z.boolean(), at: Stamp, claimGeneration: Stamp,
+  binding: WorktreeBinding.optional() });
+export const WorktreeTransition = z.strictObject({ id: UUID, channel: Channel, taskID: UUID, agentId: AgentID, previewID: UUID,
+  claimGeneration: Stamp, from: absolutePath, to: absolutePath, configurationDigest: Digest, authorityDigest: Digest,
+  status: z.enum(['prepared', 'moved', 'failed', 'uncertain']), preparedAt: Stamp, settledAt: Stamp.optional(), receiptID: UUID.optional(),
+  actualLocation: absolutePath.optional() });
 export const Action = z.strictObject({ id: UUID, channel: Channel, requester: AgentID, generation: Stamp, policyRevision: Stamp,
   operation: Operation, target: AgentID, messageID: UUID.optional(), evidence: RecoveryEvidence, admissionID: text(128).optional(),
   wakePolicy: z.enum(['steer', 'queue', 'paused']).optional(), status: z.enum(['awaiting_approval', 'approved', 'executing', 'succeeded', 'failed', 'uncertain', 'rejected']),
@@ -105,29 +119,29 @@ export const Incident = z.strictObject({ id: UUID, channel: Channel, category: z
   entityID: UUID.optional(), status: z.enum(['open', 'resolved']), openedAt: Stamp, resolvedAt: Stamp.optional(), evidenceID: UUID.optional() });
 export const State = z.strictObject({ version: z.literal(CONTROL_VERSION), lastNow: Stamp,
   channels: z.array(ChannelState).max(128), tasks: z.array(Task).max(4096), actions: z.array(Action).max(4096), incidents: z.array(Incident).max(4096),
-  evidence: z.array(Evidence).max(16384), previews: z.array(WorktreePreview).max(4096) });
+  evidence: z.array(Evidence).max(16384), previews: z.array(WorktreePreview).max(4096), transitions: z.array(WorktreeTransition).max(4096).default([]) });
 export const Event = z.strictObject({ id: UUID, channel: Channel, type: z.enum([
   'channel.configured', 'master.volunteered', 'master.proposed', 'master.activated', 'master.renewed', 'master.ended',
   'election.started', 'election.voted', 'election.inconclusive', 'election.cancelled', 'election.won', 'master.revoked', 'member.departed', 'action.requested', 'action.approved', 'action.rejected',
   'action.executing', 'action.succeeded', 'action.failed', 'action.uncertain', 'incident.opened', 'incident.resolved',
   'task.created', 'task.claimed', 'task.released', 'task.dispatching', 'task.admitted', 'task.unadmitted', 'task.uncertain',
   'task.started', 'task.progress', 'task.stopped', 'task.reassigned', 'task.reported', 'task.completed', 'task.changes_requested', 'task.missed',
-  'evidence.recorded', 'worktree.previewed', 'worktree.approved', 'notice.accepted', 'messages.viewed',
+  'evidence.recorded', 'worktree.previewed', 'worktree.approved', 'worktree.prepared', 'worktree.moved', 'worktree.failed', 'worktree.uncertain', 'notice.accepted', 'messages.viewed',
 ]), actor: Actor, at: Stamp, entityID: UUID.optional(), generation: Stamp.optional(), agentId: AgentID.optional(), durable: z.boolean() });
 export const Notice = z.strictObject({ id: UUID, channel: Channel, agentId: AgentID, assignmentID: UUID, generation: Stamp,
   promptVersion: z.literal(MASTER_PROMPT_VERSION), kind: z.enum(['offer', 'active', 'ended']), text: text(6000), at: Stamp,
   status: z.enum(['pending', 'accepted', 'cancelled']), receiptID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/).optional() });
-export const freshControlState = () => ({ version: CONTROL_VERSION, lastNow: 0, channels: [], tasks: [], actions: [], incidents: [], evidence: [], previews: [] });
+export const freshControlState = () => ({ version: CONTROL_VERSION, lastNow: 0, channels: [], tasks: [], actions: [], incidents: [], evidence: [], previews: [], transitions: [] });
 
 export function validateControlState(input) {
   const state = State.parse(input);
   const channels = new Map(state.channels.map(c => [c.id, c]));
   const tasks = new Map(state.tasks.map(t => [t.id, t]));
   const evidence = new Map(state.evidence.map(e => [e.id, e]));
-  for (const entries of [state.channels, state.tasks, state.actions, state.incidents, state.evidence, state.previews]) {
+  for (const entries of [state.channels, state.tasks, state.actions, state.incidents, state.evidence, state.previews, state.transitions]) {
     if (new Set(entries.map(e => e.id)).size !== entries.length) throw new Error('Duplicate control entity');
   }
-  for (const entry of [...state.tasks, ...state.actions, ...state.incidents, ...state.evidence, ...state.previews]) {
+  for (const entry of [...state.tasks, ...state.actions, ...state.incidents, ...state.evidence, ...state.previews, ...state.transitions]) {
     if (!channels.has(entry.channel)) throw new Error('Unknown control channel');
   }
   for (const channel of state.channels) {
@@ -170,6 +184,22 @@ export function validateControlState(input) {
   }
   for (const preview of state.previews) {
     if (tasks.get(preview.taskID)?.channel !== preview.channel || preview.from === preview.to) throw new Error('Invalid worktree preview');
+    if (preview.binding && !preview.agentId.startsWith(`${preview.binding.harness}:`)) throw new Error('Invalid worktree harness binding');
+  }
+  const unresolved = new Set();
+  for (const transition of state.transitions) {
+    const preview = state.previews.find(p => p.id === transition.previewID), task = tasks.get(transition.taskID);
+    if (!preview?.approved || !preview.binding || task?.channel !== transition.channel || preview.taskID !== task.id ||
+      preview.agentId !== transition.agentId || preview.channel !== transition.channel || preview.claimGeneration !== transition.claimGeneration ||
+      transition.from !== preview.from || transition.to !== preview.to || transition.configurationDigest !== preview.configurationDigest ||
+      transition.authorityDigest !== preview.binding.sourceAuthorityDigest || transition.authorityDigest !== preview.binding.destinationAuthorityDigest) throw new Error('Invalid worktree transition');
+    if (['prepared', 'uncertain'].includes(transition.status)) {
+      if (unresolved.has(transition.agentId) || task.claimant !== transition.agentId || task.claimGeneration !== transition.claimGeneration) throw new Error('Invalid worktree continuity');
+      unresolved.add(transition.agentId);
+    }
+    if (transition.status !== 'prepared' && (!transition.receiptID || transition.settledAt === undefined || !transition.actualLocation)) throw new Error('Missing worktree receipt');
+    if (transition.status === 'moved' && transition.actualLocation !== transition.to) throw new Error('Invalid moved location');
+    if (transition.status === 'failed' && transition.actualLocation !== transition.from) throw new Error('Unproven worktree failure');
   }
   // Kahn's algorithm avoids recursive stack exhaustion for a long, otherwise valid dependency chain.
   const indegree = new Map(state.tasks.map(t => [t.id, t.dependencies.length])), dependants = new Map();

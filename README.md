@@ -497,7 +497,7 @@ docs/                         Remote design, live proof, local deployment record
 
 ## Next work
 
-- [x] Control-plane foundation and opt-in authenticated broker/OpenCode/Codex governance, plus receipt-backed broker delivery effects. Task/worktree execution and dashboard remain pending. [Implementation status and agreed behavior →](docs/control-plane.md)
+- [x] Control-plane foundation, authenticated broker/OpenCode/Codex governance, receipt-backed broker delivery effects and internal worktree grant/recovery contracts. Live task/worktree execution and dashboard remain pending. [Implementation status and agreed behavior →](docs/control-plane.md)
 - [ ] React/Mantine operations dashboard, broker/adapter control integration, channel master elections and operational task scheduling.
 - [ ] Verified same-window, same-project `/new` handoff.
 - [x] Per-host credentials and scoped session capabilities (v0.2 candidate).

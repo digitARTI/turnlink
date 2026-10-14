@@ -22,7 +22,7 @@ export const controlTools = [
   { name: 'channel_control', description: 'Opt-in Turnlink governance and task records. Identity is harness-bound. Only participant operations are offered; query channel status for supported broker effects. Task dispatch remains disabled.',
     inputSchema: schema({ command: z.toJSONSchema(ParticipantCommand) }) },
   { name: 'channel_status', description: 'Read authenticated channel state, tasks, incidents or audit events. Message bodies require the current master generation; ordinary history visibility is unchanged.',
-    inputSchema: schema({ channel: str, view: { type: 'string', enum: ['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'notices'] },
+    inputSchema: schema({ channel: str, view: { type: 'string', enum: ['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'notices', 'previews', 'transitions'] },
       generation: { type: 'integer', minimum: 0 }, after: { type: 'integer', minimum: 0 }, offset: { type: 'integer', minimum: 0, maximum: 100000 },
       limit: { type: 'integer', minimum: 1, maximum: 100 } }, ['channel', 'view']) },
 ];

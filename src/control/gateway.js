@@ -14,12 +14,14 @@ const masterOps = new Set(['action.request', 'incident.resolve', 'task.create', 
 
 // All identity/clock/membership inputs below originate in the broker. No caller can provide an Actor or scheduler role.
 export class ControlGateway {
-  constructor({ directory, now, members, member, receiver, messages, hosts, adminDigest, options, effectsEnabled = false }) {
+  constructor({ directory, now, members, member, receiver, messages, hosts, adminDigest, options, effectsEnabled = false, worktreeGrants = false }) {
     this.store = new ControlStore(directory, options);
     Object.assign(this, { now, members, member, receiver, messages, hosts, adminDigest });
     this.effectsEnabled = effectsEnabled;
+    this.worktreeGrants = worktreeGrants;
   }
-  capabilities() { return { effectsEnabled: this.effectsEnabled, effectOperations: this.effectsEnabled ? BROKER_EFFECT_OPERATIONS : [], taskDispatchEnabled: false }; }
+  capabilities() { return { effectsEnabled: this.effectsEnabled, effectOperations: this.effectsEnabled ? BROKER_EFFECT_OPERATIONS : [], taskDispatchEnabled: false,
+    worktreeGrantsEnabled: this.worktreeGrants, worktreeExecutionEnabled: false }; }
   context(actor) { return { actor, now: this.now(), members: this.members() }; }
   boundMember(principal, agentId, proof, channel) {
     try { return this.member(principal, agentId, proof, channel); }
@@ -49,6 +51,7 @@ export class ControlGateway {
     if (adapter) {
       const agent = this.adapter(socket, params, command.channel);
       check(adapterOps.has(command.op), 'CONTROL_OPERATION_DISABLED'); actor = { kind: 'adapter', agentId: agent.agentId };
+      if (['worktree.begin', 'worktree.settle'].includes(command.op)) check(this.worktreeGrants, 'WORKTREE_GRANTS_DISABLED');
       if (command.op === 'master.renew') {
         const active = this.store.snapshot().channels.find(c => c.id === command.channel)?.active;
         check(active?.agentId === agent.agentId && this.store.offerAccepted(command.channel, agent.agentId, active.id), 'ROLE_NOTICE_NOT_ADMITTED');
@@ -64,7 +67,7 @@ export class ControlGateway {
         check(active?.agentId === agent.agentId && this.store.offerAccepted(command.channel, agent.agentId, active.id), 'ROLE_NOTICE_NOT_ADMITTED');
       }
     }
-    // No action.begin/task.prepare endpoint: external effects and dispatch stay disabled until the executor gate.
+    // Models cannot invoke execution, reconciliation or adapter worktree grants; task dispatch stays disabled.
     return { ...this.store.apply(command, this.context(actor)), ...this.capabilities() };
   }
   query(socket, params) {
@@ -101,6 +104,7 @@ export class ControlGateway {
       return { entries: bounded.entries, next: bounded.entries.at(-1)?.sequence ?? (params.after || 0) };
     }
     const values = state[params.view].filter(value => value.channel === params.channel);
+    if (['previews', 'transitions'].includes(params.view)) return this.page(socket.principal.admin || master ? values : values.filter(v => v.agentId === agent.agentId), params.offset, params.limit);
     // Tasks/incident metadata is shared channel coordination data; action targets/evidence are visible only to the operator/master/requester.
     return this.page(params.view === 'actions' && !socket.principal.admin && !master ? values.filter(a => a.requester === agent.agentId) : values,
       params.offset, params.limit);

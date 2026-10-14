@@ -14,8 +14,9 @@ const nameKey = value => value.normalize('NFKC').toLowerCase();
 const fresh = () => ({ version: 3, agents: {}, bindings: {}, messages: [] });
 export function createBroker({ port = 47321, secret = token(true), adminSecret = adminToken(true), hosts,
   directory = stateDir, now = Date.now, sweepIntervalMs = 1000, write = atomicWrite,
-  limits = {}, controlPlane = false, controlOptions = {}, controlEffects = false, effectHooks = {} } = {}) {
+  limits = {}, controlPlane = false, controlOptions = {}, controlEffects = false, effectHooks = {}, worktreeGrants = false } = {}) {
   if (controlEffects && !controlPlane) throw new Error('Control effects require the control plane');
+  if (worktreeGrants && !controlPlane) throw new Error('Worktree grants require the control plane');
   validateCredential(secret); validateCredential(adminSecret);
   if (secret === adminSecret) throw new Error('Host and administrator credentials must differ');
   const budget = { connections: 64, hostConnections: 16, sessionsPerHost: 64, channelMembers: 32,
@@ -171,7 +172,7 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
   };
   if (controlPlane) {
     try {
-      control = new ControlGateway({ directory: join(directory, 'control'), now, options: controlOptions, effectsEnabled: controlEffects,
+      control = new ControlGateway({ directory: join(directory, 'control'), now, options: controlOptions, effectsEnabled: controlEffects, worktreeGrants,
         members: () => Object.values(store.agents).filter(a => !security.hosts[a.hostId]?.revoked && !store.bindings[a.agentId]?.revoked)
           .map(a => ({ agentId: a.agentId, channel: a.channel, harness: a.harness, connected: connected(a.agentId) })),
         member, receiver: id => subscriptions.get(id), messages: () => store.messages, hosts: () => security.hosts, adminDigest: digest(adminSecret) });

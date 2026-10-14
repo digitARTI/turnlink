@@ -203,10 +203,13 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     assert.equal(afterMove.agent, beforeMove.agent);
     assert.deepEqual(afterMove.model, beforeMove.model);
     assert.deepEqual(afterMove.permissions, beforeMove.permissions);
+    await wait(async () => !(await admin.request('control_query', { channel: 'development', view: 'channel' })).members.find(m => m.agentId === `opencode:${session.id}`)?.connected);
+    const detachedMessage = await send('must not automatically follow an arbitrary move');
+    await delay(100); assert.equal(delivered(detachedMessage.id), false);
     await api(`${prefix}/prompt`, { text: 'WORKTREE_GATE_VERIFY' });
     await api(`/api/experimental/session/${session.id}/wait`, {});
     const request = requests.find(r => JSON.stringify(r.messages).includes('WORKTREE_GATE_VERIFY'));
     assert.match(JSON.stringify(request.messages), /PROJECT_WORKTREE_GATE/);
     assert.match(JSON.stringify(request.messages), /GLOBAL_WORKTREE_GATE/);
-    // The existing adapter deliberately detaches on move; continuity still needs an explicit task-transition implementation.
+    // Arbitrary moves still detach. Production continuity needs verified native exclusion and destination rebind, not just a matching session ID.
   });
