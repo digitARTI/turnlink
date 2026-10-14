@@ -2,13 +2,14 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { ChannelClient } from './client.js';
-import { tools, ToolSession } from './tools.js';
+import { tools, controlTools, ToolSession } from './tools.js';
 import { render } from './config.js';
 import { diagnosticCode } from './diagnostics.js';
 import { codexStdioSession } from './session-binding.js';
 
 const claude = process.argv.includes('--claude-channel');
 const codexStdio = process.argv.includes('--codex-stdio');
+const offeredTools = process.argv.includes('--control-plane') ? [...tools, ...controlTools] : tools;
 if (claude && codexStdio) throw new Error('Codex stdio binding cannot be used for a Claude channel');
 const harness = claude ? 'claude' : 'codex';
 const boundSessionId = process.env.AGENT_CHANNEL_SESSION_ID || (!claude ? process.env.CODEX_THREAD_ID : undefined);
@@ -35,7 +36,7 @@ client.on('message', message => {
   } }).catch(error => { offered.delete(message.id); console.error(`Turnlink: channel notification failed (${diagnosticCode(error)})`); });
 });
 client.on('disconnected', () => offered.clear());
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.map(definition => {
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: offeredTools.map(definition => {
   if (!codexStdio || definition.name !== 'channel_join') return definition;
   const inputSchema = structuredClone(definition.inputSchema);
   delete inputSchema.properties.harness; delete inputSchema.properties.sessionId;
@@ -44,6 +45,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.map(de
 }) }));
 mcp.setRequestHandler(CallToolRequestSchema, async request => {
   try {
+    if (!offeredTools.some(tool => tool.name === request.params.name)) throw new Error('Unknown or disabled tool');
     const args = request.params.arguments || {};
     let target = session, parameters = args;
     if (codexStdio) {

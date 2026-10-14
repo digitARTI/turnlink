@@ -5,13 +5,14 @@ import { pathToFileURL } from 'node:url';
 import { stateDir, token, adminToken, identity, url, digest, matches, validateCredential } from './config.js';
 import { acquireStore, readPrivate, atomicWrite } from './storage.js';
 import { parseRequest, validateState, Security, MAX_FRAME_BYTES, MAX_RESPONSE_BYTES } from './protocol.js';
+import { ControlGateway } from './control/gateway.js';
 
 export const NAME_RESERVATION_MS = 300000;
 const nameKey = value => value.normalize('NFKC').toLowerCase();
 const fresh = () => ({ version: 3, agents: {}, bindings: {}, messages: [] });
 export function createBroker({ port = 47321, secret = token(true), adminSecret = adminToken(true), hosts,
   directory = stateDir, now = Date.now, sweepIntervalMs = 1000, write = atomicWrite,
-  limits = {} } = {}) {
+  limits = {}, controlPlane = false, controlOptions = {} } = {}) {
   validateCredential(secret); validateCredential(adminSecret);
   if (secret === adminSecret) throw new Error('Host and administrator credentials must differ');
   const budget = { connections: 64, hostConnections: 16, sessionsPerHost: 64, channelMembers: 32,
@@ -21,6 +22,7 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
   const deliveries = new Map();
   const controls = new Map();
   const buckets = new Map();
+  let control, controlFault = false;
   const fail = error => {
     fault = error;
     for (const socket of server?.clients || []) socket.terminate();
@@ -81,6 +83,11 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
     if (a.reservationExpiresAt == null) { a.disconnectedAt = now(); a.reservationExpiresAt = now() + NAME_RESERVATION_MS; }
   };
   const remove = (id, reason) => {
+    // Revoke role authority durably BEFORE changing the legacy JSON membership. Failure leaves the old membership intact.
+    if (control && store.agents[id]) {
+      if (controlFault) throw new Error('CONTROL_UNAVAILABLE');
+      control.departed(id, store.agents[id].channel);
+    }
     for (const m of store.messages) if (m.recipients.includes(id) && !m.delivered.includes(id)) m.cancelled[id] = reason;
     delete store.agents[id];
     return () => {
@@ -154,6 +161,15 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
       }
     }
   };
+  if (controlPlane) {
+    try {
+      control = new ControlGateway({ directory: join(directory, 'control'), now, options: controlOptions,
+        members: () => Object.values(store.agents).filter(a => !security.hosts[a.hostId]?.revoked && !store.bindings[a.agentId]?.revoked)
+          .map(a => ({ agentId: a.agentId, channel: a.channel, harness: a.harness, connected: connected(a.agentId) })),
+        member, receiver: id => subscriptions.get(id), messages: () => store.messages, hosts: () => security.hosts, adminDigest: digest(adminSecret) });
+      control.tick();
+    } catch (error) { try { control?.close(); } finally { unlock(); } throw error; }
+  }
   server = new WebSocketServer({ host: '127.0.0.1', port, maxPayload: MAX_FRAME_BYTES, perMessageDeflate: false,
     verifyClient: ({ req }, done) => {
       try {
@@ -306,6 +322,10 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
           case 'revoke': {
             if (!principal.admin) throw new Error('Administrative authorization required');
             if (!Object.hasOwn(security.hosts, p.hostId)) throw new Error('Unknown host');
+            if (control) {
+              if (controlFault) throw new Error('CONTROL_UNAVAILABLE');
+              for (const a of Object.values(store.agents).filter(a => a.hostId === p.hostId)) control.departed(a.agentId, a.channel);
+            }
             security.hosts[p.hostId].revoked = true; saveSecurity();
             for (const s of server.clients) if (!s.principal.admin && s.principal.hostId === p.hostId) s.close(1008, 'Credential revoked');
             result = { revoked: true, hostId: p.hostId }; break;
@@ -319,6 +339,13 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
             result = { revoked: true, agentId: p.agentId }; break;
           }
           case 'handoff': throw new Error('Automatic handoff requires a verified window/project event');
+          case 'control_info':
+            result = control ? { ...control.handle(socket, request.method, p), available: !controlFault } : { version: 1, enabled: false, effectsEnabled: false };
+            break;
+          case 'control_command': case 'control_adapter': case 'control_query': case 'control_notice_ack':
+          case 'control_enroll_adapter': case 'control_revoke_adapter':
+            if (!control || controlFault) throw new Error(control ? 'CONTROL_UNAVAILABLE' : 'CONTROL_DISABLED');
+            result = control.handle(socket, request.method, p); break;
         }
         send(socket, { id: request.id, result });
         if (request.method === 'subscribe') deliver(p.agentId);
@@ -338,21 +365,26 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
   heartbeat = setInterval(() => {
     for (const s of server.clients) { if (!validPrincipal(s.principal) || !s.alive) s.terminate(); else { s.alive = false; s.ping(); } }
   }, 15000); heartbeat.unref();
-  expiryTimer = setInterval(() => { try { sweep(); } catch { /* persistence fault already isolated */ } }, sweepIntervalMs); expiryTimer.unref();
+  expiryTimer = setInterval(() => {
+    try { sweep(); } catch { /* membership revocation/persistence failures stay conservative */ }
+    if (control && !controlFault) { try { control.tick(); } catch { controlFault = true; } }
+  }, sweepIntervalMs); expiryTimer.unref();
   function close() {
     if (closePromise) return closePromise;
     clearInterval(heartbeat); clearInterval(expiryTimer);
     if (!fault) { for (const id of subscriptions.keys()) if (store.agents[id]) reserve(store.agents[id]); try { persist(); } catch { /* preserve last durable snapshot */ } }
     closing = true;
     for (const s of server.clients) s.terminate();
-    closePromise = new Promise(resolve => server.close(() => { unlock(); resolve(); })); return closePromise;
+    closePromise = new Promise(resolve => server.close(() => {
+      try { control?.close(); } catch { controlFault = true; } finally { unlock(); resolve(); }
+    })); return closePromise;
   }
   return { server, get store() { return store; }, get security() { return security; }, get fault() { return fault; }, sweep, close };
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const address = new URL(url);
   if (address.hostname !== '127.0.0.1' || address.protocol !== 'ws:') throw new Error('Broker must use ws://127.0.0.1');
-  const broker = createBroker({ port: Number(address.port) });
+  const broker = createBroker({ port: Number(address.port), controlPlane: process.env.AGENT_CHANNEL_CONTROL === '1' });
   broker.server.on('listening', () => { if (!broker.fault) console.error(`Turnlink protocol v2 listening on ${url}`); });
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => { await broker.close(); process.exit(0); });
 }

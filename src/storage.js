@@ -43,6 +43,15 @@ export function privateDirectory(path) {
   }
   windowsPermissions(path, created !== undefined);
 }
+// Metadata-only verification for binary state such as SQLite; never decode it as a credential string.
+export function assertPrivateFile(path) {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Private path must be a regular file');
+  if (process.platform !== 'win32' && ((stat.mode & 0o077) || stat.uid !== process.getuid())) {
+    throw new Error('Private file must belong to this user and have mode 0600');
+  }
+  windowsPermissions(path); return stat;
+}
 export function readPrivate(path, maxBytes = 64 * 1024 * 1024) {
   const initial = lstatSync(path);
   if (!initial.isFile() || initial.isSymbolicLink()) throw new Error('Credential/state path must be a regular file');

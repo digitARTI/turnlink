@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -12,18 +12,25 @@ import { privateTemp } from '../src/storage.js';
 import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
 import { admissionID } from '../adapters/opencode-runtime.js';
+import { randomUUID } from 'node:crypto';
 
 test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects (local model fixture)',
   { skip: process.env.TURNLINK_OPENCODE_INTEGRATION !== '1', timeout: 90000 }, async t => {
     const root = privateTemp(join(tmpdir(), 'turnlink-opencode-service-'));
     const project = join(root, 'project'); mkdirSync(project);
     const home = join(root, 'home'); mkdirSync(home);
-    const token = '1'.repeat(64), tokenFile = join(root, 'host.token');
+    const token = '1'.repeat(64), tokenFile = join(root, 'host.token'), adapterTokenFile = join(root, 'adapter.token');
     writeFileSync(tokenFile, token, { mode: 0o600 });
-    const broker = createBroker({ port: 0, secret: token, adminSecret: '2'.repeat(64), directory: join(root, 'broker') });
+    writeFileSync(adapterTokenFile, '3'.repeat(64), { mode: 0o600 });
+    const broker = createBroker({ port: 0, secret: token, adminSecret: '2'.repeat(64), directory: join(root, 'broker'), controlPlane: true });
     await once(broker.server, 'listening');
-    const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, tokenFile, credentialDirectory: join(root, 'credentials') };
+    const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, tokenFile, credentialDirectory: join(root, 'credentials'), control: true, adapterTokenFile };
     const sender = new ChannelClient(options);
+    const admin = new ChannelClient({ ...options, token: '2'.repeat(64) });
+    const controlCommand = (op, fields = {}) => ({ id: randomUUID(), op, channel: 'development', ...fields });
+    await admin.request('control_command', { command: controlCommand('channel.configure') });
+    await admin.request('control_enroll_adapter', { hostId: 'local', credential: '3'.repeat(64) });
+    const roleAcceptanceID = randomUUID();
     let releaseBusy;
     let busyReached = false;
     const requests = [];
@@ -37,6 +44,17 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
         if (last.role === 'user' && text.includes('TURNLINK_JOIN')) {
           delta = { tool_calls: [{ index: 0, id: 'call_join', type: 'function', function: { name: 'channel_join',
             arguments: JSON.stringify({ channel: 'development', name: 'receiver', role: 'fixture', project: { name: 'fixture' } }) } }] };
+          finish = 'tool_calls';
+        }
+        if (last.role === 'user' && text.includes('TURNLINK_VOLUNTEER')) {
+          delta = { tool_calls: [{ index: 0, id: 'call_volunteer', type: 'function', function: { name: 'channel_control',
+            arguments: JSON.stringify({ command: controlCommand('master.volunteer', { eligible: true }) }) } }] };
+          finish = 'tool_calls';
+        }
+        const assignmentID = text.match(/Assignment: ([a-f0-9-]{36})/)?.[1];
+        if (last.role === 'user' && assignmentID && text.includes('Turnlink supplemental master role')) {
+          delta = { tool_calls: [{ index: 0, id: 'call_role_accept', type: 'function', function: { name: 'channel_control',
+            arguments: JSON.stringify({ command: { ...controlCommand('master.accept', { proposalID: assignmentID, promptVersion: 1 }), id: roleAcceptanceID } }) } }] };
           finish = 'tool_calls';
         }
         if (last.role === 'user' && text.includes('TURNLINK_BUSY')) {
@@ -61,6 +79,13 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
         models: { test: { capabilities: { tools: true, input: ['text'], output: ['text'] }, limit: { context: 32000, output: 2048 } } } } },
     };
     writeFileSync(join(project, 'opencode.json'), JSON.stringify(config));
+    writeFileSync(join(project, 'AGENTS.md'), 'PROJECT_WORKTREE_GATE: preserve project instructions.\n');
+    mkdirSync(join(home, 'config', 'opencode'), { recursive: true });
+    writeFileSync(join(home, 'config', 'opencode', 'AGENTS.md'), 'GLOBAL_WORKTREE_GATE: preserve global instructions.\n');
+    execFileSync('git', ['init', project], { stdio: 'ignore' });
+    execFileSync('git', ['-C', project, 'add', 'opencode.json', 'AGENTS.md']);
+    execFileSync('git', ['-C', project, '-c', 'user.name=Turnlink fixture', '-c', 'user.email=fixture@example.invalid',
+      'commit', '-m', 'Isolated worktree gate'], { stdio: 'ignore' });
     // Reserve a port; the child uses an isolated HOME/XDG configuration and never the managed service.
     const reservation = createServer(); reservation.listen(0, '127.0.0.1'); await once(reservation, 'listening');
     const port = reservation.address().port; await new Promise(resolve => reservation.close(resolve));
@@ -84,7 +109,7 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
         .split('\n').filter(line => /password|ERROR|WARN|plugin|Turnlink/.test(line)).slice(-12).join('\n').replace(/server password \S+/g, 'server password [redacted]');
     };
     t.after(async () => {
-      releaseBusy?.(); sender.close(); child.kill();
+      releaseBusy?.(); sender.close(); admin.close(); child.kill();
       if (child.pid && child.exitCode === null && child.signalCode === null) await once(child, 'exit');
       model.closeAllConnections(); await new Promise(resolve => model.close(resolve));
       await broker.close(); rmSync(root, { recursive: true, force: true });
@@ -98,8 +123,8 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
       const value = await response.json();
       return value.data ?? value;
     };
-    const wait = async check => {
-      for (let i = 0; i < 300; i++) {
+    const wait = async (check, iterations = 300) => {
+      for (let i = 0; i < iterations; i++) {
         t.signal.throwIfAborted();
         if (childError) throw childError;
         if (child.exitCode !== null) throw new Error(`OpenCode exited: ${diagnostics()}`);
@@ -109,7 +134,8 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
       throw new Error(`Real-service condition timed out; model requests=${requests.length}; tools=${JSON.stringify(requests.at(-1)?.tools?.map(t => t.function.name))}; tool results=${JSON.stringify(requests.at(-1)?.messages.filter(m => m.role === 'tool'))}\n${diagnostics()}`);
     };
     await wait(async () => { try { return !!await api('/api/info'); } catch { return false; } });
-    const session = await api('/api/session', { location: { directory: project }, title: 'Turnlink fixture', agent: 'plan' });
+    const session = await api('/api/session', { location: { directory: project }, title: 'Turnlink fixture', agent: 'plan',
+      permissions: [{ action: 'edit', resource: '*', effect: 'deny' }] });
     const prefix = `/api/session/${session.id}`;
     await api(`${prefix}/prompt`, { text: 'TURNLINK_JOIN' });
     await api(`/api/experimental/session/${session.id}/wait`, {});
@@ -155,4 +181,32 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     const reconnect = await send('reconnect fixture'); await wait(() => delivered(reconnect.id));
     await api(`/api/experimental/session/${session.id}/wait`, {});
     assert.ok(requests.some(r => JSON.stringify(r.messages).includes('reconnect fixture')));
+    await api(`${prefix}/prompt`, { text: 'TURNLINK_VOLUNTEER' });
+    await api(`/api/experimental/session/${session.id}/wait`, {});
+    await wait(async () => (await admin.request('control_query', { channel: 'development', view: 'channel' })).channel.volunteers.includes(`opencode:${session.id}`));
+    await admin.request('control_command', { command: controlCommand('master.appoint', { candidate: `opencode:${session.id}` }) });
+    // Background adapter polling (not model inbox polling) admits the supplemental role notice and the fixture explicitly accepts it.
+    await wait(async () => (await admin.request('control_query', { channel: 'development', view: 'channel' })).channel.active?.agentId === `opencode:${session.id}`, 900);
+    await api(`/api/experimental/session/${session.id}/wait`, {});
+    const roleSession = await api(prefix);
+    assert.equal(roleSession.agent, 'plan'); assert.deepEqual(roleSession.permissions, session.permissions);
+    const roleRequest = requests.find(r => JSON.stringify(r.messages).includes('Turnlink supplemental master role'));
+    assert.ok(roleRequest); assert.match(JSON.stringify(roleRequest.messages), /GLOBAL_WORKTREE_GATE/); assert.match(JSON.stringify(roleRequest.messages), /PROJECT_WORKTREE_GATE/);
+    await admin.request('control_command', { command: controlCommand('master.revoke') });
+    const beforeMove = await api(prefix);
+    const worktree = await api('/api/worktree', { projectID: beforeMove.projectID, name: 'turnlink-gate' });
+    await api(`${prefix}/move`, { directory: worktree.directory, delivery: 'queue' });
+    await api(`/api/experimental/session/${session.id}/wait`, {});
+    const afterMove = await api(prefix);
+    assert.equal(afterMove.id, beforeMove.id);
+    assert.equal(afterMove.location.directory, worktree.directory);
+    assert.equal(afterMove.agent, beforeMove.agent);
+    assert.deepEqual(afterMove.model, beforeMove.model);
+    assert.deepEqual(afterMove.permissions, beforeMove.permissions);
+    await api(`${prefix}/prompt`, { text: 'WORKTREE_GATE_VERIFY' });
+    await api(`/api/experimental/session/${session.id}/wait`, {});
+    const request = requests.find(r => JSON.stringify(r.messages).includes('WORKTREE_GATE_VERIFY'));
+    assert.match(JSON.stringify(request.messages), /PROJECT_WORKTREE_GATE/);
+    assert.match(JSON.stringify(request.messages), /GLOBAL_WORKTREE_GATE/);
+    // The existing adapter deliberately detaches on move; continuity still needs an explicit task-transition implementation.
   });

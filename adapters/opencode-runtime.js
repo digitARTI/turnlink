@@ -1,10 +1,11 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { resolve } from 'node:path';
 import { ChannelClient } from '../src/client.js';
-import { ToolSession, tools } from '../src/tools.js';
+import { ToolSession, tools, controlTools } from '../src/tools.js';
 import { identity, render, digest } from '../src/config.js';
 import { AdmissionLedger, fingerprint } from '../src/admissions.js';
 import { diagnosticCode } from '../src/diagnostics.js';
+import { makeOpenCodeControl } from './opencode-control.js';
 
 export const admissionID = (sessionID, messageID) => `msg_turnlink_${digest(`${sessionID}:${messageID}`)}`;
 const key = sessionID => `memberships/${sessionID}`;
@@ -34,15 +35,30 @@ export async function setupOpenCode(ctx) {
       tools: new ToolSession(channel, { harness: 'opencode', sessionId: sessionID,
         onJoin: async agent => {
           const state = sessions.get(sessionID);
+          state.controlChannel = agent.channel;
           await state.saving;
-          await ctx.storage.set(key(sessionID), { sessionID, directory: ctx.location.directory, forms: [...state.forms] });
+          await ctx.storage.set(key(sessionID), { sessionID, directory: ctx.location.directory, channel: agent.channel, forms: [...state.forms] });
           await channel.subscribe(agent.agentId);
+          void control.poll(sessionID);
         } }),
       queue: [], flushing: false, generation: 0, revision: 0, blocked: new Set(), forms: new Set(),
     });
     return sessions.get(sessionID);
   };
   const invalidate = state => { state.generation++; state.queue = []; state.tools.agentId = null; };
+  const refreshBlockers = async (sessionID, state, valid) => {
+    const revision = state.revision;
+    const [permissions, context] = await Promise.all([
+      ctx.permission.list({ sessionID }, { signal: controller.signal }),
+      ctx.session.context({ sessionID }, { signal: controller.signal }),
+    ]);
+    if (!valid() || revision !== state.revision) return false;
+    const questions = context.flatMap(m => m.type === 'assistant' ? m.content : [])
+      .filter(part => part.type === 'tool' && part.name === 'question' && ['running', 'streaming'].includes(part.state.status));
+    state.blocked = new Set([...permissions.map(p => `permission:${p.id}`), ...state.forms].concat(questions.map(p => `question:${p.id}`)));
+    return !state.blocked.size;
+  };
+  const control = makeOpenCodeControl({ ctx, channel, sessions, options, signal: controller.signal, ownSession, refreshBlockers, log });
   const flush = async sessionID => {
     const state = sessions.get(sessionID);
     if (closed || !state || state.flushing || !state.tools.agentId || !state.queue.length) return;
@@ -52,15 +68,7 @@ export async function setupOpenCode(ctx) {
     try {
       await ownSession(sessionID);
       const revision = state.revision;
-      const [permissions, context] = await Promise.all([
-        ctx.permission.list({ sessionID }, { signal: controller.signal }),
-        ctx.session.context({ sessionID }, { signal: controller.signal }),
-      ]);
-      if (!valid() || revision !== state.revision) return;
-      const questions = context.flatMap(m => m.type === 'assistant' ? m.content : [])
-        .filter(part => part.type === 'tool' && part.name === 'question' && ['running', 'streaming'].includes(part.state.status));
-      state.blocked = new Set([...permissions.map(p => `permission:${p.id}`), ...state.forms].concat(questions.map(p => `question:${p.id}`)));
-      if (state.blocked.size) return;
+      if (!await refreshBlockers(sessionID, state, valid) || revision !== state.revision) return;
       state.ledger ??= new AdmissionLedger(channel.hostId, identity('opencode', sessionID), options.credentialDirectory);
       for (const message of state.queue.slice(0, 8)) {
         if (!valid() || state.blocked.size || revision !== state.revision) return;
@@ -129,7 +137,7 @@ export async function setupOpenCode(ctx) {
     if (['form.replied', 'form.cancelled'].includes(event.type)) state.forms.delete(`form:${p.id}`);
     if (event.type.startsWith('permission.') || event.type.startsWith('form.')) state.revision++;
     if (event.type.startsWith('form.') && state.tools.agentId) {
-      const value = { sessionID, directory: ctx.location.directory, forms: [...state.forms] };
+      const value = { sessionID, directory: ctx.location.directory, forms: [...state.forms], ...(state.controlChannel ? { channel: state.controlChannel } : {}) };
       state.saving = (state.saving || Promise.resolve()).catch(log).then(() => {
         if (!closed) return ctx.storage.set(key(sessionID), value);
       });
@@ -156,8 +164,10 @@ export async function setupOpenCode(ctx) {
             if (!resumed.registered) { await ctx.storage.remove(entry.key); continue; }
             get(sessionID).tools.agentId = identity('opencode', sessionID);
             get(sessionID).forms = new Set(Array.isArray(entry.value.forms) ? entry.value.forms : []);
+            get(sessionID).controlChannel = typeof entry.value.channel === 'string' ? entry.value.channel : undefined;
             channel.registrations.set(identity('opencode', sessionID), {});
             await channel.subscribe(identity('opencode', sessionID));
+            void control.poll(sessionID);
           } catch (error) {
             const state = sessions.get(sessionID);
             if (state) state.tools.agentId = null;
@@ -174,14 +184,18 @@ export async function setupOpenCode(ctx) {
     for (const id of sessions.keys()) void flush(id);
   }, 2000);
   timer.unref();
+  const controlTimer = options.control === true && options.adapterTokenFile ? setInterval(() => {
+    for (const id of sessions.keys()) void control.poll(id);
+  }, 30000) : undefined;
+  controlTimer?.unref();
   const cleanup = () => {
-    closed = true; controller.abort(); clearInterval(timer);
+    closed = true; controller.abort(); clearInterval(timer); clearInterval(controlTimer);
     for (const state of sessions.values()) invalidate(state);
     channel.close();
   };
   try {
     await ctx.tool.transform(editor => {
-      for (const definition of tools.filter(t => t.name !== 'channel_ack')) {
+      for (const definition of [...tools, ...(options.control === true ? controlTools : [])].filter(t => t.name !== 'channel_ack')) {
         const input = structuredClone(definition.inputSchema);
         if (definition.name === 'channel_join') {
           delete input.properties.harness; delete input.properties.sessionId;
@@ -200,6 +214,7 @@ export async function setupOpenCode(ctx) {
             if (definition.name === 'channel_join') args = { ...args, harness: 'opencode', sessionId: context.sessionID,
               project: { ...args.project, root: args.project.root || session.location.directory } };
             const result = await state.tools.call(definition.name, args);
+            if (['channel_control', 'channel_status'].includes(definition.name)) void control.poll(context.sessionID);
             if (definition.name === 'channel_leave') { invalidate(state); await state.saving; await ctx.storage.remove(key(context.sessionID)); }
             return { content: JSON.stringify(result) };
           },

@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import { EventEmitter } from 'node:events';
 import { url, token, identity, sessionProof } from './config.js';
 import { parseFrame, MAX_FRAME_BYTES, Hello } from './protocol.js';
+import { isDiagnosticCode } from './diagnostics.js';
 
 export class ChannelClient extends EventEmitter {
   constructor(options = {}) {
@@ -35,7 +36,11 @@ export class ChannelClient extends EventEmitter {
         else {
           const p = this.pending.get(data.id); if (!p) return;
           this.pending.delete(data.id); clearTimeout(p.timer);
-          data.error ? p.reject(new Error(data.error)) : p.resolve(data.result);
+          if (data.error) {
+            const error = new Error(data.error);
+            if (isDiagnosticCode(data.error)) error.code = data.error;
+            p.reject(error);
+          } else p.resolve(data.result);
         }
       });
       socket.on('close', () => {
@@ -73,7 +78,8 @@ export class ChannelClient extends EventEmitter {
     if (this.admin) return p;
     const id = method === 'join' ? identity(p.harness, p.sessionId) : p.agentId ||
       (['members', 'history'].includes(method) ? this.primaryAgentId : undefined);
-    if (id && ['join', 'subscribe', 'unsubscribe', 'send', 'ack', 'leave', 'resume', 'members', 'history'].includes(method)) {
+    if (id && ['join', 'subscribe', 'unsubscribe', 'send', 'ack', 'leave', 'resume', 'members', 'history',
+      'control_command', 'control_query', 'control_adapter', 'control_notice_ack'].includes(method)) {
       if (method !== 'join') p.agentId = id;
       p.proof = sessionProof(this.hostId, id, this.options.credentialDirectory, ['join', 'subscribe'].includes(method));
     }

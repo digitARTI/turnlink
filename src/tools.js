@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { identity } from './config.js';
+import { z } from 'zod';
+import { Command } from './control/contracts.js';
+import { PARTICIPANT_OPERATIONS } from './control/operations.js';
 
 const str = { type: 'string', minLength: 1 };
 const schema = (properties, required = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false });
@@ -13,6 +16,15 @@ export const tools = [
   { name: 'channel_history', description: 'Read channel history and delivery state.', inputSchema: schema({ channel: str, limit: { type: 'integer', minimum: 1, maximum: 100 } }, ['channel']) },
   { name: 'channel_ack', description: 'Confirm an incoming message was seen by the model. Required for Claude channel delivery confirmation.', inputSchema: schema({ id: str }) },
   { name: 'channel_leave', description: 'Leave the channel.', inputSchema: schema({}) },
+];
+const ParticipantCommand = z.discriminatedUnion('op', Command.options.filter(schema => PARTICIPANT_OPERATIONS.includes(schema.shape.op.value)));
+export const controlTools = [
+  { name: 'channel_control', description: 'Opt-in Turnlink governance and task records. Identity is harness-bound. Only participant operations are offered; external effects/dispatch are not enabled yet.',
+    inputSchema: schema({ command: z.toJSONSchema(ParticipantCommand) }) },
+  { name: 'channel_status', description: 'Read authenticated channel state, tasks, incidents or audit events. Message bodies require the current master generation; ordinary history visibility is unchanged.',
+    inputSchema: schema({ channel: str, view: { type: 'string', enum: ['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'notices'] },
+      generation: { type: 'integer', minimum: 0 }, after: { type: 'integer', minimum: 0 }, offset: { type: 'integer', minimum: 0, maximum: 100000 },
+      limit: { type: 'integer', minimum: 1, maximum: 100 } }, ['channel', 'view']) },
 ];
 export class ToolSession {
   constructor(client, { harness, sessionId, onJoin } = {}) { Object.assign(this, { client, harness, sessionId, onJoin }); }
@@ -28,6 +40,12 @@ export class ToolSession {
       return result;
     }
     if (!this.agentId) throw new Error('Call channel_join first');
+    if (name === 'channel_control') {
+      let command;
+      try { command = ParticipantCommand.parse(args.command); } catch { throw new Error('Invalid participant control command'); }
+      return this.client.request('control_command', { agentId: this.agentId, command });
+    }
+    if (name === 'channel_status') return this.client.request('control_query', { ...args, agentId: this.agentId });
     if (name === 'channel_members') return this.client.request('members', { ...args, agentId: this.agentId });
     if (name === 'channel_history') return this.client.request('history', { ...args, agentId: this.agentId });
     if (name === 'channel_send') return this.client.request('send', { ...args, agentId: this.agentId, messageId: args.messageId || randomUUID() });

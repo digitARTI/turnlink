@@ -34,6 +34,18 @@ const methods = {
   revoke: z.strictObject({ hostId: HostID }),
   revoke_session: z.strictObject({ agentId: AgentID }),
   handoff: z.strictObject({}),
+  control_info: z.strictObject({}),
+  control_command: z.strictObject({ agentId: AgentID.optional(), proof: proof.optional(), command: z.unknown() }),
+  control_adapter: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/), command: z.unknown() }),
+  control_query: z.strictObject({ channel: Channel, agentId: AgentID.optional(), proof: proof.optional(),
+    view: z.enum(['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'notices']),
+    generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    after: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    offset: z.number().int().min(0).max(100000).optional(), limit: z.number().int().min(1).max(100).optional() }),
+  control_notice_ack: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/), id: z.string().uuid(),
+    receiptID: z.string().regex(/^msg_[a-zA-Z0-9_-]{1,124}$/) }),
+  control_enroll_adapter: z.strictObject({ hostId: HostID, credential: z.string().regex(/^[a-f0-9]{64}$/) }),
+  control_revoke_adapter: z.strictObject({ hostId: HostID }),
 };
 const envelope = z.strictObject({ v: z.literal(PROTOCOL_VERSION), id: z.union([z.number().int().min(1).max(2147483647), bounded(128)]),
   method: bounded(64), params: z.unknown() });

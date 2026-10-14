@@ -1,6 +1,11 @@
 // Log classifications, not exception bodies, provider responses or credentials.
 const codes = new Set(['ADMISSION_UNCERTAIN', 'EACCES', 'ENOENT', 'ENOSPC', 'ELOCKED', 'ECOMPROMISED',
-  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE']);
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE',
+  'CONTROL_DISABLED', 'CONTROL_UNAVAILABLE', 'CONTROL_ACCESS_DENIED', 'CONTROL_OPERATION_DISABLED',
+  'ADAPTER_RECEIVER_REQUIRED', 'ADAPTER_CREDENTIAL_REQUIRED', 'ROLE_NOTICE_NOT_ADMITTED', 'CHANNEL_NOT_CONFIGURED',
+  'STALE_MASTER', 'STALE_POLICY', 'NOTICE_CANCELLED', 'VERIFIED_CAPABILITY_REQUIRED', 'CONTROL_EVENT_STORE_FULL',
+  'CONTROL_NOTICE_STORE_FULL', 'COMMAND_RECEIPTS_FULL', 'CONTROL_STATE_FULL', 'CLOCK_REGRESSION', 'OPERATOR_REQUIRED', 'ADAPTER_REQUIRED']);
+export const isDiagnosticCode = value => codes.has(value);
 export function diagnosticCode(error) {
   if (codes.has(error?.code)) return error.code;
   const status = error?.status || error?.response?.status || error?.data?.statusCode;

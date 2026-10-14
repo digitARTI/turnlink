@@ -1,0 +1,119 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { rmSync } from 'node:fs';
+import { privateTemp } from '../src/storage.js';
+import { createBroker } from '../src/broker.js';
+import { ChannelClient } from '../src/client.js';
+
+const HOST = '1'.repeat(64), ADMIN = '2'.repeat(64), ADAPTER = '3'.repeat(64);
+async function fixture(t, enabled = true) {
+  const root = privateTemp(join(tmpdir(), 'turnlink-control-broker-'));
+  let now = 1000;
+  const broker = createBroker({ directory: root, port: 0, secret: HOST, adminSecret: ADMIN, controlPlane: enabled, now: () => now });
+  await once(broker.server, 'listening');
+  const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, credentialDirectory: join(root, 'proofs') };
+  const clients = [];
+  const client = (token = HOST) => { const value = new ChannelClient({ ...options, token }); clients.push(value); return value; };
+  const admin = client(ADMIN), a = client(), b = client(), c = client();
+  const joinAgent = async (connection, sessionId, channel = 'dev') => {
+    await connection.request('join', { harness: 'opencode', sessionId, name: sessionId, role: 'full project access', channel,
+      project: { name: 'fixture', root: '/project' } });
+    await connection.subscribe(`opencode:${sessionId}`);
+  };
+  await joinAgent(a, 'a'); await joinAgent(b, 'b'); await joinAgent(c, 'c');
+  const run = (connection, agentId, op, fields = {}, channel = 'dev') => connection.request('control_command', {
+    ...(agentId ? { agentId } : {}), command: { id: randomUUID(), op, channel, ...fields },
+  });
+  const query = (connection = admin, agentId, view = 'channel', fields = {}, channel = 'dev') => connection.request('control_query', {
+    channel, view, ...(agentId ? { agentId } : {}), ...fields,
+  });
+  const enroll = () => admin.request('control_enroll_adapter', { hostId: 'local', credential: ADAPTER });
+  const appoint = async () => {
+    await run(a, 'opencode:a', 'master.volunteer', { eligible: true });
+    const result = await run(admin, undefined, 'master.appoint', { candidate: 'opencode:a' });
+    const notice = (await query(a, 'opencode:a', 'notices')).entries.find(n => n.kind === 'offer');
+    return { proposalID: result.commandID, notice };
+  };
+  t.after(async () => { clients.forEach(c => c.close()); await broker.close(); rmSync(root, { recursive: true, force: true }); });
+  if (enabled) await run(admin, undefined, 'channel.configure');
+  return { broker, options, admin, a, b, c, client, run, query, enroll, appoint, joinAgent, advance: ms => { now += ms; } };
+}
+
+test('control plane is opt-in and leaves baseline channel messaging available', async t => {
+  const f = await fixture(t, false);
+  assert.equal((await f.a.request('control_info')).enabled, false);
+  await assert.rejects(f.run(f.admin, undefined, 'channel.configure'), /CONTROL_DISABLED/);
+  const message = await f.a.request('send', { agentId: 'opencode:a', to: 'opencode:b', text: 'baseline', messageId: 'baseline' });
+  assert.equal(message.text, 'baseline');
+});
+
+test('broker derives roles and refuses caller-selected operator, adapter or scheduler authority', async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.run(f.a, 'opencode:a', 'channel.configure', { mode: 'automatic' }), /CONTROL_OPERATION_DISABLED/);
+  await assert.rejects(f.run(f.a, 'opencode:a', 'evidence.record', { entityID: randomUUID(), kind: 'idle' }), /CONTROL_OPERATION_DISABLED/);
+  await assert.rejects(f.run(f.admin, undefined, 'action.begin', { actionID: randomUUID() }), /CONTROL_OPERATION_DISABLED/);
+  await assert.rejects(f.run(f.a, 'opencode:a', 'master.volunteer', { eligible: true, actor: { kind: 'operator' } }), /Invalid request schema/);
+  await assert.rejects(f.a.rpc('control_query', { agentId: 'opencode:b', proof: '0'.repeat(64), channel: 'dev', view: 'channel' }), /CONTROL_ACCESS_DENIED/);
+  await f.run(f.admin, undefined, 'channel.configure', {}, 'other');
+  await assert.rejects(f.query(f.a, 'opencode:a', 'tasks', {}, 'other'), /CONTROL_ACCESS_DENIED/);
+});
+
+test('adapter evidence needs separate enrollment, matching session proof and the actual receiver socket', async t => {
+  const f = await fixture(t);
+  const command = { id: randomUUID(), op: 'evidence.record', channel: 'dev', entityID: randomUUID(), kind: 'idle' };
+  await assert.rejects(f.a.request('control_adapter', { agentId: 'opencode:a', credential: ADAPTER, command }), /ADAPTER_CREDENTIAL_REQUIRED/);
+  await assert.rejects(f.admin.request('control_enroll_adapter', { hostId: 'local', credential: HOST }), /SEPARATE_ADAPTER_CREDENTIAL_REQUIRED/);
+  await f.enroll();
+  const sameHost = f.client();
+  await assert.rejects(sameHost.request('control_adapter', { agentId: 'opencode:a', credential: ADAPTER, command }), /ADAPTER_RECEIVER_REQUIRED/);
+  await f.a.request('control_adapter', { agentId: 'opencode:a', credential: ADAPTER, command });
+  await f.admin.request('control_revoke_adapter', { hostId: 'local' });
+  await assert.rejects(f.a.request('control_adapter', { agentId: 'opencode:a', credential: ADAPTER,
+    command: { ...command, id: randomUUID() } }), /ADAPTER_CREDENTIAL_REQUIRED/);
+});
+
+test('master activation requires a durable native role-notice receipt; ordinary history stays participant-only', async t => {
+  const f = await fixture(t); await f.enroll();
+  await f.b.request('send', { agentId: 'opencode:b', to: 'opencode:c', text: 'private peer exchange', messageId: 'private' });
+  const { proposalID, notice } = await f.appoint();
+  assert.match(notice.text, /not a replacement system prompt/);
+  const accept = () => f.run(f.a, 'opencode:a', 'master.accept', { proposalID, promptVersion: 1 });
+  await assert.rejects(accept(), /ROLE_NOTICE_NOT_ADMITTED/);
+  await f.a.request('control_notice_ack', { agentId: 'opencode:a', credential: ADAPTER, id: notice.id, receiptID: 'msg_role_fixture' });
+  await accept();
+  const generation = (await f.query()).channel.active.generation;
+  assert.equal((await f.query(f.a, 'opencode:a', 'messages', { generation })).entries[0].text, 'private peer exchange');
+  assert.deepEqual(await f.a.request('history', { agentId: 'opencode:a', channel: 'dev' }), []);
+  await assert.rejects(f.query(f.b, 'opencode:b', 'messages', { generation }), /MASTER_MESSAGE_ACCESS_REQUIRED/);
+  f.advance(120000);
+  await assert.rejects(f.query(f.a, 'opencode:a', 'messages', { generation }), /MASTER_MESSAGE_ACCESS_REQUIRED/);
+});
+
+test('leaving and quickly rejoining never restores the old master generation', async t => {
+  const f = await fixture(t); await f.enroll(); const { proposalID, notice } = await f.appoint();
+  await f.a.request('control_notice_ack', { agentId: 'opencode:a', credential: ADAPTER, id: notice.id, receiptID: 'msg_role_fixture' });
+  await f.run(f.a, 'opencode:a', 'master.accept', { proposalID, promptVersion: 1 });
+  const generation = (await f.query()).channel.active.generation;
+  await f.a.request('leave', { agentId: 'opencode:a' });
+  await f.joinAgent(f.a, 'a');
+  assert.equal((await f.query()).channel.active, null);
+  await assert.rejects(f.query(f.a, 'opencode:a', 'messages', { generation }), /MASTER_MESSAGE_ACCESS_REQUIRED/);
+  assert.ok(!(await f.query()).channel.volunteers.includes('opencode:a'));
+});
+
+test('bounded control pagination never returns another channel or credentials', async t => {
+  const f = await fixture(t); await f.enroll();
+  for (let i = 0; i < 4; i++) await f.run(f.admin, undefined, 'task.create', {
+    title: `task ${i}`, instructions: 'x'.repeat(12000), criteria: 'evidence', requiresWorktree: false,
+  });
+  const page = await f.query(f.a, 'opencode:a', 'tasks', { limit: 100 });
+  assert.ok(page.entries.length > 0 && page.entries.length < 4);
+  assert.ok(Buffer.byteLength(JSON.stringify(page)) < 49152);
+  assert.ok(!JSON.stringify(page).includes(ADAPTER));
+  const next = await f.query(f.a, 'opencode:a', 'tasks', { offset: page.next });
+  assert.equal(next.entries.length + page.entries.length, 4);
+});
