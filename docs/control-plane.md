@@ -2,7 +2,7 @@
 
 ## Current status
 
-This includes the foundation and an **opt-in authenticated broker/OpenCode governance slice**, not a deployed coordination platform. Default messaging behavior remains unchanged. No active configuration or production state is migrated.
+This includes the foundation and an **opt-in authenticated broker/OpenCode/Codex governance slice**, not a deployed coordination platform. Default messaging behavior remains unchanged. No active configuration or production state is migrated.
 
 Implemented:
 
@@ -16,8 +16,9 @@ Implemented:
 - Transactional role-notice outbox, native OpenCode admission receipts, explicit participant acceptance, adapter lease renewal and membership-departure fencing.
 - Optional `channel_control` / `channel_status` tools and a local operator CLI (`src/control-admin.js`). Model tools cannot enroll adapters, change channel policy, approve worktrees or initiate effects.
 - Broker/socket, storage-hardening and OpenCode role regression tests. The real OpenCode service gate verifies supplemental role acceptance without replacing its existing agent, permissions or global/project instructions.
+- `src/codex-control.js`: same-proxy/thread role delivery, receiver-backed acknowledgements and lease renewal. Admission uncertainty persists across restart; late responses reconcile without appearing in editor RPC output. Real Codex API/model-fixture verification preserves cwd, model, sandbox/approval settings and global/project instructions.
 
-Not implemented yet: comprehensive broker telemetry ingestion, Codex native role-notice delivery/renewal, action executors, task dispatch, managed worktree previews/transitions, dashboard, or OpenCode alert UI. An `action` marked approved has **not** been executed; a task in `dispatching` represents an intent awaiting a future executor. Transport responses explicitly report `effectsEnabled: false`. Internal stores/reducers are not browser/model APIs.
+Not implemented yet: comprehensive broker telemetry ingestion, action executors, task dispatch, managed worktree previews/transitions, dashboard, or OpenCode alert UI. An `action` marked approved has **not** been executed; a task in `dispatching` represents an intent awaiting a future executor. Transport responses explicitly report `effectsEnabled: false`. Internal stores/reducers are not browser/model APIs.
 
 ## Experimental activation (isolated state only)
 
@@ -35,7 +36,9 @@ npm run control-admin -- query development channel
 
 In the existing OpenCode plugin options, add `control: true` and `adapterTokenFile: "/absolute/private/adapter.token"`, retaining all existing options. This exposes the two participant tools and enables native role delivery/30-second adapter maintenance. Only offer notices may wake an idle conversation; active/ended notices use non-resuming steering. The maintenance loop does not ask participants to poll or send heartbeat replies. Native permission/question/form blockers remain respected.
 
-MCP exposes the participant tools only with `--control-plane`. Codex native role delivery is **not wired yet**: merely enabling these tools does not make a Codex participant operationally eligible for receipt-backed master activation. No task, recovery or worktree effects are dispatched in this slice.
+MCP exposes the participant tools only with `--control-plane`. For Codex, retain existing MCP configuration and append that flag to its Turnlink MCP arguments. On the **proxy process**, set `AGENT_CHANNEL_CONTROL=1` and `AGENT_CHANNEL_ADAPTER_TOKEN_FILE=/absolute/private/adapter.token`. The proxy does not forward the adapter credential-file variable to its Codex child/MCP processes. Do not supply this credential through tool arguments or the model environment.
+
+Codex role offers use `turn/start` when lifecycle is known idle, or `turn/steer` with the exact active turn ID. Active/ended notices only steer a running turn; idle delivery is deferred. Existing approval requests block admission. Resumed threads whose lifecycle cannot be established are held until a native turn response/event establishes it. No instructions, cwd, agent/model, sandbox or approval parameters are overridden by role admission. Uncertain admissions are held for native receipt reconciliation/operator inspection, never blindly replayed after a timeout or restart. These are governance capabilities, not full task-execution or IDE acceptance. No task, recovery or worktree effects are dispatched in this slice.
 
 ## Agreed behavior
 
@@ -115,7 +118,7 @@ Membership departure and host revocation persist role termination before alterin
 
 ## Next implementation gates
 
-1. **Authenticated integration follow-through:** broker/OpenCode slice is implemented and tested; add Codex native role delivery/renewal and comprehensive telemetry, storage alerts and archive/export. Do not expose a generic endpoint accepting caller-selected actor context.
+1. **Authenticated integration follow-through:** broker/OpenCode/Codex governance slices are implemented and tested; add comprehensive telemetry, storage alerts and archive/export. Do not expose a generic endpoint accepting caller-selected actor context.
 2. **Atomic effect boundary:** control state and legacy broker JSON are not one transaction. Implement durable, idempotent effect intents and reconciliation before cancellation/member-removal/recovery executors; do not claim cross-store atomicity.
 3. **Adapter continuity:** authorized OpenCode session moves and Codex turn cwd overrides, live blocker/idle snapshots, lease renewal, receipt correlation and safe recovery. Negative tests must prove arbitrary moves/peer input cannot acquire these capabilities.
 4. **React/Mantine dashboard:** loopback-first server, human login/session, CSRF/origin protections, scoped browser API, channel/message/incident/task views, approvals, and storage alerts. Never send broker host/admin credentials to JavaScript. Add OpenCode CLI alerts separately.

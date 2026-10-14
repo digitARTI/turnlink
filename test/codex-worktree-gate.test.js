@@ -5,11 +5,15 @@ import { createInterface } from 'node:readline';
 import { once } from 'node:events';
 import { mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { privateTemp } from '../src/storage.js';
 import { createServer } from 'node:http';
+import { createBroker } from '../src/broker.js';
+import { ChannelClient } from '../src/client.js';
+import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 
-test('real Codex changes cwd in the same thread without permission overrides (local model fixture)',
+test('real Codex proxy admits supplemental roles and changes cwd in the same thread without permission overrides (local model fixture)',
   { skip: process.env.TURNLINK_CODEX_INTEGRATION !== '1', timeout: 30000 }, async t => {
     const root = privateTemp(join(tmpdir(), 'turnlink-codex-worktree-'));
     const project = join(root, 'project'), worktree = join(root, 'worktree'), home = join(root, 'home');
@@ -41,9 +45,18 @@ test('real Codex changes cwd in the same thread without permission overrides (lo
     });
     model.listen(0, '127.0.0.1'); await once(model, 'listening');
     writeFileSync(join(home, '.codex', 'config.toml'), `model = "fixture"\nmodel_provider = "fixture"\n[model_providers.fixture]\nname = "Fixture"\nbase_url = "http://127.0.0.1:${model.address().port}/v1"\nwire_api = "responses"\nenv_key = "TURNLINK_FIXTURE_KEY"\n`);
-    const child = spawn(process.env.TURNLINK_CODEX_EXECUTABLE || 'codex', ['app-server'], {
-      cwd: project, env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: join(home, '.codex'), TURNLINK_FIXTURE_KEY: 'fixture-only' }, stdio: ['pipe', 'pipe', 'pipe'],
+    const broker = createBroker({ port: 0, directory: join(root, 'broker'), secret: '1'.repeat(64), adminSecret: '2'.repeat(64), controlPlane: true });
+    await once(broker.server, 'listening');
+    const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, token: '1'.repeat(64), credentialDirectory: join(root, 'proofs') };
+    const admin = new ChannelClient({ ...options, token: '2'.repeat(64) }), participant = new ChannelClient(options);
+    const adapterFile = join(root, 'adapter.token'); writeFileSync(adapterFile, '3'.repeat(64), { mode: 0o600 });
+    const child = spawn(process.execPath, [resolve('src/codex-proxy.js'), 'app-server'], {
+      cwd: project, env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: join(home, '.codex'), TURNLINK_FIXTURE_KEY: 'fixture-only',
+        AGENT_CHANNEL_CODEX_EXECUTABLE: process.env.TURNLINK_CODEX_EXECUTABLE || 'codex', AGENT_CHANNEL_URL: options.url,
+        AGENT_CHANNEL_TOKEN: options.token, AGENT_CHANNEL_CREDENTIAL_DIR: options.credentialDirectory,
+        AGENT_CHANNEL_CONTROL: '1', AGENT_CHANNEL_ADAPTER_TOKEN_FILE: adapterFile }, stdio: ['pipe', 'pipe', 'pipe'],
     });
+    const childClosed = once(child, 'close');
     const pending = new Map(); let sequence = 0, diagnostics = '';
     child.stderr.on('data', chunk => { diagnostics = (diagnostics + chunk).slice(-4000); });
     const rejectAll = error => { for (const p of pending.values()) { clearTimeout(p.timer); p.reject(error); } pending.clear(); };
@@ -65,9 +78,10 @@ test('real Codex changes cwd in the same thread without permission overrides (lo
     });
     t.after(async () => {
       rejectAll(new Error('Fixture stopped')); child.kill();
-      if (child.pid && child.exitCode === null && child.signalCode === null) await once(child, 'exit');
+      if (child.pid) await childClosed;
       model.closeAllConnections(); await new Promise(resolve => model.close(resolve));
-      rmSync(root, { recursive: true, force: true });
+      admin.close(); participant.close(); await broker.close();
+      rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     });
     await rpc('initialize', { clientInfo: { name: 'turnlink_worktree_gate', version: '0.1.0' } });
     child.stdin.write(JSON.stringify({ method: 'initialized', params: {} }) + '\n');
@@ -88,4 +102,31 @@ test('real Codex changes cwd in the same thread without permission overrides (lo
     assert.match(lastInput, /GLOBAL_WORKTREE_GATE/);
     assert.match(lastInput, /PROJECT_WORKTREE_GATE/);
     assert.match(lastInput, /WORKTREE_NEW_GATE/);
+    const command = (op, fields = {}) => ({ id: randomUUID(), channel: 'gate', op, ...fields });
+    await admin.request('control_command', { command: command('channel.configure') });
+    await admin.request('control_enroll_adapter', { hostId: 'local', credential: '3'.repeat(64) });
+    const agentId = `codex:${before.thread.id}`;
+    const registration = { harness: 'codex', sessionId: before.thread.id, channel: 'gate', name: 'gate-agent', role: 'implementation',
+      project: { name: 'gate', root: realpathSync(worktree) } };
+    await participant.request('join', registration);
+    await participant.request('control_command', { agentId, command: command('master.volunteer', { eligible: true }) });
+    const roleDone = new Promise(resolve => { completed = resolve; });
+    const proposal = command('master.appoint', { candidate: agentId });
+    await admin.request('control_command', { command: proposal });
+    await delay(100); // Drain join maintenance before triggering the authenticated role offer.
+    await participant.request('join', registration);
+    await roleDone;
+    let admitted = false;
+    for (let i = 0; i < 100; i++) {
+      if ((await admin.request('control_query', { channel: 'gate', view: 'events' })).entries.some(e => e.type === 'notice.accepted')) { admitted = true; break; }
+      await delay(20);
+    }
+    assert.ok(admitted, 'real Codex must return a native role admission receipt');
+    assert.match(lastInput, /Turnlink supplemental master role/);
+    assert.match(lastInput, /GLOBAL_WORKTREE_GATE/); assert.match(lastInput, /PROJECT_WORKTREE_GATE/);
+    await participant.request('control_command', { agentId, command: command('master.accept', { proposalID: proposal.id, promptVersion: 1 }) });
+    assert.equal((await admin.request('control_query', { channel: 'gate', view: 'channel' })).channel.active.agentId, agentId);
+    const roleState = await rpc('thread/resume', { threadId: before.thread.id, excludeTurns: true });
+    assert.equal(roleState.thread.id, before.thread.id); assert.equal(roleState.model, after.model); assert.equal(roleState.cwd, after.cwd);
+    assert.deepEqual(roleState.approvalPolicy, after.approvalPolicy); assert.deepEqual(roleState.sandbox, after.sandbox);
   });

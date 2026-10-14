@@ -243,7 +243,7 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
             persist();
             if (subscriptions.get(p.agentId) !== socket) deliveries.delete(p.agentId);
             subscriptions.set(p.agentId, socket);
-            result = { subscribed: true, registered: !!a }; break;
+            result = { subscribed: true, registered: !!a, ...(a ? { channel: a.channel } : {}) }; break;
           }
           case 'resume': {
             binding(principal, p.agentId, p.proof);
