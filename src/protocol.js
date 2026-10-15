@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { StorageStatus } from './control/storage-contracts.js';
 
 export const PROTOCOL_VERSION = 2;
 export const MAX_FRAME_BYTES = 65536;
@@ -35,13 +36,17 @@ const methods = {
   revoke_session: z.strictObject({ agentId: AgentID }),
   handoff: z.strictObject({}),
   control_info: z.strictObject({}),
-  control_command: z.strictObject({ agentId: AgentID.optional(), proof: proof.optional(), command: z.unknown() }),
+  control_command: z.strictObject({ agentId: AgentID.optional(), proof: proof.optional(), command: z.unknown(),
+    expected: z.strictObject({ policyRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      activeID: z.string().uuid().nullable(), proposalID: z.string().uuid().nullable(), electionID: z.string().uuid().nullable(),
+      volunteersDigest: z.string().regex(/^[a-f0-9]{64}$/) }).optional() }),
   control_adapter: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/), command: z.unknown() }),
   control_query: z.strictObject({ channel: Channel, agentId: AgentID.optional(), proof: proof.optional(),
     view: z.enum(['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'notices', 'previews', 'transitions', 'evidence']),
     generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     after: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
-    offset: z.number().int().min(0).max(100000).optional(), limit: z.number().int().min(1).max(100).optional() }),
+    offset: z.number().int().min(0).max(100000).optional(), limit: z.number().int().min(1).max(100).optional(), entityID: z.string().uuid().optional() })
+    .refine(p => !p.entityID || ['tasks', 'actions', 'incidents', 'evidence', 'previews', 'transitions'].includes(p.view)),
   control_notice_ack: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/), id: z.string().uuid(),
     receiptID: z.string().regex(/^msg_[a-zA-Z0-9_-]{1,124}$/) }),
   control_task_pull: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/), channel: Channel,
@@ -49,6 +54,15 @@ const methods = {
   control_task_watch: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/) }),
   control_enroll_adapter: z.strictObject({ hostId: HostID, credential: z.string().regex(/^[a-f0-9]{64}$/) }),
   control_revoke_adapter: z.strictObject({ hostId: HostID }),
+  control_storage_status: z.strictObject({}),
+  control_storage_watch: z.strictObject({}),
+  control_receipt: z.strictObject({ channel: Channel, commandID: z.string().uuid() }),
+  control_activity_status: z.strictObject({}),
+  control_activity: z.strictObject({ channel: Channel, after: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    limit: z.number().int().min(1).max(100).optional() }),
+  control_export: z.strictObject({ id: z.string().uuid() }),
+  control_export_read: z.strictObject({ id: z.string().uuid(), offset: z.number().int().nonnegative().max(1024 * 1024 * 1024),
+    limit: z.number().int().min(1).max(24576).optional() }),
 };
 const envelope = z.strictObject({ v: z.literal(PROTOCOL_VERSION), id: z.union([z.number().int().min(1).max(2147483647), bounded(128)]),
   method: bounded(64), params: z.unknown() });
@@ -105,6 +119,8 @@ export function parseFrame(raw) {
     z.strictObject({ v: z.literal(2), event: z.literal('presence'), agent }).parse(value);
   } else if (value.event === 'task_available') {
     z.strictObject({ v: z.literal(2), event: z.literal('task_available'), agentId: AgentID }).parse(value);
+  } else if (value.event === 'control_storage') {
+    z.strictObject({ v: z.literal(2), event: z.literal('control_storage'), status: StorageStatus }).parse(value);
   } else {
     z.strictObject({ v: z.literal(2), id: z.union([z.string(), z.number(), z.null()]), result: z.unknown().optional(), error: z.string().min(1).max(512).optional() })
       .refine(v => Object.hasOwn(v, 'result') !== Object.hasOwn(v, 'error')).parse(value);

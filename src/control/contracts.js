@@ -11,6 +11,12 @@ export const ELECTION_TIMEOUT_MS = 60000;
 export const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const Stamp = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const UUID = z.string().uuid();
+export const ChannelPrecondition = z.strictObject({ policyRevision: Stamp, generation: Stamp,
+  activeID: UUID.nullable(), proposalID: UUID.nullable(), electionID: UUID.nullable(), volunteersDigest: z.string().regex(/^[a-f0-9]{64}$/) });
+export const channelPrecondition = channel => ChannelPrecondition.parse({ policyRevision: channel.policyRevision, generation: channel.generation,
+  activeID: channel.active?.id ?? null, proposalID: channel.proposal?.id ?? null, electionID: channel.election?.id ?? null,
+  volunteersDigest: createHash('sha256').update(JSON.stringify(channel.volunteers)).digest('hex') });
+export const CommandResult = z.strictObject({ commandID: UUID, channel: Channel, eventIDs: z.array(UUID).max(16384) });
 const text = max => z.string().trim().min(1).max(max).refine(value => Buffer.byteLength(value, 'utf8') <= max, 'UTF-8 byte limit exceeded');
 const absolutePath = text(2048).refine(value => !value.includes('\0') && (posix.isAbsolute(value) || win32.isAbsolute(value)), 'Absolute host path required');
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
@@ -43,8 +49,12 @@ const payload = (op, fields = {}) => z.strictObject({ id: UUID, op: z.literal(op
 const EvidenceKind = z.enum(['admitted', 'unadmitted', 'native_idempotent', 'uncertain', 'capability', 'idle', 'busy', 'started', 'stopped', 'artifact']);
 export const Evidence = z.strictObject({ id: UUID, channel: Channel, entityID: UUID, agentId: AgentID, kind: EvidenceKind, at: Stamp,
   attempt: Stamp.optional(), admissionID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/).optional(),
-  sameConversationWorktree: z.boolean().optional(), artifact: z.strictObject({ type: z.literal('native_session_segment'), harness: z.literal('opencode'),
-    sessionID: text(200), fromMessageID: text(128), throughMessageID: text(128), digest: Digest, finish: text(32) }).optional() });
+  sameConversationWorktree: z.boolean().optional(), artifact: z.discriminatedUnion('type', [
+    z.strictObject({ type: z.literal('native_session_segment'), harness: z.literal('opencode'),
+      sessionID: text(200), fromMessageID: text(128), throughMessageID: text(128), digest: Digest, finish: text(32) }),
+    z.strictObject({ type: z.literal('native_turn'), harness: z.literal('codex'), sessionID: text(200), turnID: text(200),
+      admissionID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/), digest: Digest, finish: z.enum(['completed', 'interrupted', 'failed']) }),
+  ]).optional() });
 export const Command = z.discriminatedUnion('op', [
   payload('channel.configure', { mode: Mode.optional(), electionsEnabled: z.boolean().optional(), capacity: z.number().int().min(1).max(32).optional() }),
   payload('master.volunteer', { eligible: z.boolean() }),

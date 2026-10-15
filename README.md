@@ -34,7 +34,7 @@ When the recipient has finished responding, its harness adapter can start a new 
 
 ## What you get
 
-An opt-in [control-plane experiment](docs/control-plane.md) adds authenticated governance/task records and OpenCode/Codex supplemental master notices. A separate experimental gate supports broker delivery pause/resume and never-offered cancellation. Task dispatch and the dashboard remain pending.
+An opt-in [control-plane experiment](docs/control-plane.md) adds authenticated governance/task records and OpenCode/Codex supplemental master notices. Separate default-off gates support receipt-backed broker delivery effects and existing-conversation task execution. An experimental [React/Mantine operator console](docs/operator-dashboard.md) provides scoped local views and guarded commands. Managed worktrees and full operational/deployment acceptance remain pending.
 
 | Capability | Behavior |
 | :--- | :--- |
@@ -497,8 +497,9 @@ docs/                         Remote design, live proof, local deployment record
 
 ## Next work
 
-- [x] Control-plane foundation, authenticated broker/OpenCode/Codex governance, receipt-backed broker delivery effects, internal worktree grant/recovery contracts and native/offline snapshot observation. Live task/worktree execution and dashboard remain pending. [Implementation status and agreed behavior →](docs/control-plane.md)
-- [ ] React/Mantine operations dashboard, broker/adapter control integration, channel master elections and operational task scheduling.
+- [x] Control-plane foundation, authenticated broker/OpenCode/Codex governance, channel master elections, receipt-backed broker effects, opt-in existing-cwd task flows and native/offline snapshot observation. [Implementation status and agreed behavior →](docs/control-plane.md)
+- [x] Core authenticated loopback React/Mantine console, private control exports, bounded broker metadata telemetry and operator storage-pressure views. [Console setup and limits →](docs/operator-dashboard.md)
+- [ ] Managed worktree continuity/creation/cleanup, remaining adapter recovery effects, safe storage reclamation, complete alert/workflow surfaces and operational Windows/IDE/live-model acceptance. [Full delivery gates →](docs/control-plane-roadmap.md)
 - [ ] Verified same-window, same-project `/new` handoff.
 - [x] Per-host credentials and scoped session capabilities (v0.2 candidate).
 - [ ] Formal accepted / turn-started / processed lifecycle receipts.

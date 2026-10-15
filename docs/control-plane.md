@@ -22,12 +22,15 @@ Implemented:
 - Native snapshot observation: `src/native-snapshot-source.js` binds source conversation identity, selected native model/agent, permissions, sandbox/approval policy, tools, retained instruction entries, configuration and activity revision. `src/worktree-snapshot.js` reads bounded offline source/destination inventories without executing destination code. Both real-service fixtures exercise these readers. Their reports are observational candidates, **not execution authorization**.
 - Codex stdio exclusion primitive: `src/codex-admission-fence.js` is integrated into proxy forwarding and tested with live stdio and the real Codex fixture. It holds competing admissions, preserves actual human approvals/cancellation, and quarantines uncertain owner effects. Acquisition remains internal-only; **no production transition executor acquires a fence yet**.
 - `adapters/opencode-tasks.js`: separately opt-in execution of voluntarily claimed, explicitly non-worktree tasks in the existing OpenCode session/cwd; private admission journal, native segment references/hashes, stop evidence, participant result report and master review notices. The real OpenCode local-model fixture exercises claim → execution → report → explicit master acceptance.
+- `src/codex-tasks.js`: separately opt-in existing-thread/cwd task execution through the Codex stdio proxy, with an exclusively locked private attempt journal and exact native-turn evidence. Native mutation uncertainty is reconciled from the correlated user-input/turn record, never by resending a start. Process-restart/approval/interruption fixtures and the real Codex local-model/native-MCP claim/report/review flow exercise this gate.
+- Bounded broker metadata telemetry, private consistent control exports and operator CLI storage-pressure monitoring; none of these observations authorizes native replay or prunes command receipts.
+- `src/dashboard-server.js` / `dashboard/`: experimental loopback React/Mantine operator console, separate login/session/CSRF, channel allowlist, typed read views, preview/confirm controls and broker-transaction policy/authority conditions. [Setup, security boundary and browser acceptance →](operator-dashboard.md)
 
-Not implemented yet: comprehensive broker telemetry ingestion, adapter replay/wake-policy/member-removal executors, Codex task dispatch, full destination effective-authority resolution, production native exclusion/destination rebind, managed worktree creation/cleanup, dashboard, or OpenCode alert UI. By default an approved action remains a record, not an effect; the separate broker-effects flag enables only the three operations listed below. Task dispatch is separately default-off; capabilities advertise its actual flag, supported harnesses and `taskWorktreesEnabled: false`. `worktreeExecutionEnabled` remains false. Internal stores/reducers/coordinators/readers are not browser/model APIs.
+Not implemented yet: comprehensive adapter health, safe storage reclamation, adapter replay/wake-policy/member-removal executors, full destination effective-authority resolution, production native exclusion/destination rebind, managed worktree creation/cleanup, complete dashboard workflows/background alert delivery, or OpenCode alert UI. By default an approved action remains a record, not an effect; the separate broker-effects flag enables only the three operations listed below. Task dispatch is separately default-off; capabilities advertise its actual flags, supported harnesses and `taskWorktreesEnabled: false`. `worktreeExecutionEnabled` remains false. Internal stores/reducers/coordinators/readers are not browser/model APIs. See `control-plane-roadmap.md` for the full remaining plan; completing an existing-cwd task or dashboard slice does not complete the platform.
 
 ## Experimental activation (isolated state only)
 
-Start a broker with `AGENT_CHANNEL_CONTROL=1 npm start`. Its control database is created in the broker state's `control/` subdirectory. Do not enable this against a production installation yet: storage archive/alerts and full operational acceptance are pending.
+Start a broker with `AGENT_CHANNEL_CONTROL=1 npm start`. Its control database is created in the broker state's `control/` subdirectory. Do not enable this against a production installation yet: safe capacity reclamation, comprehensive telemetry/dashboard alerts and full operational acceptance are pending.
 
 Use the local operator credential through the CLI, never through model tools or browser JavaScript:
 
@@ -43,7 +46,7 @@ In the existing OpenCode plugin options, add `control: true` and `adapterTokenFi
 
 MCP exposes the participant tools only with `--control-plane`. For Codex, retain existing MCP configuration and append that flag to its Turnlink MCP arguments. On the **proxy process**, set `AGENT_CHANNEL_CONTROL=1` and `AGENT_CHANNEL_ADAPTER_TOKEN_FILE=/absolute/private/adapter.token`. The proxy does not forward the adapter credential-file variable to its Codex child/MCP processes. Do not supply this credential through tool arguments or the model environment.
 
-Codex role offers use `turn/start` when lifecycle is known idle, or `turn/steer` with the exact active turn ID. Active/ended notices only steer a running turn; idle delivery is deferred. Existing approval requests block admission. Resumed threads whose lifecycle cannot be established are held until a native turn response/event establishes it. No instructions, cwd, agent/model, sandbox or approval parameters are overridden by role admission. Uncertain admissions are held for native receipt reconciliation/operator inspection, never blindly replayed after a timeout or restart. These are governance capabilities, not full task-execution or IDE acceptance. No task or worktree effects are dispatched.
+Codex role offers use `turn/start` when lifecycle is known idle, or `turn/steer` with the exact active turn ID. Active/ended notices only steer a running turn; idle delivery is deferred. Existing approval requests block admission. Resumed threads whose lifecycle cannot be established are held until a native turn response/event establishes it. No instructions, cwd, agent/model, sandbox or approval parameters are overridden by role admission. Uncertain admissions are held for native receipt reconciliation/operator inspection, never blindly replayed after a timeout or restart. Governance alone dispatches no task or worktree effects; the separate task gate below is required for task execution. IDE and production acceptance remain pending.
 
 ### Optional broker-local effects gate
 
@@ -71,6 +74,18 @@ The adapter observes native blockers/idle lifecycle and retains the existing ses
 Before native admission, the adapter persists an attempt-bound deterministic message ID and task binding under an exclusive private journal lock. Recovery uses that same native idempotency key, never a fresh execution prompt. Lost responses retain uncertainty and exact admission evidence; scope changes, missing journals for an already-admitted attempt, corrupt records and full journals fail closed. The journal holds at most 256 attempts and requires future operator archival rather than silently discarding receipts.
 
 Native assistant activity supplies started/progress observations. After native idle, the adapter records a session segment reference, digest and finish reason, plus stop evidence; raw transcript/output is not uploaded to the broker or journal. These references are not correctness certification. A supplemental result notice asks the participant for an actual `task.report`; a separate master notice requests `task.review`. The master can inspect scoped `evidence` alongside tasks. Acceptance must still evaluate criteria and the reported result. This gate does not provide worktree isolation, managed cleanup, comprehensive telemetry or production/IDE/live-model acceptance.
+
+### Optional Codex existing-cwd task gate
+
+On an isolated broker only, set `AGENT_CHANNEL_CONTROL=1`, `AGENT_CHANNEL_TASKS=1` and **separately** `AGENT_CHANNEL_CODEX_TASKS=1`. The last flag requires the first two. On the stdio proxy process, retain the existing enrolled adapter token-file configuration and set `AGENT_CHANNEL_CONTROL=1 AGENT_CHANNEL_CODEX_TASKS=1`. Both broker and proxy must opt in; an ordinary OpenCode task-enabled broker still rejects Codex task pulls. WebSocket/Unix app-server transports are not covered. No user installation or running broker is reconfigured by this code.
+
+Only explicitly non-worktree claimed tasks may start. The proxy uses the existing thread and sends only `threadId` and `input` to `turn/start`; it does not override cwd, model, instructions, sandbox or approvals. Native start/resume selections, native `thread/read`/`config/read` observations, known idle lifecycle and process mutation revisions guard admission. Concurrent native mutations defer admission. Unknown thread mutations or explicit per-turn overrides invalidate cached selection until native re-observation. This is an existing-cwd check, not complete destination-authority resolution or a worktree exclusion grant.
+
+The private journal persists invocation **before** the RPC. Neither the JSON-RPC request ID nor the task marker is claimed as a Codex-native idempotency key. Lost native responses are never resent. Recovery needs the exact native turn/user-input marker, matching thread/task/attempt, unchanged native scope and terminal turn status before stop evidence. Missing/corrupt/full journals fail closed. An unresolved invocation with no matching turn remains uncertain; a disconnect, thread close or archive does not prove a stop. Journals hold at most 256 attempts pending operator archival.
+
+Evidence contains only a native thread/turn reference, admission binding, digest and finish status; raw native results/configuration do not enter broker evidence or the journal. Actual native observations produce bounded progress records. After stop evidence, a separately journaled report notice asks the participant for `task.report`; an uncertain notice is not replayed, and the participant still must submit a report. A master must explicitly accept its evidence. Human interruption is forwarded immediately and records an interrupted stop without automatically waking a report turn. Native approval/elicitation responses pass unchanged; the adapter never supplies a decision.
+
+The isolated real Codex fixture verifies native model → harness-bound MCP voluntary claim → proxy execution → artifact/stop evidence → native model/MCP report → explicit native model/MCP master acceptance. Its test operator explicitly answers only its known local fixture MCP consent request. Process fixtures verify lost-response recovery across actual proxy/native-process restart, private internal RPC responses, approval blocking and human stop behavior. These checks do not establish Windows/IDE/live-model/production acceptance or enable managed worktree movement.
 
 ### Worktree preparation subgate (internal verification only)
 
@@ -168,24 +183,120 @@ Tested locally with OpenCode **2.0.28** and Codex CLI **0.161.0**:
 
 ## Storage and trust boundaries
 
-Control state version 1 / SQLite schema version 4 lives in a **separate new private directory** with `control.db`; it does not replace/migrate `store.json` or `security.json`. The existing broker remains authoritative for enrolled hosts, session proofs, membership and messages. The control repository owns only its new state. Older private control schemas are validated before additive migration; old active assignments without accepted role notices cannot gain transport authority. Broker schema version 3 accepts additive private exposure, pause and effect-receipt records; older binaries may reject snapshots containing these new fields. Do not downgrade by stripping receipts or exposure metadata.
+Control state version 1 / SQLite schema version 5 lives in a **separate new private directory** with `control.db`; it does not replace/migrate `store.json` or `security.json`. The existing broker remains authoritative for enrolled hosts, session proofs, membership and messages. The control repository owns only its new state. Older private control schemas are validated before additive migration; schema 5 adds bounded activity observations and retention/loss metadata without rewriting state, audit or command receipts. Old active assignments without accepted role notices cannot gain transport authority. Broker schema version 3 accepts additive private exposure, pause and effect-receipt records; older binaries may reject snapshots containing these new fields or the new Codex native-turn artifact variant. Older control binaries reject schema 5. Do not downgrade by stripping receipts, artifact evidence, telemetry or exposure metadata.
 
 Commands are strict and carry UUID idempotency keys. Actor identities, membership snapshots and the clock are separate **trusted context**, never request/model fields. The broker resolves `operator` from its administrator credential, `participant` from host/session proof plus membership, and `adapter` from separate operator enrollment plus session proof and the actual receiver socket. Only the in-process scheduler can issue clock/departure transitions. A session proof alone cannot grant arbitrary adapter evidence-reporting or operator rights. The internal store is not an authentication mechanism; unrestricted same-user filesystem access can still read adapter credentials.
 
 State/evidence/audit are committed in one SQLite transaction with full synchronization, an exclusive writer lock, private directory/file checks, WAL checkpointing and bounded storage. Unknown schema versions/corrupt state fail closed. Clock regression is rejected. Command receipts cannot silently disappear and permit repeated effects.
 
-Rolling telemetry expires after 30 days. Authority changes, action/task transitions, unresolved incidents and admission evidence are not automatically deleted. Initial limits: 100,000 events, 10,000 command receipts, 64 MiB serialized state and a bounded SQLite database. Hitting a limit rejects the transaction without deleting evidence. An archive/export and operator-visible storage incident are required before production activation. Only periodic lease renewals and progress telemetry are rolling events in this initial core; adapter health/message telemetry remains to be wired.
+Rolling telemetry expires after 30 days, subject to unresolved-message/evidence protection. Authority changes, action/task transitions, unresolved incidents and admission evidence are not automatically deleted. Initial limits: 100,000 events, 10,000 command receipts, 20,000 activity observations, 64 MiB serialized state and a bounded SQLite database. Hitting a control-state limit rejects the transaction without deleting evidence; observation capacity instead records telemetry loss without rejecting already-durable broker operations. Private control exports and operator CLI pressure alerts are implemented; safe capacity reclamation and dashboard/OpenCode alerts remain production gates. Broker message/receiver metadata now complements rolling lease-renewal and task-progress events; native adapter health and broader operational telemetry remain incomplete.
 
 Audit events store enumerated types and IDs, not credentials, headers, prompts, task bodies or arbitrary provider error text. Task instructions/results and role notices are separately persisted collaboration content. Message inspection reads the existing broker message store; it is not an independent 30-day message archive. Explicit sensitive-content handling and comprehensive telemetry remain future work. Same-user unrestricted filesystem access is not sandboxed by the control plane.
 
 Membership departure and host revocation persist role termination before altering legacy broker membership/security. These stores are **not atomic together**: a later JSON failure may conservatively leave membership present with its role already revoked. Control-storage failures prevent membership-removal success; scheduler failure disables control requests until restart, without granting stale role authority. A full notice/audit store can therefore block departure and needs an operator-visible archival/recovery path before deployment. Renewal command receipts also consume the finite command budget; this slice is not an unattended long-running service.
 
+### Operator storage status and private control exports
+
+```sh
+npm run control-admin -- storage
+npm run control-admin -- storage-watch
+npm run control-admin -- export /absolute/private-directory/new-export.jsonl
+# Retry a lost response using the original UUID printed before the request:
+npm run control-admin -- export /absolute/private-directory/another-new-file.jsonl ORIGINAL_UUID
+```
+
+These commands use the local operator credential, not a participant/model tool.
+Detailed quotas, disk capacity and unresolved-work counts require operator access;
+participants receive only aggregate pressure through `control_info`. Watches send
+changes to pressure level/affected resources to subscribed operator sockets, with
+no master required and no participant wake. A disconnect ends the CLI watch with
+a failure status; reconnect explicitly. Quotas warn at 80% and become critical at
+95%; low free disk has additional absolute/percentage thresholds. These are
+alerts, not permission to replay effects, discard receipts or clear a fault.
+
+Exports are immutable `control/exports/UUID.jsonl` files with private permissions,
+a bounded streaming format, content/footer validation and SHA-256 download
+verification. Each captures a consistent SQLite read transaction: control state,
+events, command receipts, notices, effect intents, broker activity observations,
+durable telemetry loss counters and credential enrollment/revocation audit metadata.
+New exports declare SQLite schema 5; the reader also accepts earlier schema-4 exports.
+Authentication registries, credential digests, broker membership/
+message JSON, raw native transcripts and adapter journals are **not** exported.
+Task instructions, results, paths and role notices **are collaboration content**
+and are retained; this is not a public/redacted export or a guarantee against
+secrets pasted into collaboration fields. Keep exports private. It is not a full
+disaster-recovery backup, an import API, or an archive of broker messages.
+
+Defaults allow 32 files, 512 MiB total and 256 MiB per file. Exporting never deletes
+live data or frees command/evidence capacity. Existing IDs return their original
+validated snapshot, including after restart; never silently regenerate an ID on
+an uncertain retry. Interrupted/failed files count toward limits and remain
+incomplete, cannot be downloaded as valid exports, and are never overwritten.
+Failed local downloads likewise remain explicitly unverified and are not
+overwritten. Do not delete incomplete files until an operator has investigated
+them. Safe verified archival/reclamation and recovery from exhausted durable
+receipt budgets remain unimplemented; do not manually strip receipts or evidence.
+
+Diagnostics and consistent exports bypass scheduler mutations and remain callable
+when control scheduling is quarantined, provided the broker and readable store
+remain usable. Completed exports can still be retrieved if the control store is
+unavailable. Neither operation clears quarantine or bypasses broker authentication,
+request budgets, filesystem safety checks or a broker-wide persistence fault.
+
+### Broker activity telemetry
+
+```sh
+npm run control-admin -- activity-status
+npm run control-admin -- activity dev
+npm run control-admin -- activity dev LAST_SEQUENCE
+```
+
+With the control plane enabled, the broker records strictly typed metadata for
+membership join/removal, receiver connect/disconnect/unsubscribe, message queue/
+offer/acknowledgement/cancellation and successful broker pause/resume effects.
+Records contain generated observation/run UUIDs, broker time, channel, agent ID,
+optional broker message UUID and enumerated cancellation reason. They do not
+copy message bodies, client message keys, names, roles, project paths, proofs,
+authentication headers, credential values, native prompts or provider errors.
+Identifiers remain private coordination metadata, not anonymized/public data.
+
+`control_activity` and `control_activity_status` are operator-only read endpoints,
+with channel filtering, bounded pages and monotonic sequence cursors; they work
+without a master and do not wake participants. They remain callable when control
+scheduling is quarantined, subject to ordinary broker authentication/availability.
+Retention runs at startup and at most once per minute, independently of master
+leases or scheduler success. It removes observations strictly older than 30 days,
+except message records pinned by pending delivery, exposed/legacy-unknown
+unacknowledged delivery (even after cancellation), control evidence, open incidents
+or unresolved recovery actions. If the protection inventory is unavailable or
+time regresses, it deletes nothing and reports a telemetry-health problem. Control
+state, command receipts and native evidence are never pruned by this operation.
+
+Coverage is explicitly **observational**, not a cross-store transaction or a
+recovery/admission receipt. A crash between broker persistence and observation can
+leave an unknown gap. Every process has a new run ID; the system never synthesizes
+missing history, silently replays an operation, or treats an offer/acknowledgement/
+disconnect as native task completion. Repeated send/ack requests do not generate
+duplicate queue/ack observations, but a later actual re-offer is a new observation.
+
+At the activity limit, new observations are refused, retained rows remain intact,
+and a durable `rejected` count increments. Failed writes increase the current
+run's `unpersisted` count; successful subsequent observation/retention transactions
+flush known losses into the durable rejection counter. A crash before that flush
+can lose the count, so zero never proves uninterrupted coverage. Quota pressure,
+known losses and retention failures appear in operator storage alerts; known
+historical loss is not silently cleared after capacity recovers. Monitoring
+failure alone does not turn an already-durable send/ack into failure or authorize
+native recovery. These are metadata observations, **not** a separate message-body
+archive; comprehensive adapter health, alert acknowledgement and safe durable
+receipt reclamation remain pending.
+
 ## Next implementation gates
 
-1. **Authenticated integration follow-through:** broker/OpenCode/Codex governance slices are implemented and tested; add comprehensive telemetry, storage alerts and archive/export. Do not expose a generic endpoint accepting caller-selected actor context.
+1. **Authenticated integration follow-through:** broker/OpenCode/Codex governance, control export, broker activity telemetry and operator CLI storage alerts are implemented and tested; add comprehensive adapter health, safe capacity reclamation and dashboard/OpenCode alerts. Do not expose a generic endpoint accepting caller-selected actor context.
 2. **Effect boundary follow-through:** broker-local pause/resume and never-offered cancellation now have durable intents/receipts and reconciliation. Add adapter-side replay/wake-policy/member-removal contracts separately; control state and legacy broker JSON are not one transaction. Do not claim cross-store atomicity.
 3. **Adapter continuity:** grant/receipt contracts, coordinator, snapshot observation and the Codex stdio fence primitive are implemented; finish effective destination authority, production owner RPC/journal/quarantine wiring, OpenCode exclusion and exact receiver rebind, plus Codex task-scoped turn cwd admission. Then verify the full approved-grant/native-effect/rebind chain. Arbitrary moves/peer input must not acquire these capabilities.
-4. **React/Mantine dashboard:** loopback-first server, human login/session, CSRF/origin protections, scoped browser API, channel/message/incident/task views, approvals, and storage alerts. Never send broker host/admin credentials to JavaScript. Add OpenCode CLI alerts separately.
+4. **React/Mantine dashboard:** the core loopback console, separate human login/session, CSRF/Host/Origin protection, scoped browser reads, guarded preview/confirm and in-page storage pressure are implemented with real broker/browser regressions. Finish broader operator workflows/background alert delivery and OpenCode CLI alerts separately. Never send broker host/admin credentials to JavaScript. See `operator-dashboard.md`.
 5. **Operational acceptance:** real socket/API failures, busy conversations, lost responses, worktree preview changes, dirty cleanup refusal, IDE evidence and live-model checks. Do not declare OpenCode/Codex operational parity based only on pure reducer tests.
 
 ## Verification

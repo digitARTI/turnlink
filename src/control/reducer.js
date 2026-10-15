@@ -284,7 +284,8 @@ export function reduceControl(previous, input, suppliedContext) {
         const value = state.tasks.find(t => t.id === command.entityID && t.channel === channel.id);
         check(value?.claimant === actor.agentId && value.attempt === command.attempt && ['running', 'uncertain', 'review'].includes(value.status), 'STALE_ARTIFACT_EVIDENCE');
         if (command.artifact) check(actor.agentId === `${command.artifact.harness}:${command.artifact.sessionID}`, 'ARTIFACT_IDENTITY_MISMATCH');
-        if (command.artifact && value.nativeAdmissionID) check(command.artifact.fromMessageID === value.nativeAdmissionID, 'ARTIFACT_IDENTITY_MISMATCH');
+        if (command.artifact && value.nativeAdmissionID) check((command.artifact.type === 'native_turn' ? command.artifact.admissionID :
+          command.artifact.fromMessageID) === value.nativeAdmissionID, 'ARTIFACT_IDENTITY_MISMATCH');
       }
       check(!command.artifact || command.kind === 'artifact', 'INVALID_ARTIFACT_EVIDENCE');
       state.evidence.push({ id: command.id, channel: channel.id, entityID: command.entityID, agentId: actor.agentId, kind: command.kind, at: now,

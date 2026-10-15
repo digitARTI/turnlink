@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 import { ControlStore } from './store.js';
-import { Command } from './contracts.js';
+import { Command, RETENTION_MS } from './contracts.js';
 import { ControlError, requireControl as check } from './policy.js';
 import { digest, matches } from '../config.js';
 import { MAX_RESPONSE_BYTES } from '../protocol.js';
 import { PARTICIPANT_OPERATIONS, OPERATOR_OPERATIONS, ADAPTER_OPERATIONS } from './operations.js';
 import { BROKER_EFFECT_OPERATIONS } from './effects.js';
 import { readyTasks } from './reducer.js';
+import { ControlArchives } from './archives.js';
+import { StorageStatus, combinePressure, pressureLevel } from './storage-contracts.js';
 
 const participantOps = new Set(PARTICIPANT_OPERATIONS);
 const operatorOps = new Set(OPERATOR_OPERATIONS);
@@ -15,16 +18,74 @@ const masterOps = new Set(['action.request', 'incident.resolve', 'task.create', 
 
 // All identity/clock/membership inputs below originate in the broker. No caller can provide an Actor or scheduler role.
 export class ControlGateway {
-  constructor({ directory, now, members, member, receiver, messages, hosts, adminDigest, options, effectsEnabled = false, worktreeGrants = false, taskDispatch = false }) {
+  constructor({ directory, now, members, member, receiver, messages, hosts, adminDigest, options, effectsEnabled = false, worktreeGrants = false, taskDispatch = false, codexTasks = false, runtimeAvailable = () => true }) {
     this.store = new ControlStore(directory, options);
+    try { this.archives = new ControlArchives(join(directory, 'exports'), options?.exportLimits); }
+    catch (error) { this.store.close(); throw error; }
+    this.runtimeAvailable = runtimeAvailable;
     Object.assign(this, { now, members, member, receiver, messages, hosts, adminDigest });
     this.effectsEnabled = effectsEnabled;
     this.worktreeGrants = worktreeGrants;
     this.taskDispatch = taskDispatch;
+    this.codexTasks = codexTasks;
+    this.activityRunID = randomUUID(); this.activityStartedAt = now(); this.activityFailures = 0; this.activityPruneFailed = false;
   }
   capabilities() { return { effectsEnabled: this.effectsEnabled, effectOperations: this.effectsEnabled ? BROKER_EFFECT_OPERATIONS : [], taskDispatchEnabled: this.taskDispatch,
-    taskExecutionHarnesses: this.taskDispatch ? ['opencode'] : [], taskWorktreesEnabled: false,
+    taskExecutionHarnesses: this.taskDispatch ? ['opencode', ...(this.codexTasks ? ['codex'] : [])] : [], taskWorktreesEnabled: false,
     worktreeGrantsEnabled: this.worktreeGrants, worktreeExecutionEnabled: false }; }
+  storageStatus() {
+    const checkedAt = this.now(), controlAvailable = this.runtimeAvailable();
+    try {
+      const report = this.store.storageStatus(), exports = this.archives.usage();
+      for (const [resource, used, limit] of [['export_count', exports.count, exports.countLimit], ['export_bytes', exports.bytes, exports.byteLimit]])
+        report.quotas.push({ resource, used, limit, level: pressureLevel(used, limit) });
+      const activity = this.store.activityStatus();
+      report.quotas.push({ resource: 'telemetry_rows', used: activity.rows, limit: activity.limit, level: pressureLevel(activity.rows, activity.limit) });
+      if (activity.rejected || this.activityFailures || this.activityPruneFailed)
+        report.quotas.push({ resource: 'telemetry_health', used: 1, limit: 1, level: 'critical' });
+      if (!controlAvailable) report.quotas.push({ resource: 'control_runtime', used: 1, limit: 1, level: 'critical' });
+      return StorageStatus.parse({ version: 1, checkedAt, controlAvailable, ...report, pressure: combinePressure(report.quotas) });
+    } catch {
+      return StorageStatus.parse({ version: 1, checkedAt, controlAvailable, pressure: { level: 'unavailable', resources: ['control_runtime'] }, quotas: [] });
+    }
+  }
+  signalStorage(sockets, send) {
+    const watching = [...sockets].filter(s => s.principal?.admin && s.storageWatch === true);
+    if (!watching.length) return;
+    const status = this.storageStatus(), signature = JSON.stringify(status.pressure);
+    for (const socket of watching) if (socket.storageSignature !== signature) {
+      send(socket, { event: 'control_storage', status }); socket.storageSignature = signature;
+    }
+  }
+  observeActivity(fields) {
+    try {
+      this.store.recordActivity({ ...fields, id: randomUUID(), runID: this.activityRunID, at: this.now() }, this.activityFailures);
+      this.activityFailures = 0;
+    }
+    catch { this.activityFailures = Math.min(Number.MAX_SAFE_INTEGER, this.activityFailures + 1); }
+  }
+  maintainActivity() {
+    const now = this.now();
+    if (this.activityPruneAt !== undefined && now >= this.activityPruneAt && now - this.activityPruneAt < 60000) return;
+    this.activityPruneAt = now;
+    try {
+      const state = this.store.snapshot(), pins = new Set();
+      // Cancellation/disconnect is not native stop proof. Retain exposed or
+      // legacy-unknown undelivered messages even after membership removal.
+      for (const message of this.messages()) if (message.recipients.some(id => !message.delivered.includes(id) &&
+        (!message.cancelled[id] || !Array.isArray(message.offered) || message.offered.includes(id)))) pins.add(message.id);
+      for (const item of state.evidence) pins.add(item.entityID);
+      for (const item of state.incidents.filter(i => i.status === 'open')) if (item.entityID) pins.add(item.entityID);
+      for (const item of state.actions.filter(a => !['succeeded', 'failed', 'rejected'].includes(a.status))) if (item.messageID) pins.add(item.messageID);
+      this.store.pruneActivity(now, [...pins], this.activityFailures); this.activityFailures = 0; this.activityPruneFailed = false;
+    } catch { this.activityPruneFailed = true; } // Unknown protection set means no pruning, never an empty guess.
+  }
+  activityStatus() {
+    const scope = { coverage: 'observational', runID: this.activityRunID, startedAt: this.activityStartedAt,
+      retentionMs: RETENTION_MS, unpersisted: this.activityFailures, pruningAvailable: !this.activityPruneFailed };
+    try { return { ...scope, available: true, ...this.store.activityStatus() }; }
+    catch { return { ...scope, available: false }; }
+  }
   context(actor) { return { actor, now: this.now(), members: this.members() }; }
   boundMember(principal, agentId, proof, channel) {
     try { return this.member(principal, agentId, proof, channel); }
@@ -72,7 +133,7 @@ export class ControlGateway {
     }
     // Models cannot invoke execution, reconciliation or adapter worktree grants;
     // native task dispatch uses the separately enabled receiver-only pull path.
-    const result = this.store.apply(command, this.context(actor));
+    const result = this.store.apply(command, this.context(actor), params.expected);
     if (['task.claim', 'task.review', 'task.missed', 'task.report', 'task.reassign'].includes(command.op)) {
       const task = this.store.snapshot().tasks.find(t => t.id === command.taskID);
       this.onTaskChanged?.(task);
@@ -81,9 +142,9 @@ export class ControlGateway {
   }
   pullTask(socket, params) {
     const agent = this.adapter(socket, params, params.channel);
-    check(this.taskDispatch && agent.harness === 'opencode', 'TASK_DISPATCH_DISABLED');
+    check(this.taskDispatch && (agent.harness === 'opencode' || (agent.harness === 'codex' && this.codexTasks)), 'TASK_DISPATCH_DISABLED');
     const active = this.store.snapshot().tasks.find(t => t.channel === agent.channel && t.claimant === agent.agentId && ['dispatching', 'running', 'uncertain'].includes(t.status));
-    if (active) return { task: active };
+    if (active) return { task: active, prepared: false };
     const next = readyTasks(this.store.snapshot(), agent.channel, this.now()).find(t => t.claimant === agent.agentId && !t.requiresWorktree);
     if (!next) return { task: null };
     const context = this.context({ kind: 'adapter', agentId: agent.agentId });
@@ -97,7 +158,7 @@ export class ControlGateway {
       if (error instanceof ControlError && ['CONVERSATION_CAPACITY', 'CHANNEL_CAPACITY', 'WORKTREE_TRANSITION_UNRESOLVED'].includes(error.code)) return { task: null };
       throw error;
     }
-    return { task: this.store.snapshot().tasks.find(t => t.id === next.id) };
+    return { task: this.store.snapshot().tasks.find(t => t.id === next.id), prepared: true };
   }
   signalReadyTasks() {
     if (!this.taskDispatch) return;
@@ -141,7 +202,7 @@ export class ControlGateway {
       const bounded = this.page(result.entries, 0, params.limit);
       return { entries: bounded.entries, next: bounded.entries.at(-1)?.sequence ?? (params.after || 0) };
     }
-    const values = state[params.view].filter(value => value.channel === params.channel);
+    const values = state[params.view].filter(value => value.channel === params.channel && (!params.entityID || value.id === params.entityID));
     if (['previews', 'transitions', 'evidence'].includes(params.view)) return this.page(socket.principal.admin || master ? values : values.filter(v => v.agentId === agent.agentId), params.offset, params.limit);
     // Tasks/incident metadata is shared channel coordination data; action targets/evidence are visible only to the operator/master/requester.
     return this.page(params.view === 'actions' && !socket.principal.admin && !master ? values.filter(a => a.requester === agent.agentId) : values,
@@ -149,7 +210,30 @@ export class ControlGateway {
   }
   handle(socket, method, params) {
     try {
-      if (method === 'control_info') return { version: 1, enabled: true, ...this.capabilities(), adaptersRequireEnrollment: true };
+      if (method === 'control_info') return { version: 1, enabled: true, ...this.capabilities(), adaptersRequireEnrollment: true,
+        storagePressure: this.storageStatus().pressure };
+      if (method === 'control_receipt') {
+        check(socket.principal.admin, 'OPERATOR_REQUIRED');
+        return { ...this.store.commandReceipt(params.channel, params.commandID), observedAt: this.now() };
+      }
+      if (['control_activity', 'control_activity_status'].includes(method)) {
+        check(socket.principal.admin, 'OPERATOR_REQUIRED');
+        if (method === 'control_activity_status') return this.activityStatus();
+        const result = this.store.activity(params.channel, params), bounded = this.page(result.entries, 0, params.limit);
+        return { entries: bounded.entries, next: bounded.entries.at(-1)?.sequence ?? (params.after || 0), status: this.activityStatus() };
+      }
+      if (['control_storage_status', 'control_storage_watch', 'control_export', 'control_export_read'].includes(method)) {
+        check(socket.principal.admin, 'OPERATOR_REQUIRED');
+        if (method === 'control_storage_status') return this.storageStatus();
+        if (method === 'control_storage_watch') {
+          const status = this.storageStatus(); socket.storageWatch = true; socket.storageSignature = JSON.stringify(status.pressure);
+          return { watching: true, status };
+        }
+        if (method === 'control_export_read') return this.archives.read(params.id, params.offset, params.limit);
+        try { return this.archives.describe(params.id); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        return this.store.exportTo(this.archives, params.id, this.now());
+      }
       if (method === 'control_command') return this.command(socket, params);
       if (method === 'control_adapter') return this.command(socket, params, true);
       if (method === 'control_query') return this.query(socket, params);
@@ -161,7 +245,7 @@ export class ControlGateway {
       if (method === 'control_task_pull') return this.pullTask(socket, params);
       if (method === 'control_task_watch') {
         const agent = this.adapter(socket, params);
-        check(this.taskDispatch && agent.harness === 'opencode', 'TASK_DISPATCH_DISABLED');
+        check(this.taskDispatch && (agent.harness === 'opencode' || (agent.harness === 'codex' && this.codexTasks)), 'TASK_DISPATCH_DISABLED');
         socket.taskWatches ??= new Set(); socket.taskWatches.add(agent.agentId); return { watching: true };
       }
       check(socket.principal.admin, 'OPERATOR_REQUIRED');

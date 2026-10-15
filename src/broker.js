@@ -14,10 +14,11 @@ const nameKey = value => value.normalize('NFKC').toLowerCase();
 const fresh = () => ({ version: 3, agents: {}, bindings: {}, messages: [] });
 export function createBroker({ port = 47321, secret = token(true), adminSecret = adminToken(true), hosts,
   directory = stateDir, now = Date.now, sweepIntervalMs = 1000, write = atomicWrite,
-  limits = {}, controlPlane = false, controlOptions = {}, controlEffects = false, effectHooks = {}, worktreeGrants = false, taskDispatch = false } = {}) {
+  limits = {}, controlPlane = false, controlOptions = {}, controlEffects = false, effectHooks = {}, worktreeGrants = false, taskDispatch = false, codexTasks = false } = {}) {
   if (controlEffects && !controlPlane) throw new Error('Control effects require the control plane');
   if (worktreeGrants && !controlPlane) throw new Error('Worktree grants require the control plane');
   if (taskDispatch && !controlPlane) throw new Error('Task dispatch requires the control plane');
+  if (codexTasks && (!controlPlane || !taskDispatch)) throw new Error('Codex task dispatch requires the control plane and task dispatch');
   validateCredential(secret); validateCredential(adminSecret);
   if (secret === adminSecret) throw new Error('Host and administrator credentials must differ');
   const budget = { connections: 64, hostConnections: 16, sessionsPerHost: 64, channelMembers: 32,
@@ -88,6 +89,7 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
     if (a.reservationExpiresAt == null) { a.disconnectedAt = now(); a.reservationExpiresAt = now() + NAME_RESERVATION_MS; }
   };
   const remove = (id, reason) => {
+    const removed = store.agents[id], cancelled = store.messages.filter(m => m.recipients.includes(id) && !m.delivered.includes(id) && !m.cancelled[id]);
     // Revoke role authority durably BEFORE changing the legacy JSON membership. Failure leaves the old membership intact.
     if (control && store.agents[id]) {
       if (controlFault) throw new Error('CONTROL_UNAVAILABLE');
@@ -97,6 +99,8 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
     delete store.agents[id];
     if (store.deliveryPauses) delete store.deliveryPauses[id];
     return () => {
+      if (removed) control?.observeActivity({ type: 'member.removed', channel: removed.channel, agentId: id, reason });
+      for (const m of cancelled) control?.observeActivity({ type: 'message.cancelled', channel: m.channel, agentId: id, messageID: m.id, reason });
       const receivers = new Set([subscriptions.get(id), ...(controls.get(id) || [])]);
       for (const socket of receivers) if (socket) send(socket, { event: 'membership_removed', agentId: id, reason });
       controls.delete(id);
@@ -166,6 +170,7 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
       if (m.recipients.includes(id) && !m.delivered.includes(id) && !m.cancelled[id] && !outstanding.has(m.id)) {
         // Persist exposure before sending. A crash here is conservative uncertainty, never proof of non-admission.
         if (Array.isArray(m.offered) && !m.offered.includes(id)) { m.offered.push(id); persist(); }
+        control?.observeActivity({ type: 'message.offered', channel: m.channel, agentId: id, messageID: m.id });
         const { offered, ...message } = m; // Exposure is broker-private metadata, not a new peer-frame requirement.
         outstanding.add(m.id); send(socket, { event: 'message', message });
       }
@@ -173,11 +178,13 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
   };
   if (controlPlane) {
     try {
-      control = new ControlGateway({ directory: join(directory, 'control'), now, options: controlOptions, effectsEnabled: controlEffects, worktreeGrants, taskDispatch,
+      control = new ControlGateway({ directory: join(directory, 'control'), now, options: controlOptions, effectsEnabled: controlEffects, worktreeGrants, taskDispatch, codexTasks,
+        runtimeAvailable: () => !controlFault,
         members: () => Object.values(store.agents).filter(a => !security.hosts[a.hostId]?.revoked && !store.bindings[a.agentId]?.revoked)
           .map(a => ({ agentId: a.agentId, channel: a.channel, harness: a.harness, connected: connected(a.agentId) })),
         member, receiver: id => subscriptions.get(id), messages: () => store.messages, hosts: () => security.hosts, adminDigest: digest(adminSecret) });
       control.tick();
+      control.maintainActivity();
       control.onTaskChanged = task => {
         if (!task?.claimant) return false;
         const receiver = subscriptions.get(task.claimant);
@@ -187,8 +194,16 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
       if (controlEffects) {
         executor = new BrokerEffectExecutor({ gateway: control, ...effectHooks, lookup: id => store.effectReceipts?.[id],
           apply: action => {
+            const prior = store.effectReceipts?.[action.id];
             const result = applyBrokerEffect(store, action, now());
-            store = result.state; persist(); return result.receipt;
+            store = result.state; persist();
+            if (!prior && result.receipt.outcome === 'succeeded') {
+              if (action.operation === 'cancel_queued') control.observeActivity({ type: 'message.cancelled', channel: action.channel,
+                agentId: action.target, messageID: action.messageID, reason: 'control_cancelled_unoffered' });
+              else control.observeActivity({ type: action.operation === 'pause_delivery' ? 'delivery.paused' : 'delivery.resumed',
+                channel: action.channel, agentId: action.target });
+            }
+            return result.receipt;
           } });
         executor.run();
       }
@@ -229,7 +244,9 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
       try {
         if (closing || fault || !validPrincipal(socket.principal)) throw new Error('Broker unavailable or credential revoked');
         consume(`requests:${socket.principal.hostId}`, 20, 40);
-        request = parseRequest(raw.toString()); sweep();
+        request = parseRequest(raw.toString());
+        if (!['control_info', 'control_storage_status', 'control_storage_watch', 'control_export', 'control_export_read',
+          'control_activity', 'control_activity_status', 'control_receipt'].includes(request.method)) sweep();
         const p = request.params, principal = socket.principal; let result;
         switch (request.method) {
           case 'hello': result = { protocol: 2, hostId: principal.hostId, admin: principal.admin }; break;
@@ -249,6 +266,7 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
             else if (prior) Object.assign(a, { lastSeenAt: prior.lastSeenAt, disconnectedAt: prior.disconnectedAt, reservationExpiresAt: prior.reservationExpiresAt });
             else reserve(a);
             store.agents[id] = a; persist(); effect?.();
+            control?.observeActivity({ type: 'member.joined', channel: a.channel, agentId: id });
             if (!controls.has(id)) controls.set(id, new Set()); controls.get(id).add(socket);
             for (const peer of list(p.channel)) { const receiver = subscriptions.get(peer.agentId); if (receiver) send(receiver, { event: 'presence', agent: a }); }
             result = { agent: a, members: page(list(p.channel)) }; break;
@@ -267,6 +285,7 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
             persist();
             if (subscriptions.get(p.agentId) !== socket) deliveries.delete(p.agentId);
             subscriptions.set(p.agentId, socket);
+            if (a && prior !== socket) control?.observeActivity({ type: 'receiver.connected', channel: a.channel, agentId: p.agentId });
             result = { subscribed: true, registered: !!a, ...(a ? { channel: a.channel } : {}) }; break;
           }
           case 'resume': {
@@ -278,7 +297,11 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
           }
           case 'unsubscribe': {
             binding(principal, p.agentId, p.proof);
-            if (subscriptions.get(p.agentId) === socket) { subscriptions.delete(p.agentId); deliveries.delete(p.agentId); if (store.agents[p.agentId]) { reserve(store.agents[p.agentId]); persist(); } }
+            if (subscriptions.get(p.agentId) === socket) {
+              subscriptions.delete(p.agentId); deliveries.delete(p.agentId);
+              const a = store.agents[p.agentId];
+              if (a) { reserve(a); persist(); control?.observeActivity({ type: 'receiver.unsubscribed', channel: a.channel, agentId: p.agentId }); }
+            }
             result = { unsubscribed: true }; break;
           }
           case 'members': case 'history': {
@@ -305,7 +328,9 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
             const m = { id: randomUUID(), messageId: p.messageId, to: p.to, channel: a.channel, from: { ...a }, text: p.text,
               createdAt: new Date(now()).toISOString(), recipients, delivered: [], cancelled: {}, offered: [] };
             if (Buffer.byteLength(JSON.stringify(store)) + Buffer.byteLength(JSON.stringify(m)) + 1 > budget.storeBytes) throw new Error('Store byte limit reached');
-            store.messages.push(m); persist(); recipients.forEach(deliver); result = m; break;
+            store.messages.push(m); persist();
+            control?.observeActivity({ type: 'message.queued', channel: m.channel, agentId: a.agentId, messageID: m.id });
+            recipients.forEach(deliver); result = m; break;
           }
           case 'ack': {
             member(principal, p.agentId, p.proof);
@@ -313,7 +338,10 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
             const m = store.messages.find(m => m.id === p.id && m.recipients.includes(p.agentId));
             if (!m) throw new Error('Unknown message');
             if (m.cancelled[p.agentId]) throw new Error('Message cancelled when membership was released');
-            if (!m.delivered.includes(p.agentId)) { m.delivered.push(p.agentId); persist(); }
+            if (!m.delivered.includes(p.agentId)) {
+              m.delivered.push(p.agentId); persist();
+              control?.observeActivity({ type: 'message.acknowledged', channel: m.channel, agentId: p.agentId, messageID: m.id });
+            }
             deliveries.get(p.agentId)?.delete(p.id); deliver(p.agentId);
             result = { delivered: true }; break;
           }
@@ -366,6 +394,13 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
           case 'control_info':
             result = control ? { ...control.handle(socket, request.method, p), available: !controlFault } : { version: 1, enabled: false, effectsEnabled: false };
             break;
+          case 'control_storage_status': case 'control_storage_watch': case 'control_export': case 'control_export_read':
+          case 'control_activity': case 'control_activity_status':
+          case 'control_receipt':
+            if (!control) throw new Error('CONTROL_DISABLED');
+            // Read-only diagnostics/exports remain available when scheduler writes
+            // are quarantined or budgets are full. They never clear that fault.
+            result = control.handle(socket, request.method, p); break;
           case 'control_command': case 'control_adapter': case 'control_query': case 'control_notice_ack':
           case 'control_task_pull': case 'control_task_watch':
           case 'control_enroll_adapter': case 'control_revoke_adapter':
@@ -382,9 +417,17 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
     });
     socket.on('close', () => {
       for (const [id, sockets] of controls) { sockets.delete(socket); if (!sockets.size) controls.delete(id); }
-      let changed = false;
-      for (const [id, s] of subscriptions) if (s === socket) { subscriptions.delete(id); deliveries.delete(id); if (store.agents[id]) { reserve(store.agents[id]); changed = true; } }
-      if (changed && !closing && !fault) { try { persist(); } catch { /* fail closed */ } }
+      const disconnected = [];
+      for (const [id, s] of subscriptions) if (s === socket) {
+        subscriptions.delete(id); deliveries.delete(id);
+        if (store.agents[id]) { reserve(store.agents[id]); disconnected.push(store.agents[id]); }
+      }
+      if (disconnected.length && !closing && !fault) {
+        try {
+          persist();
+          for (const a of disconnected) control?.observeActivity({ type: 'receiver.disconnected', channel: a.channel, agentId: a.agentId });
+        } catch { /* fail closed */ }
+      }
     });
   });
   heartbeat = setInterval(() => {
@@ -397,6 +440,10 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
         control.tick(); executor?.run(); control.signalReadyTasks();
         if (executor) for (const id of subscriptions.keys()) deliver(id);
       } catch { controlFault = true; }
+    }
+    if (control && !fault) {
+      control.maintainActivity();
+      try { control.signalStorage(server.clients, send); } catch { /* Diagnostics cannot crash messaging or authorize recovery. */ }
     }
   }, sweepIntervalMs); expiryTimer.unref();
   function close() {
@@ -415,7 +462,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const address = new URL(url);
   if (address.hostname !== '127.0.0.1' || address.protocol !== 'ws:') throw new Error('Broker must use ws://127.0.0.1');
   const broker = createBroker({ port: Number(address.port), controlPlane: process.env.AGENT_CHANNEL_CONTROL === '1',
-    controlEffects: process.env.AGENT_CHANNEL_CONTROL_EFFECTS === '1', taskDispatch: process.env.AGENT_CHANNEL_TASKS === '1' });
+    controlEffects: process.env.AGENT_CHANNEL_CONTROL_EFFECTS === '1', taskDispatch: process.env.AGENT_CHANNEL_TASKS === '1',
+    codexTasks: process.env.AGENT_CHANNEL_CODEX_TASKS === '1' });
   broker.server.on('listening', () => { if (!broker.fault) console.error(`Turnlink protocol v2 listening on ${url}`); });
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => { await broker.close(); process.exit(0); });
 }

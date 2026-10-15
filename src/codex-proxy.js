@@ -11,6 +11,7 @@ import { diagnosticCode } from './diagnostics.js';
 import { resolveExecutable } from './executable.js';
 import { makeCodexControl, roleFingerprint } from './codex-control.js';
 import { CodexAdmissionFence } from './codex-admission-fence.js';
+import { makeCodexTasks } from './codex-tasks.js';
 
 let executable;
 try { executable = resolveExecutable(process.env.AGENT_CHANNEL_CODEX_EXECUTABLE || ''); }
@@ -35,7 +36,15 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
   const requests = new Map();
   const own = new Map();
   const approvals = new Map();
+  const taskRequests = new Map();
   const forwardEditor = (line, data, internal = false) => {
+    if (!internal && data?.method && data.params?.threadId) {
+      // A new explicit native selection requires a fresh thread/resume response
+      // before managed task admission. Never infer effective override policy.
+      const state = threads.get(data.params.threadId);
+      if (state && (!['thread/read', 'thread/list', 'turn/start', 'turn/steer', 'turn/interrupt'].includes(data.method) ||
+        (data.method === 'turn/start' && Object.keys(data.params).some(k => !['threadId', 'input'].includes(k))))) state.nativeSelection = null;
+    }
     if (!internal && data?.id !== undefined && data.method) requests.set(data.id, { method: data.method, params: data.params });
     if (data?.id !== undefined && !data.method && approvals.has(data.id)) {
       const threadId = approvals.get(data.id); approvals.delete(data.id);
@@ -50,11 +59,30 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
       return { known: !!state && all.every(s => s.lifecycleKnown === true), idle: !!state && all.every(s => !s.turnId),
         blocked: approvals.size > 0, flushing: all.some(s => s.flushing === true) };
     },
-    onRelease: () => { for (const threadID of threads.keys()) setImmediate(() => void flush(threadID)); },
+    onRelease: () => { for (const threadID of threads.keys()) setImmediate(() => { void tasks.poll(threadID); void flush(threadID); }); },
     onFatal: () => child.kill() });
   const write = data => fence.internal(data);
   const timeoutMs = Number(process.env.AGENT_CHANNEL_RPC_TIMEOUT_MS || 30000);
   if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 300000) throw new Error('Invalid RPC timeout');
+  const taskIdle = threadID => {
+    const state = threads.get(threadID);
+    return !!state?.lifecycleKnown && !state.turnId && !state.flushing && !fence.held && !fence.closed && approvals.size === 0 &&
+      !fence.nativeTurns.size && !fence.unknownNativeActivity && !fence.serverRequests.size &&
+      ![...fence.pending.values()].some(p => !['thread/read', 'thread/list', 'config/read', 'configRequirements/read', 'model/list'].includes(p.method));
+  };
+  const taskRPC = (method, params, revision) => new Promise((resolve, reject) => {
+    if (fence.closed || taskRequests.size >= 128) { reject(new Error('Native task RPC unavailable')); return; }
+    if (method === 'turn/start' && (!taskIdle(params.threadId) || fence.revision !== revision)) {
+      const error = new Error('Native task scope changed'); error.code = 'NATIVE_SNAPSHOT_CHANGED'; reject(error); return;
+    }
+    const id = `turnlink-task-rpc-${randomUUID()}`;
+    const timer = setTimeout(() => {
+      taskRequests.delete(id); const error = new Error('Native task RPC uncertain'); error.code = 'ADMISSION_UNCERTAIN'; reject(error);
+    }, timeoutMs);
+    taskRequests.set(id, { resolve, reject, timer });
+    try { write({ id, method, params }); }
+    catch (error) { clearTimeout(timer); taskRequests.delete(id); reject(error); }
+  });
   const admissionFingerprint = (message, role) => role ? roleFingerprint(message) : fingerprint(message);
   const receipt = (state, message, status, extra = {}, role = false) => state.ledger.set({
     id: message.id, fingerprint: admissionFingerprint(message, role), state: status, updatedAt: Date.now(), ...extra,
@@ -90,7 +118,7 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
   });
   const flush = async threadId => {
     const state = threads.get(threadId);
-    if (!state || state.flushing || fence.held || [...approvals.values()].includes(threadId)) return;
+    if (!state || state.flushing || state.taskBusy || fence.held || [...approvals.values()].includes(threadId)) return;
     state.flushing = true;
     try {
       while ((state.queue.length || state.roles.length) && !fence.held && ![...approvals.values()].includes(threadId)) {
@@ -134,12 +162,31 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
   const control = makeCodexControl({ client, threads, flush,
     enabled: process.env.AGENT_CHANNEL_CONTROL === '1', tokenFile: process.env.AGENT_CHANNEL_ADAPTER_TOKEN_FILE,
     log: error => console.error(`Turnlink: control maintenance blocked (${diagnosticCode(error)})`) });
-  const bind = async (threadId, thread, newlyStarted = false) => {
+  const tasks = makeCodexTasks({ client, threads,
+    enabled: process.env.AGENT_CHANNEL_CODEX_TASKS === '1' && process.env.AGENT_CHANNEL_CONTROL === '1',
+    tokenFile: process.env.AGENT_CHANNEL_ADAPTER_TOKEN_FILE,
+    native: { held: () => fence.held, idle: taskIdle, revision: () => fence.revision,
+      start: (threadId, text, revision) => taskRPC('turn/start', { threadId, input: [{ type: 'text', text }] }, revision),
+      read: async threadId => {
+        const revision = fence.revision, state = threads.get(threadId), selection = state?.nativeSelection;
+        const [result, config] = await Promise.all([taskRPC('thread/read', { threadId, includeTurns: true }), taskRPC('config/read', { includeLayers: true })]);
+        if (threads.get(threadId) !== state || state?.nativeSelection !== selection) {
+          const error = new Error('Native task selection changed'); error.code = 'NATIVE_SNAPSHOT_REQUIRED'; throw error;
+        }
+        if (fence.revision !== revision) {
+          const error = new Error('Native task snapshot changed'); error.code = 'NATIVE_SNAPSHOT_CHANGED'; throw error;
+        }
+        return { thread: result.thread, selection, configuration: config.config, revision };
+      } }, log: error => console.error(`Turnlink: task execution blocked (${diagnosticCode(error)})`) });
+  const bind = async (threadId, thread, newlyStarted = false, nativeResult) => {
     if (!threads.has(threadId)) {
       const active = thread?.turns?.find(turn => ['inProgress', 'in_progress'].includes(turn.status));
       const known = newlyStarted || (Array.isArray(thread?.turns) && thread.turns.every(turn => ['completed', 'interrupted', 'failed', 'inProgress', 'in_progress'].includes(turn.status)));
       threads.set(threadId, { queue: [], roles: [], seen: new Set(), turnId: active?.id || null, lifecycleKnown: known, flushing: false, generation: 0 });
     }
+    const bound = threads.get(threadId);
+    if (nativeResult) bound.nativeSelection = { cwd: nativeResult.cwd, model: nativeResult.model, modelProvider: nativeResult.modelProvider,
+      sandbox: nativeResult.sandbox, approvalPolicy: nativeResult.approvalPolicy };
     try {
       await client.connect();
       const state = threads.get(threadId);
@@ -148,6 +195,7 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
       const subscription = await client.subscribe(identity('codex', threadId));
       if (subscription.channel) state.channel = subscription.channel;
       void control.poll(threadId);
+      void tasks.watch(threadId);
     } catch (error) { console.error(`Turnlink: receiver connection blocked (${diagnosticCode(error)})`); }
   };
   client.on('message', message => {
@@ -167,16 +215,29 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
   });
   client.on('presence', ({ agent }) => {
     for (const [threadId, state] of threads) if (identity('codex', threadId) === agent.agentId) {
-      state.channel = agent.channel; void control.poll(threadId);
+      state.channel = agent.channel; void control.poll(threadId); void tasks.watch(threadId);
+    }
+  });
+  client.on('connected', () => { for (const threadId of threads.keys()) void tasks.watch(threadId); });
+  client.on('task_available', ({ agentId }) => {
+    for (const threadId of threads.keys()) if (identity('codex', threadId) === agentId) {
+      tasks.notify(threadId); void control.poll(threadId); void tasks.poll(threadId);
     }
   });
   createInterface({ input: process.stdin }).on('line', line => {
     try { fence.editor(line); } catch { child.kill(); }
-  }).on('close', () => { fence.close(); control.close(); client.close(); child.stdin.end(); });
+  }).on('close', () => { fence.close(); control.close(); tasks.close(); client.close(); child.stdin.end(); });
   createInterface({ input: child.stdout }).on('line', line => {
     try {
       const data = JSON.parse(line);
       fence.observe(data);
+      if (taskRequests.has(data.id) && !data.method) {
+        const pending = taskRequests.get(data.id); taskRequests.delete(data.id); clearTimeout(pending.timer);
+        if (data.error) pending.reject(new Error('Native task RPC rejected'));
+        else pending.resolve(data.result);
+        return;
+      }
+      if (typeof data.id === 'string' && data.id.startsWith('turnlink-task-rpc-')) return;
       if (own.has(data.id)) {
         const pending = own.get(data.id); own.delete(data.id); clearTimeout(pending.timer);
         const { threadId, state, message, generation, role } = pending.context;
@@ -196,7 +257,7 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
       const request = requests.get(data.id);
       if (request && !data.method) {
         requests.delete(data.id);
-        if (['thread/start', 'thread/resume'].includes(request.method) && data.result?.thread?.id) bind(data.result.thread.id, data.result.thread, request.method === 'thread/start');
+        if (['thread/start', 'thread/resume'].includes(request.method) && data.result?.thread?.id) bind(data.result.thread.id, data.result.thread, request.method === 'thread/start', data.result);
         if (request.method === 'turn/start' && data.result?.turn?.id) {
           const state = threads.get(request.params.threadId);
           if (state) { state.turnId = data.result.turn.id; state.lifecycleKnown = true; }
@@ -205,10 +266,12 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
       if (data.method === 'turn/started') {
         const state = threads.get(data.params.threadId);
         if (state) { state.turnId = data.params.turn.id; state.lifecycleKnown = true; setImmediate(() => void flush(data.params.threadId)); }
+        tasks.notify(data.params.threadId);
       }
       if (data.method === 'turn/completed') {
         const state = threads.get(data.params.threadId);
         if (state) { state.turnId = null; state.lifecycleKnown = true; setImmediate(() => void flush(data.params.threadId)); }
+        tasks.notify(data.params.threadId);
       }
       if (data.method === 'thread/closed' || data.method === 'thread/archived') {
         threads.delete(data.params.threadId);
@@ -218,12 +281,13 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
     } catch { /* forward diagnostic lines unchanged */ }
     process.stdout.write(`${line}\n`);
   });
-  const retry = setInterval(() => { for (const threadId of threads.keys()) void flush(threadId); }, 2000);
+  const retry = setInterval(() => { for (const threadId of threads.keys()) { void tasks.poll(threadId); void flush(threadId); } }, 2000);
   retry.unref();
   const controlTimer = process.env.AGENT_CHANNEL_CONTROL === '1' && process.env.AGENT_CHANNEL_ADAPTER_TOKEN_FILE ?
     setInterval(() => { for (const threadId of threads.keys()) void control.poll(threadId); }, 30000) : undefined;
   controlTimer?.unref();
-  child.on('exit', () => { fence.close(); control.close(); clearInterval(controlTimer); clearInterval(retry); client.close(); for (const p of own.values()) clearTimeout(p.timer); });
+  child.on('exit', () => { fence.close(); control.close(); tasks.close(); clearInterval(controlTimer); clearInterval(retry); client.close(); for (const p of own.values()) clearTimeout(p.timer);
+    for (const p of taskRequests.values()) { clearTimeout(p.timer); p.reject(new Error('Native task process stopped')); } taskRequests.clear(); });
 }
 child.on('error', error => { console.error(`Turnlink: executable launch failed (${diagnosticCode(error)})`); process.exit(1); });
 child.on('exit', code => { process.stdin.destroy(); process.exitCode = code ?? 1; });

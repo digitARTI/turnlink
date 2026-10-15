@@ -7,6 +7,7 @@ import { adminToken } from './config.js';
 import { privateDirectory } from './storage.js';
 import { diagnosticCode } from './diagnostics.js';
 import { Command } from './control/contracts.js';
+import { downloadControlExport } from './control-export-client.js';
 
 // Local human/operator interface only. Never register this program as a model tool or expose its credentials to a browser.
 const [operation, ...args] = process.argv.slice(2);
@@ -22,6 +23,33 @@ try {
   } else if (operation === 'query') {
     const [channel, view = 'channel', agentId] = args;
     console.log(JSON.stringify(await client.request('control_query', { channel, view, ...(agentId ? { agentId } : {}) })));
+  } else if (operation === 'storage') {
+    if (args.length) throw new Error('storage accepts no arguments');
+    console.log(JSON.stringify(await client.request('control_storage_status')));
+  } else if (operation === 'activity') {
+    const [channel, cursor = '0'] = args, after = Number(cursor);
+    if (args.length > 2 || !channel || !Number.isSafeInteger(after) || after < 0) throw new Error('activity requires a channel and optional sequence cursor');
+    console.log(JSON.stringify(await client.request('control_activity', { channel, after })));
+  } else if (operation === 'activity-status') {
+    if (args.length) throw new Error('activity-status accepts no arguments');
+    console.log(JSON.stringify(await client.request('control_activity_status')));
+  } else if (operation === 'receipt') {
+    const [channel, commandID] = args;
+    if (args.length !== 2) throw new Error('receipt requires a channel and original command UUID');
+    console.log(JSON.stringify(await client.request('control_receipt', { channel, commandID })));
+  } else if (operation === 'storage-watch') {
+    if (args.length) throw new Error('storage-watch accepts no arguments');
+    client.on('control_storage', ({ status }) => console.log(JSON.stringify(status)));
+    const result = await client.request('control_storage_watch'); console.log(JSON.stringify(result.status));
+    await new Promise(resolve => {
+      process.once('SIGINT', resolve); process.once('SIGTERM', resolve);
+      client.once('disconnected', () => { console.error('Turnlink storage monitor disconnected; reconnect explicitly.'); process.exitCode = 1; resolve(); });
+    });
+  } else if (operation === 'export') {
+    const [file, suppliedID] = args, id = suppliedID || randomUUID();
+    if (args.length > 2 || !file || !isAbsolute(file)) throw new Error('An absolute new private export-file path is required');
+    console.error(`Turnlink control export id=${id}`); // Keep this exact ID for a lost-response retry; never regenerate it on retry.
+    console.log(JSON.stringify(await downloadControlExport({ client, id, file })));
   } else if (operation === 'enroll-adapter') {
     const [hostId, file] = args;
     if (!file || !isAbsolute(file)) throw new Error('An absolute new private credential-file path is required');
@@ -33,8 +61,9 @@ try {
     console.log(JSON.stringify({ enrolled: true, hostId, credentialFile: file }));
   } else if (operation === 'revoke-adapter') {
     console.log(JSON.stringify(await client.request('control_revoke_adapter', { hostId: args[0] })));
-  } else throw new Error('Usage: control-admin command <JSON> | query <channel> <view> [agentId] | enroll-adapter <hostId> <new-private-file> | revoke-adapter <hostId>');
+  } else throw new Error('Usage: control-admin command <JSON> | query <channel> <view> [agentId] | storage | storage-watch | activity <channel> [after] | activity-status | receipt <channel> <commandID> | export <new-private-file> [id] | enroll-adapter <hostId> <new-private-file> | revoke-adapter <hostId>');
 } catch (error) {
   console.error(`Turnlink control operation failed (${diagnosticCode(error)}). Check command syntax, enrollment and broker control status.`);
+  if (error.partialFile) console.error(JSON.stringify({ partialExport: error.partialFile, verified: false }));
   process.exitCode = 1;
 } finally { client?.close(); }
