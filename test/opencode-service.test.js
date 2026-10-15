@@ -13,6 +13,8 @@ import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
 import { admissionID } from '../adapters/opencode-runtime.js';
 import { randomUUID } from 'node:crypto';
+import { NativeWorktreeSnapshotReader } from '../src/worktree-snapshot.js';
+import { makeOpenCodeSnapshotSource } from '../src/native-snapshot-source.js';
 
 test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects (local model fixture)',
   { skip: process.env.TURNLINK_OPENCODE_INTEGRATION !== '1', timeout: 90000 }, async t => {
@@ -195,6 +197,18 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     await admin.request('control_command', { command: controlCommand('master.revoke') });
     const beforeMove = await api(prefix);
     const worktree = await api('/api/worktree', { projectID: beforeMove.projectID, name: 'turnlink-gate' });
+    const nativeSource = makeOpenCodeSnapshotSource({ sessionID: session.id, readSession: () => api(prefix),
+      readAgent: agent => api(`/api/agent/${agent}`), readTools: async () => requests.at(-1).tools,
+      readResolvedModel: () => api('/api/model/default'),
+      readInstructions: () => api(`/api/experimental/session/${session.id}/instructions/entries`), readConfiguration: () => api('/api/config'),
+      // Isolated fixture observation after native wait; it does not provide a production admission lock.
+      readActivity: async () => ({ idle: true, blocked: false, revision: requests.length }) });
+    const snapshotReader = new NativeWorktreeSnapshotReader({ harness: 'opencode', sessionID: session.id, native: nativeSource,
+      home, globalDirectory: join(home, 'config/opencode') });
+    const pair = await snapshotReader.inspectPair(worktree.directory);
+    assert.equal(pair.source.agentId, `opencode:${session.id}`); assert.equal(pair.executionEligible, false);
+    assert.ok(pair.issues.includes('DYNAMIC_OR_UNRESOLVED_CONFIGURATION'), 'destination plugins must not be treated as statically verified authority');
+    assert.ok(!JSON.stringify(pair).includes(token));
     await api(`${prefix}/move`, { directory: worktree.directory, delivery: 'queue' });
     await api(`/api/experimental/session/${session.id}/wait`, {});
     const afterMove = await api(prefix);

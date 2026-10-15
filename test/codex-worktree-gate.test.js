@@ -12,6 +12,8 @@ import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { NativeWorktreeSnapshotReader } from '../src/worktree-snapshot.js';
+import { makeCodexSnapshotSource } from '../src/native-snapshot-source.js';
 
 test('real Codex proxy admits supplemental roles and changes cwd in the same thread without permission overrides (local model fixture)',
   { skip: process.env.TURNLINK_CODEX_INTEGRATION !== '1', timeout: 30000 }, async t => {
@@ -88,6 +90,22 @@ test('real Codex proxy admits supplemental roles and changes cwd in the same thr
     const before = await rpc('thread/start', { cwd: realpathSync(project) });
     await rpc('turn/start', { threadId: before.thread.id, input: [{ type: 'text', text: 'Seed isolated worktree gate' }] });
     const turn = await turnDone; assert.equal(turn.status, 'completed'); assert.ok(modelCalls > 0);
+    const source = makeCodexSnapshotSource({ threadID: before.thread.id,
+      readThread: () => rpc('thread/resume', { threadId: before.thread.id, excludeTurns: true }),
+      readTools: async () => JSON.parse(lastInput).tools,
+      readConfiguration: async () => {
+        const result = await rpc('config/read', { includeLayers: true });
+        assert.ok(result.config, 'native config/read must expose effective configuration'); return result.config;
+      },
+      readInstructions: async () => ({ nativeInstructions: JSON.parse(lastInput).instructions }),
+      // The isolated fixture owns all admissions and has awaited turn/completed. This is observational, not production native exclusion.
+      readActivity: async () => ({ idle: true, blocked: false, revision: modelCalls }) });
+    const discovery = new NativeWorktreeSnapshotReader({ harness: 'codex', sessionID: before.thread.id, native: source,
+      home, globalDirectory: join(home, '.codex') });
+    const pair = await discovery.inspectPair(realpathSync(worktree));
+    assert.equal(pair.source.agentId, `codex:${before.thread.id}`); assert.equal(pair.executionEligible, false);
+    assert.ok(pair.instructionCandidates.destination.some(path => path === realpathSync(join(worktree, 'AGENTS.md'))));
+    assert.ok(!JSON.stringify(pair).includes('fixture-only'));
     // A resume of an already loaded thread ignores cwd in 0.161.0; the supported transition is turn/start.cwd.
     const secondDone = new Promise(resolve => { completed = resolve; });
     await rpc('turn/start', { threadId: before.thread.id, cwd: realpathSync(worktree), input: [{ type: 'text', text: 'Verify destination instructions' }] });
