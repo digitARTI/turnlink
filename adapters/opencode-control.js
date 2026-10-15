@@ -21,7 +21,7 @@ export function makeOpenCodeControl({ ctx, channel, sessions, options, signal, o
           op: 'master.renew', channel: state.controlChannel, generation: status.channel.active.generation } });
       }
       const notices = await channel.request('control_query', { agentId: state.tools.agentId, channel: state.controlChannel, view: 'notices', limit: 8 });
-      if (!valid() || !notices.entries.length || !await refreshBlockers(sessionID, state, valid)) return;
+      if (!valid() || state.taskBusy || !notices.entries.length || !await refreshBlockers(sessionID, state, valid)) return;
       state.ledger ??= new AdmissionLedger(channel.hostId, identity('opencode', sessionID), options.credentialDirectory);
       for (const notice of notices.entries) {
         if (!valid() || !await refreshBlockers(sessionID, state, valid)) return;
@@ -35,7 +35,7 @@ export function makeOpenCodeControl({ ctx, channel, sessions, options, signal, o
           const receipt = { id: notice.id, fingerprint, state: 'inflight', method: 'session.prompt.role', rpcId: id, updatedAt: Date.now() };
           state.ledger.set(receipt);
           try {
-            const admitted = await ctx.session.prompt({ sessionID, id, text: notice.text, delivery: 'steer', resume: notice.kind === 'offer',
+            const admitted = await ctx.session.prompt({ sessionID, id, text: notice.text, delivery: 'steer', resume: ['offer', 'task_review'].includes(notice.kind),
               metadata: { source: 'turnlink-role', channel: notice.channel, assignmentID: notice.assignmentID,
                 generation: notice.generation, promptVersion: notice.promptVersion, kind: notice.kind } }, { signal });
             if (admitted.id !== id || admitted.sessionID !== sessionID) throw new Error('Unexpected role admission receipt');

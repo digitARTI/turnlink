@@ -14,9 +14,10 @@ const nameKey = value => value.normalize('NFKC').toLowerCase();
 const fresh = () => ({ version: 3, agents: {}, bindings: {}, messages: [] });
 export function createBroker({ port = 47321, secret = token(true), adminSecret = adminToken(true), hosts,
   directory = stateDir, now = Date.now, sweepIntervalMs = 1000, write = atomicWrite,
-  limits = {}, controlPlane = false, controlOptions = {}, controlEffects = false, effectHooks = {}, worktreeGrants = false } = {}) {
+  limits = {}, controlPlane = false, controlOptions = {}, controlEffects = false, effectHooks = {}, worktreeGrants = false, taskDispatch = false } = {}) {
   if (controlEffects && !controlPlane) throw new Error('Control effects require the control plane');
   if (worktreeGrants && !controlPlane) throw new Error('Worktree grants require the control plane');
+  if (taskDispatch && !controlPlane) throw new Error('Task dispatch requires the control plane');
   validateCredential(secret); validateCredential(adminSecret);
   if (secret === adminSecret) throw new Error('Host and administrator credentials must differ');
   const budget = { connections: 64, hostConnections: 16, sessionsPerHost: 64, channelMembers: 32,
@@ -172,11 +173,17 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
   };
   if (controlPlane) {
     try {
-      control = new ControlGateway({ directory: join(directory, 'control'), now, options: controlOptions, effectsEnabled: controlEffects, worktreeGrants,
+      control = new ControlGateway({ directory: join(directory, 'control'), now, options: controlOptions, effectsEnabled: controlEffects, worktreeGrants, taskDispatch,
         members: () => Object.values(store.agents).filter(a => !security.hosts[a.hostId]?.revoked && !store.bindings[a.agentId]?.revoked)
           .map(a => ({ agentId: a.agentId, channel: a.channel, harness: a.harness, connected: connected(a.agentId) })),
         member, receiver: id => subscriptions.get(id), messages: () => store.messages, hosts: () => security.hosts, adminDigest: digest(adminSecret) });
       control.tick();
+      control.onTaskChanged = task => {
+        if (!task?.claimant) return false;
+        const receiver = subscriptions.get(task.claimant);
+        if (!receiver?.taskWatches?.has(task.claimant)) return false;
+        send(receiver, { event: 'task_available', agentId: task.claimant }); return true;
+      };
       if (controlEffects) {
         executor = new BrokerEffectExecutor({ gateway: control, ...effectHooks, lookup: id => store.effectReceipts?.[id],
           apply: action => {
@@ -360,6 +367,7 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
             result = control ? { ...control.handle(socket, request.method, p), available: !controlFault } : { version: 1, enabled: false, effectsEnabled: false };
             break;
           case 'control_command': case 'control_adapter': case 'control_query': case 'control_notice_ack':
+          case 'control_task_pull': case 'control_task_watch':
           case 'control_enroll_adapter': case 'control_revoke_adapter':
             if (!control || controlFault) throw new Error(control ? 'CONTROL_UNAVAILABLE' : 'CONTROL_DISABLED');
             result = control.handle(socket, request.method, p); break;
@@ -386,7 +394,7 @@ export function createBroker({ port = 47321, secret = token(true), adminSecret =
     try { sweep(); } catch { /* membership revocation/persistence failures stay conservative */ }
     if (control && !controlFault && !fault) {
       try {
-        control.tick(); executor?.run();
+        control.tick(); executor?.run(); control.signalReadyTasks();
         if (executor) for (const id of subscriptions.keys()) deliver(id);
       } catch { controlFault = true; }
     }
@@ -407,7 +415,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const address = new URL(url);
   if (address.hostname !== '127.0.0.1' || address.protocol !== 'ws:') throw new Error('Broker must use ws://127.0.0.1');
   const broker = createBroker({ port: Number(address.port), controlPlane: process.env.AGENT_CHANNEL_CONTROL === '1',
-    controlEffects: process.env.AGENT_CHANNEL_CONTROL_EFFECTS === '1' });
+    controlEffects: process.env.AGENT_CHANNEL_CONTROL_EFFECTS === '1', taskDispatch: process.env.AGENT_CHANNEL_TASKS === '1' });
   broker.server.on('listening', () => { if (!broker.fault) console.error(`Turnlink protocol v2 listening on ${url}`); });
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => { await broker.close(); process.exit(0); });
 }

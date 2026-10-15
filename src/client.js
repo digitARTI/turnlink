@@ -61,7 +61,7 @@ export class ChannelClient extends EventEmitter {
         }
       }
       for (const id of this.subscriptions) await this.rpc('subscribe', this.authorize('subscribe', { agentId: id }));
-      this.attempt = 0;
+      this.attempt = 0; this.emit('connected');
     }).catch(error => { this.socket?.terminate(); this.scheduleReconnect(); throw error; }).finally(() => { this.connecting = null; });
     return this.connecting;
   }
@@ -79,7 +79,7 @@ export class ChannelClient extends EventEmitter {
     const id = method === 'join' ? identity(p.harness, p.sessionId) : p.agentId ||
       (['members', 'history'].includes(method) ? this.primaryAgentId : undefined);
     if (id && ['join', 'subscribe', 'unsubscribe', 'send', 'ack', 'leave', 'resume', 'members', 'history',
-      'control_command', 'control_query', 'control_adapter', 'control_notice_ack'].includes(method)) {
+      'control_command', 'control_query', 'control_adapter', 'control_notice_ack', 'control_task_pull', 'control_task_watch'].includes(method)) {
       if (method !== 'join') p.agentId = id;
       p.proof = sessionProof(this.hostId, id, this.options.credentialDirectory, ['join', 'subscribe'].includes(method));
     }

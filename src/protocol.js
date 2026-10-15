@@ -38,12 +38,15 @@ const methods = {
   control_command: z.strictObject({ agentId: AgentID.optional(), proof: proof.optional(), command: z.unknown() }),
   control_adapter: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/), command: z.unknown() }),
   control_query: z.strictObject({ channel: Channel, agentId: AgentID.optional(), proof: proof.optional(),
-    view: z.enum(['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'notices', 'previews', 'transitions']),
+    view: z.enum(['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'notices', 'previews', 'transitions', 'evidence']),
     generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     after: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     offset: z.number().int().min(0).max(100000).optional(), limit: z.number().int().min(1).max(100).optional() }),
   control_notice_ack: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/), id: z.string().uuid(),
     receiptID: z.string().regex(/^msg_[a-zA-Z0-9_-]{1,124}$/) }),
+  control_task_pull: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/), channel: Channel,
+    cwd: z.string().min(1).max(2048), scopeDigest: z.string().regex(/^[a-f0-9]{64}$/) }),
+  control_task_watch: z.strictObject({ ...owned, credential: z.string().regex(/^[a-f0-9]{64}$/) }),
   control_enroll_adapter: z.strictObject({ hostId: HostID, credential: z.string().regex(/^[a-f0-9]{64}$/) }),
   control_revoke_adapter: z.strictObject({ hostId: HostID }),
 };
@@ -100,6 +103,8 @@ export function parseFrame(raw) {
     z.strictObject({ v: z.literal(2), event: z.literal('membership_removed'), agentId: AgentID, reason: bounded(128) }).parse(value);
   } else if (value.event === 'presence') {
     z.strictObject({ v: z.literal(2), event: z.literal('presence'), agent }).parse(value);
+  } else if (value.event === 'task_available') {
+    z.strictObject({ v: z.literal(2), event: z.literal('task_available'), agentId: AgentID }).parse(value);
   } else {
     z.strictObject({ v: z.literal(2), id: z.union([z.string(), z.number(), z.null()]), result: z.unknown().optional(), error: z.string().min(1).max(512).optional() })
       .refine(v => Object.hasOwn(v, 'result') !== Object.hasOwn(v, 'error')).parse(value);

@@ -135,11 +135,19 @@ export class ControlStore {
     });
   }
   enqueueNotices(previous, state, events) {
-    for (const event of events.filter(e => ['master.proposed', 'master.activated', 'master.ended'].includes(e.type))) {
+    const notices = events.filter(e => ['master.proposed', 'master.activated', 'master.ended', 'task.reported', 'task.stopped'].includes(e.type));
+    for (const event of events.filter(e => e.type === 'master.activated')) {
+      for (const task of state.tasks.filter(t => t.channel === event.channel && t.status === 'review' && t.stoppedEvidence))
+        notices.push({ ...event, id: randomUUID(), entityID: task.id, type: 'task.reported' });
+    }
+    for (const source of notices) {
+      const event = source.type === 'task.stopped' ? { ...source, type: 'task.reported' } : source;
+      if (event.type === 'task.reported' && !state.tasks.some(t => t.id === event.entityID && t.status === 'review' && t.stoppedEvidence)) continue;
       const priorChannel = previous.channels.find(c => c.id === event.channel), nextChannel = state.channels.find(c => c.id === event.channel);
-      const assignment = [priorChannel?.active, priorChannel?.proposal, nextChannel?.active, nextChannel?.proposal]
+      const assignment = event.type === 'task.reported' ? nextChannel?.active : [priorChannel?.active, priorChannel?.proposal, nextChannel?.active, nextChannel?.proposal]
         .find(value => value?.id === event.entityID) || (event.agentId ? { id: event.entityID, agentId: event.agentId,
           generation: event.generation, promptVersion: MASTER_PROMPT_VERSION } : undefined);
+      if (event.type === 'task.reported' && !assignment) continue;
       check(!!assignment, 'NOTICE_ASSIGNMENT_MISSING');
       if (event.type === 'master.ended') {
         for (const row of this.db.prepare("SELECT * FROM notices WHERE assignment_id=? AND status='pending'").all(assignment.id)) {
@@ -148,8 +156,10 @@ export class ControlStore {
         }
       }
       check(this.db.prepare('SELECT count(*) AS total FROM notices').get().total < this.noticeLimit, 'CONTROL_NOTICE_STORE_FULL');
-      const kind = { 'master.proposed': 'offer', 'master.activated': 'active', 'master.ended': 'ended' }[event.type];
-      const text = kind === 'offer' ? masterInstructions(assignment, event.channel) :
+      const kind = { 'master.proposed': 'offer', 'master.activated': 'active', 'master.ended': 'ended', 'task.reported': 'task_review' }[event.type];
+      const task = kind === 'task_review' ? state.tasks.find(t => t.id === event.entityID) : undefined;
+      const text = kind === 'task_review' ? 'Turnlink task ready for master review. Inspect the task criteria, participant report and adapter evidence via channel_status. Accept or reject using task.review only after review; a stopped execution and artifact reference do not independently prove correctness. Preserve all existing project/global instructions and permissions.\nTASK_REVIEW_DATA\n' +
+        JSON.stringify({ taskID: task.id, evidenceID: task.result.evidence[0], generation: assignment.generation }) : kind === 'offer' ? masterInstructions(assignment, event.channel) :
         `Turnlink supplemental role notice: assignment ${assignment.id}, channel ${event.channel}, generation ${assignment.generation} is ${kind === 'active' ? 'active' : 'inactive'}. ` +
         'Your existing global/project instructions, agent, model, tools and project permissions remain unchanged. Do not automatically reply to this notice. Broker authorization determines current authority.';
       const notice = Notice.parse({ id: event.id, channel: event.channel, agentId: assignment.agentId, assignmentID: assignment.id,

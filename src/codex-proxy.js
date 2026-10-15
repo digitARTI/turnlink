@@ -95,7 +95,7 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
     try {
       while ((state.queue.length || state.roles.length) && !fence.held && ![...approvals.values()].includes(threadId)) {
         // Lifecycle notices never wake an idle thread. An already-accepted receipt can still be acknowledged while idle.
-        const notice = state.roles.find(n => n.kind === 'offer' || state.turnId || state.ledger.get(n.id)?.state === 'accepted');
+        const notice = state.roles.find(n => ['offer', 'task_review'].includes(n.kind) || state.turnId || state.ledger.get(n.id)?.state === 'accepted');
         const role = !!notice, message = notice || state.queue[0];
         if (!message) break;
         if (role && !state.lifecycleKnown) break;
@@ -112,7 +112,7 @@ if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\
           if (previous?.state === 'accepted') {
             await accepted(threadId, state, message, generation, undefined, role); continue;
           }
-          if (role && ((!state.turnId && message.kind !== 'offer') ||
+          if (role && ((!state.turnId && !['offer', 'task_review'].includes(message.kind)) ||
             [...requests.values()].some(r => r.method === 'turn/start' && r.params?.threadId === threadId))) break;
           if (previous && ['inflight', 'uncertain'].includes(previous.state)) break;
           const context = { threadId, state, message, generation, role };

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { Command, Context, validateControlState, Event, MASTER_LEASE_MS, MASTER_PROMPT_VERSION, PROPOSAL_TIMEOUT_MS, ELECTION_TIMEOUT_MS } from './contracts.js';
 import { requireControl as check, actionDecision } from './policy.js';
 
@@ -240,6 +240,8 @@ export function reduceControl(previous, input, suppliedContext) {
       check(value.claimant === actor.agentId && value.status === 'claimed' && ['none', 'unadmitted'].includes(value.admission), 'EXECUTION_MAY_BE_ACTIVE');
       value.claimant = null; value.status = 'open'; value.admission = 'none';
       delete value.stoppedEvidence; delete value.receiptID; delete value.dispatchIntentID;
+      delete value.executionScope;
+      delete value.nativeAdmissionID;
       emit('task.released', value.id); break;
     }
     case 'task.prepare': {
@@ -268,6 +270,11 @@ export function reduceControl(previous, input, suppliedContext) {
       }
       // This is only a durable dispatch intent. An executor must verify capability evidence and an approved location preview.
       value.attempt++; value.status = 'dispatching'; value.admission = 'none'; value.dispatchIntentID = command.id;
+      if (command.cwd && command.scopeDigest) {
+        value.executionScope = { cwd: command.cwd, digest: command.scopeDigest };
+        value.nativeAdmissionID = `msg_turnlink_task_${createHash('sha256').update(command.id).digest('hex')}`;
+      }
+      else { delete value.executionScope; delete value.nativeAdmissionID; }
       delete value.stoppedEvidence; delete value.receiptID; value.lastProgressAt = now; value.deadlineIncident = false;
       emit('task.dispatching', value.id); break;
     }
@@ -276,10 +283,14 @@ export function reduceControl(previous, input, suppliedContext) {
       if (command.kind === 'artifact') {
         const value = state.tasks.find(t => t.id === command.entityID && t.channel === channel.id);
         check(value?.claimant === actor.agentId && value.attempt === command.attempt && ['running', 'uncertain', 'review'].includes(value.status), 'STALE_ARTIFACT_EVIDENCE');
+        if (command.artifact) check(actor.agentId === `${command.artifact.harness}:${command.artifact.sessionID}`, 'ARTIFACT_IDENTITY_MISMATCH');
+        if (command.artifact && value.nativeAdmissionID) check(command.artifact.fromMessageID === value.nativeAdmissionID, 'ARTIFACT_IDENTITY_MISMATCH');
       }
+      check(!command.artifact || command.kind === 'artifact', 'INVALID_ARTIFACT_EVIDENCE');
       state.evidence.push({ id: command.id, channel: channel.id, entityID: command.entityID, agentId: actor.agentId, kind: command.kind, at: now,
         ...(command.attempt !== undefined ? { attempt: command.attempt } : {}), ...(command.admissionID ? { admissionID: command.admissionID } : {}),
-        ...(command.sameConversationWorktree !== undefined ? { sameConversationWorktree: command.sameConversationWorktree } : {}) });
+        ...(command.sameConversationWorktree !== undefined ? { sameConversationWorktree: command.sameConversationWorktree } : {}),
+        ...(command.artifact ? { artifact: command.artifact } : {}) });
       emit('evidence.recorded', command.id); break;
     }
     case 'worktree.preview': {
@@ -334,8 +345,12 @@ export function reduceControl(previous, input, suppliedContext) {
       if (command.outcome === 'uncertain') incident('capability', value.id); break;
     }
     case 'task.admission': {
-      const value = task(); adapter(value); check(value.status === 'dispatching', 'TASK_NOT_DISPATCHING');
+      const value = task(); adapter(value);
+      const recovering = value.status === 'uncertain' && !!value.executionScope && !value.stoppedEvidence && command.outcome === 'admitted' && command.admissionID === value.nativeAdmissionID;
+      check(value.status === 'dispatching' || recovering, 'TASK_NOT_DISPATCHING');
+      if (value.executionScope) check(command.admissionID === value.nativeAdmissionID, 'ADMISSION_KEY_REQUIRED');
       value.admission = command.outcome; value.receiptID = command.receiptID;
+      if (recovering) value.status = 'dispatching';
       state.evidence.push({ id: command.receiptID, channel: channel.id, entityID: value.id, agentId: actor.agentId, kind: command.outcome, at: now, attempt: value.attempt });
       if (command.outcome === 'unadmitted') value.status = 'claimed';
       if (command.outcome === 'uncertain') { value.status = 'uncertain'; incident('admission', value.id); }
@@ -345,6 +360,10 @@ export function reduceControl(previous, input, suppliedContext) {
       const value = task(); adapter(value); check(value.status === 'dispatching' && value.admission === 'admitted', 'ADMISSION_REQUIRED');
       state.evidence.push({ id: command.evidenceID, channel: channel.id, entityID: value.id, agentId: actor.agentId, kind: 'started', at: now, attempt: value.attempt });
       value.status = 'running'; value.lastProgressAt = now; value.deadlineIncident = false; emit('task.started', value.id); break;
+    }
+    case 'task.uncertain': {
+      const value = task(); adapter(value); check(['dispatching', 'running', 'uncertain'].includes(value.status), 'TASK_NOT_ACTIVE');
+      value.status = 'uncertain'; incident('admission', value.id); emit('task.uncertain', value.id); break;
     }
     case 'task.progress': {
       const value = task(); adapter(value); check(value.status === 'running', 'TASK_NOT_RUNNING');
@@ -363,6 +382,8 @@ export function reduceControl(previous, input, suppliedContext) {
       check(value.admission === 'unadmitted' || !!value.stoppedEvidence || (value.status === 'claimed' && value.admission === 'none' && !value.dispatchIntentID), 'STOP_EVIDENCE_REQUIRED');
       value.attempt++; value.claimant = null; value.status = 'open'; value.admission = 'none';
       delete value.result; delete value.stoppedEvidence; delete value.receiptID; delete value.dispatchIntentID;
+      delete value.executionScope;
+      delete value.nativeAdmissionID;
       emit('task.reassigned', value.id); break;
     }
     case 'task.report': {

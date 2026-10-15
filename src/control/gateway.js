@@ -6,6 +6,7 @@ import { digest, matches } from '../config.js';
 import { MAX_RESPONSE_BYTES } from '../protocol.js';
 import { PARTICIPANT_OPERATIONS, OPERATOR_OPERATIONS, ADAPTER_OPERATIONS } from './operations.js';
 import { BROKER_EFFECT_OPERATIONS } from './effects.js';
+import { readyTasks } from './reducer.js';
 
 const participantOps = new Set(PARTICIPANT_OPERATIONS);
 const operatorOps = new Set(OPERATOR_OPERATIONS);
@@ -14,13 +15,15 @@ const masterOps = new Set(['action.request', 'incident.resolve', 'task.create', 
 
 // All identity/clock/membership inputs below originate in the broker. No caller can provide an Actor or scheduler role.
 export class ControlGateway {
-  constructor({ directory, now, members, member, receiver, messages, hosts, adminDigest, options, effectsEnabled = false, worktreeGrants = false }) {
+  constructor({ directory, now, members, member, receiver, messages, hosts, adminDigest, options, effectsEnabled = false, worktreeGrants = false, taskDispatch = false }) {
     this.store = new ControlStore(directory, options);
     Object.assign(this, { now, members, member, receiver, messages, hosts, adminDigest });
     this.effectsEnabled = effectsEnabled;
     this.worktreeGrants = worktreeGrants;
+    this.taskDispatch = taskDispatch;
   }
-  capabilities() { return { effectsEnabled: this.effectsEnabled, effectOperations: this.effectsEnabled ? BROKER_EFFECT_OPERATIONS : [], taskDispatchEnabled: false,
+  capabilities() { return { effectsEnabled: this.effectsEnabled, effectOperations: this.effectsEnabled ? BROKER_EFFECT_OPERATIONS : [], taskDispatchEnabled: this.taskDispatch,
+    taskExecutionHarnesses: this.taskDispatch ? ['opencode'] : [], taskWorktreesEnabled: false,
     worktreeGrantsEnabled: this.worktreeGrants, worktreeExecutionEnabled: false }; }
   context(actor) { return { actor, now: this.now(), members: this.members() }; }
   boundMember(principal, agentId, proof, channel) {
@@ -67,8 +70,43 @@ export class ControlGateway {
         check(active?.agentId === agent.agentId && this.store.offerAccepted(command.channel, agent.agentId, active.id), 'ROLE_NOTICE_NOT_ADMITTED');
       }
     }
-    // Models cannot invoke execution, reconciliation or adapter worktree grants; task dispatch stays disabled.
-    return { ...this.store.apply(command, this.context(actor)), ...this.capabilities() };
+    // Models cannot invoke execution, reconciliation or adapter worktree grants;
+    // native task dispatch uses the separately enabled receiver-only pull path.
+    const result = this.store.apply(command, this.context(actor));
+    if (['task.claim', 'task.review', 'task.missed', 'task.report', 'task.reassign'].includes(command.op)) {
+      const task = this.store.snapshot().tasks.find(t => t.id === command.taskID);
+      this.onTaskChanged?.(task);
+    }
+    return { ...result, ...this.capabilities() };
+  }
+  pullTask(socket, params) {
+    const agent = this.adapter(socket, params, params.channel);
+    check(this.taskDispatch && agent.harness === 'opencode', 'TASK_DISPATCH_DISABLED');
+    const active = this.store.snapshot().tasks.find(t => t.channel === agent.channel && t.claimant === agent.agentId && ['dispatching', 'running', 'uncertain'].includes(t.status));
+    if (active) return { task: active };
+    const next = readyTasks(this.store.snapshot(), agent.channel, this.now()).find(t => t.claimant === agent.agentId && !t.requiresWorktree);
+    if (!next) return { task: null };
+    const context = this.context({ kind: 'adapter', agentId: agent.agentId });
+    const capabilityID = randomUUID();
+    this.store.apply({ id: capabilityID, op: 'evidence.record', channel: agent.channel, entityID: next.id, kind: 'capability', sameConversationWorktree: false }, context);
+    this.store.apply({ id: randomUUID(), op: 'evidence.record', channel: agent.channel, entityID: next.id, kind: 'idle' }, context);
+    try {
+      this.store.apply({ id: randomUUID(), op: 'task.prepare', channel: agent.channel, taskID: next.id, capabilityEvidenceID: capabilityID,
+        cwd: params.cwd, scopeDigest: params.scopeDigest }, this.context({ kind: 'scheduler' }));
+    } catch (error) {
+      if (error instanceof ControlError && ['CONVERSATION_CAPACITY', 'CHANNEL_CAPACITY', 'WORKTREE_TRANSITION_UNRESOLVED'].includes(error.code)) return { task: null };
+      throw error;
+    }
+    return { task: this.store.snapshot().tasks.find(t => t.id === next.id) };
+  }
+  signalReadyTasks() {
+    if (!this.taskDispatch) return;
+    const state = this.store.snapshot(), next = new Set();
+    for (const channel of state.channels) for (const task of readyTasks(state, channel.id, this.now()).filter(t => !t.requiresWorktree)) {
+      const key = `${task.id}:${task.claimGeneration}:${task.attempt}:${task.missedDecision || ''}`;
+      if (this.taskSignals?.has(key) || this.onTaskChanged?.(task)) next.add(key);
+    }
+    this.taskSignals = next;
   }
   query(socket, params) {
     const agent = socket.principal.admin ? undefined : this.boundMember(socket.principal, params.agentId, params.proof, params.channel);
@@ -104,7 +142,7 @@ export class ControlGateway {
       return { entries: bounded.entries, next: bounded.entries.at(-1)?.sequence ?? (params.after || 0) };
     }
     const values = state[params.view].filter(value => value.channel === params.channel);
-    if (['previews', 'transitions'].includes(params.view)) return this.page(socket.principal.admin || master ? values : values.filter(v => v.agentId === agent.agentId), params.offset, params.limit);
+    if (['previews', 'transitions', 'evidence'].includes(params.view)) return this.page(socket.principal.admin || master ? values : values.filter(v => v.agentId === agent.agentId), params.offset, params.limit);
     // Tasks/incident metadata is shared channel coordination data; action targets/evidence are visible only to the operator/master/requester.
     return this.page(params.view === 'actions' && !socket.principal.admin && !master ? values.filter(a => a.requester === agent.agentId) : values,
       params.offset, params.limit);
@@ -119,6 +157,12 @@ export class ControlGateway {
         const agent = this.adapter(socket, params);
         this.store.acceptNotice(agent.channel, agent.agentId, params.id, params.receiptID, this.now());
         return { accepted: true };
+      }
+      if (method === 'control_task_pull') return this.pullTask(socket, params);
+      if (method === 'control_task_watch') {
+        const agent = this.adapter(socket, params);
+        check(this.taskDispatch && agent.harness === 'opencode', 'TASK_DISPATCH_DISABLED');
+        socket.taskWatches ??= new Set(); socket.taskWatches.add(agent.agentId); return { watching: true };
       }
       check(socket.principal.admin, 'OPERATOR_REQUIRED');
       const registry = this.hosts();

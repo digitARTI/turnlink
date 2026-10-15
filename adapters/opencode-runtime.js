@@ -6,6 +6,9 @@ import { identity, render, digest } from '../src/config.js';
 import { AdmissionLedger, fingerprint } from '../src/admissions.js';
 import { diagnosticCode } from '../src/diagnostics.js';
 import { makeOpenCodeControl } from './opencode-control.js';
+import { makeOpenCodeTasks } from './opencode-tasks.js';
+import { readPrivate } from '../src/storage.js';
+import { validateCredential } from '../src/config.js';
 
 export const admissionID = (sessionID, messageID) => `msg_turnlink_${digest(`${sessionID}:${messageID}`)}`;
 const key = sessionID => `memberships/${sessionID}`;
@@ -17,6 +20,7 @@ const supported = version => {
 export async function setupOpenCode(ctx) {
   if (!supported(ctx.app.version.replace(/^v/, ''))) throw new Error('Turnlink requires OpenCode >=2.0.28 and <3; V1 is not supported');
   const options = ctx.options;
+  if (options.tasks === true && (options.control !== true || !options.adapterTokenFile)) throw new Error('Task execution requires control and a separate adapter credential file');
   const channel = new ChannelClient({ url: options.url, tokenFile: options.tokenFile, credentialDirectory: options.credentialDirectory });
   const controller = new AbortController();
   const sessions = new Map();
@@ -37,9 +41,10 @@ export async function setupOpenCode(ctx) {
           const state = sessions.get(sessionID);
           state.controlChannel = agent.channel;
           await state.saving;
-          await ctx.storage.set(key(sessionID), { sessionID, directory: ctx.location.directory, channel: agent.channel, forms: [...state.forms] });
+          await ctx.storage.set(key(sessionID), { sessionID, directory: ctx.location.directory, channel: agent.channel, forms: [...state.forms], taskWatch: state.taskWatch === true });
           await channel.subscribe(agent.agentId);
           void control.poll(sessionID);
+          if (state.taskWatch) void tasks.watch(sessionID);
         } }),
       queue: [], flushing: false, generation: 0, revision: 0, blocked: new Set(), forms: new Set(),
     });
@@ -59,9 +64,15 @@ export async function setupOpenCode(ctx) {
     return !state.blocked.size;
   };
   const control = makeOpenCodeControl({ ctx, channel, sessions, options, signal: controller.signal, ownSession, refreshBlockers, log });
+  const tasks = makeOpenCodeTasks({ ctx, channel, sessions, options, signal: controller.signal, ownSession, refreshBlockers, log,
+    credential: () => validateCredential(readPrivate(options.adapterTokenFile, 128).trim()) });
+  channel.on('connected', () => { for (const [id, state] of sessions) if (state.taskWatch) void tasks.watch(id); });
+  channel.on('task_available', ({ agentId }) => {
+    for (const [id, state] of sessions) if (state.tools.agentId === agentId && state.taskWatch) { state.taskPending = true; void tasks.poll(id); }
+  });
   const flush = async sessionID => {
     const state = sessions.get(sessionID);
-    if (closed || !state || state.flushing || !state.tools.agentId || !state.queue.length) return;
+    if (closed || !state || state.flushing || state.taskBusy || !state.tools.agentId || !state.queue.length) return;
     state.flushing = true;
     const generation = state.generation;
     const valid = () => !closed && state.generation === generation && !!state.tools.agentId;
@@ -137,7 +148,7 @@ export async function setupOpenCode(ctx) {
     if (['form.replied', 'form.cancelled'].includes(event.type)) state.forms.delete(`form:${p.id}`);
     if (event.type.startsWith('permission.') || event.type.startsWith('form.')) state.revision++;
     if (event.type.startsWith('form.') && state.tools.agentId) {
-      const value = { sessionID, directory: ctx.location.directory, forms: [...state.forms], ...(state.controlChannel ? { channel: state.controlChannel } : {}) };
+      const value = { sessionID, directory: ctx.location.directory, forms: [...state.forms], taskWatch: state.taskWatch === true, ...(state.controlChannel ? { channel: state.controlChannel } : {}) };
       state.saving = (state.saving || Promise.resolve()).catch(log).then(() => {
         if (!closed) return ctx.storage.set(key(sessionID), value);
       });
@@ -165,9 +176,11 @@ export async function setupOpenCode(ctx) {
             get(sessionID).tools.agentId = identity('opencode', sessionID);
             get(sessionID).forms = new Set(Array.isArray(entry.value.forms) ? entry.value.forms : []);
             get(sessionID).controlChannel = typeof entry.value.channel === 'string' ? entry.value.channel : undefined;
+            get(sessionID).taskWatch = entry.value.taskWatch === true;
             channel.registrations.set(identity('opencode', sessionID), {});
             await channel.subscribe(identity('opencode', sessionID));
             void control.poll(sessionID);
+            if (get(sessionID).taskWatch) void tasks.watch(sessionID);
           } catch (error) {
             const state = sessions.get(sessionID);
             if (state) state.tools.agentId = null;
@@ -181,7 +194,7 @@ export async function setupOpenCode(ctx) {
   };
   const timer = setInterval(() => {
     void recover().catch(log);
-    for (const id of sessions.keys()) void flush(id);
+    for (const id of sessions.keys()) { void tasks.poll(id); void flush(id); }
   }, 2000);
   timer.unref();
   const controlTimer = options.control === true && options.adapterTokenFile ? setInterval(() => {
@@ -214,6 +227,13 @@ export async function setupOpenCode(ctx) {
             if (definition.name === 'channel_join') args = { ...args, harness: 'opencode', sessionId: context.sessionID,
               project: { ...args.project, root: args.project.root || session.location.directory } };
             const result = await state.tools.call(definition.name, args);
+            if (options.tasks === true && definition.name === 'channel_control' && args.command?.op === 'task.claim') {
+              state.taskWatch = true; state.taskPending = true;
+              await state.saving;
+              await ctx.storage.set(key(context.sessionID), { sessionID: context.sessionID, directory: ctx.location.directory,
+                channel: state.controlChannel, forms: [...state.forms], taskWatch: true });
+              void tasks.watch(context.sessionID);
+            }
             if (['channel_control', 'channel_status'].includes(definition.name)) void control.poll(context.sessionID);
             if (definition.name === 'channel_leave') { invalidate(state); await state.saving; await ctx.storage.remove(key(context.sessionID)); }
             return { content: JSON.stringify(result) };

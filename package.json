@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node src/broker.js",
     "test": "node src/run-tests.js",
-    "test:control": "node --test test/control.test.js test/control-hardening.test.js test/control-broker.test.js test/control-effects.test.js test/worktree-transition.test.js test/worktree-snapshot.test.js test/opencode-control.test.js test/codex-control.test.js test/codex-admission-fence.test.js",
+    "test:control": "node --test test/control.test.js test/control-hardening.test.js test/control-broker.test.js test/control-effects.test.js test/worktree-transition.test.js test/worktree-snapshot.test.js test/opencode-control.test.js test/opencode-tasks.test.js test/codex-control.test.js test/codex-admission-fence.test.js",
     "control-admin": "node src/control-admin.js",
     "test:worktrees": "node src/run-worktree-gates.js",
     "check": "node src/check-source.js",

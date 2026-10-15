@@ -24,9 +24,9 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     const token = '1'.repeat(64), tokenFile = join(root, 'host.token'), adapterTokenFile = join(root, 'adapter.token');
     writeFileSync(tokenFile, token, { mode: 0o600 });
     writeFileSync(adapterTokenFile, '3'.repeat(64), { mode: 0o600 });
-    const broker = createBroker({ port: 0, secret: token, adminSecret: '2'.repeat(64), directory: join(root, 'broker'), controlPlane: true });
+    const broker = createBroker({ port: 0, secret: token, adminSecret: '2'.repeat(64), directory: join(root, 'broker'), controlPlane: true, taskDispatch: true });
     await once(broker.server, 'listening');
-    const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, tokenFile, credentialDirectory: join(root, 'credentials'), control: true, adapterTokenFile };
+    const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, tokenFile, credentialDirectory: join(root, 'credentials'), control: true, tasks: true, adapterTokenFile };
     const sender = new ChannelClient(options);
     const admin = new ChannelClient({ ...options, token: '2'.repeat(64) });
     const controlCommand = (op, fields = {}) => ({ id: randomUUID(), op, channel: 'development', ...fields });
@@ -52,6 +52,28 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
           delta = { tool_calls: [{ index: 0, id: 'call_volunteer', type: 'function', function: { name: 'channel_control',
             arguments: JSON.stringify({ command: controlCommand('master.volunteer', { eligible: true }) }) } }] };
           finish = 'tool_calls';
+        }
+        if (last.role === 'user' && text.includes('TURNLINK_TASK_WORKER_JOIN')) {
+          delta = { tool_calls: [{ index: 0, id: 'call_task_join', type: 'function', function: { name: 'channel_join',
+            arguments: JSON.stringify({ channel: 'development', name: 'task-worker', role: 'fixture worker', project: { name: 'fixture' } }) } }] };
+          finish = 'tool_calls';
+        }
+        const claim = text.match(/TURNLINK_TASK_CLAIM:([a-f0-9-]{36})/)?.[1];
+        if (last.role === 'user' && claim) {
+          delta = { tool_calls: [{ index: 0, id: 'call_task_claim', type: 'function', function: { name: 'channel_control',
+            arguments: JSON.stringify({ command: controlCommand('task.claim', { taskID: claim }) }) } }] }; finish = 'tool_calls';
+        }
+        if (last.role === 'user' && text.startsWith('Turnlink task execution.')) delta = { content: 'TASK_VERTICAL_RESULT: fixture task completed.' };
+        if (last.role === 'user' && text.includes('TASK_RESULT_DATA\n')) {
+          const data = JSON.parse(text.split('TASK_RESULT_DATA\n')[1]);
+          delta = { tool_calls: [{ index: 0, id: 'call_task_report', type: 'function', function: { name: 'channel_control',
+            arguments: JSON.stringify({ command: controlCommand('task.report', { taskID: data.taskID, evidence: data.evidence, summary: 'TASK_VERTICAL_RESULT produced; native evidence attached.' }) }) } }] };
+          finish = 'tool_calls';
+        }
+        if (last.role === 'user' && text.includes('TASK_REVIEW_DATA\n')) {
+          const data = JSON.parse(text.split('TASK_REVIEW_DATA\n')[1]);
+          delta = { tool_calls: [{ index: 0, id: 'call_task_accept', type: 'function', function: { name: 'channel_control',
+            arguments: JSON.stringify({ command: controlCommand('task.review', { ...data, accept: true }) }) } }] }; finish = 'tool_calls';
         }
         const assignmentID = text.match(/Assignment: ([a-f0-9-]{36})/)?.[1];
         if (last.role === 'user' && assignmentID && text.includes('Turnlink supplemental master role')) {
@@ -194,6 +216,28 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     assert.equal(roleSession.agent, 'plan'); assert.deepEqual(roleSession.permissions, session.permissions);
     const roleRequest = requests.find(r => JSON.stringify(r.messages).includes('Turnlink supplemental master role'));
     assert.ok(roleRequest); assert.match(JSON.stringify(roleRequest.messages), /GLOBAL_WORKTREE_GATE/); assert.match(JSON.stringify(roleRequest.messages), /PROJECT_WORKTREE_GATE/);
+    const worker = await api('/api/session', { location: { directory: project }, title: 'Task worker', agent: 'plan',
+      permissions: [{ action: 'edit', resource: '*', effect: 'deny' }] });
+    const workerPrefix = `/api/session/${worker.id}`;
+    await api(`${workerPrefix}/prompt`, { text: 'TURNLINK_TASK_WORKER_JOIN' });
+    await api(`/api/experimental/session/${worker.id}/wait`, {});
+    const managed = controlCommand('task.create', { title: 'Native vertical task', instructions: 'Return TASK_VERTICAL_RESULT; do not change files or session location.',
+      criteria: 'Native result, participant report, adapter evidence and explicit master acceptance.', requiresWorktree: false });
+    await admin.request('control_command', { command: managed });
+    await api(`${workerPrefix}/prompt`, { text: `TURNLINK_TASK_CLAIM:${managed.id}` });
+    await api(`/api/experimental/session/${worker.id}/wait`, {});
+    await wait(async () => (await admin.request('control_query', { channel: 'development', view: 'tasks' })).entries.find(t => t.id === managed.id)?.status !== 'claimed', 160);
+    await wait(async () => (await admin.request('control_query', { channel: 'development', view: 'tasks' })).entries.find(t => t.id === managed.id)?.status === 'completed', 1000);
+    const task = (await admin.request('control_query', { channel: 'development', view: 'tasks' })).entries.find(t => t.id === managed.id);
+    const evidence = (await admin.request('control_query', { channel: 'development', view: 'evidence' })).entries;
+    const artifact = evidence.find(e => task.result.evidence.includes(e.id));
+    assert.equal(artifact.artifact.harness, 'opencode'); assert.equal(artifact.artifact.sessionID, worker.id);
+    assert.equal(artifact.artifact.type, 'native_session_segment'); assert.ok(task.stoppedEvidence);
+    const workerAfter = await api(workerPrefix);
+    assert.equal(workerAfter.agent, worker.agent); assert.deepEqual(workerAfter.permissions, worker.permissions);
+    assert.equal(workerAfter.location.directory, worker.location.directory);
+    assert.equal(task.claimant, `opencode:${worker.id}`); assert.match(task.result.summary, /TASK_VERTICAL_RESULT/);
+    await api(`/api/experimental/session/${session.id}/wait`, {});
     await admin.request('control_command', { command: controlCommand('master.revoke') });
     const beforeMove = await api(prefix);
     const worktree = await api('/api/worktree', { projectID: beforeMove.projectID, name: 'turnlink-gate' });

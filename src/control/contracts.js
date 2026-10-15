@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { AgentID, Channel, Harness } from '../protocol.js';
 import { posix, win32 } from 'node:path';
+import { createHash } from 'node:crypto';
 
 export const CONTROL_VERSION = 1;
 export const MASTER_PROMPT_VERSION = 1;
@@ -42,7 +43,8 @@ const payload = (op, fields = {}) => z.strictObject({ id: UUID, op: z.literal(op
 const EvidenceKind = z.enum(['admitted', 'unadmitted', 'native_idempotent', 'uncertain', 'capability', 'idle', 'busy', 'started', 'stopped', 'artifact']);
 export const Evidence = z.strictObject({ id: UUID, channel: Channel, entityID: UUID, agentId: AgentID, kind: EvidenceKind, at: Stamp,
   attempt: Stamp.optional(), admissionID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/).optional(),
-  sameConversationWorktree: z.boolean().optional() });
+  sameConversationWorktree: z.boolean().optional(), artifact: z.strictObject({ type: z.literal('native_session_segment'), harness: z.literal('opencode'),
+    sessionID: text(200), fromMessageID: text(128), throughMessageID: text(128), digest: Digest, finish: text(32) }).optional() });
 export const Command = z.discriminatedUnion('op', [
   payload('channel.configure', { mode: Mode.optional(), electionsEnabled: z.boolean().optional(), capacity: z.number().int().min(1).max(32).optional() }),
   payload('master.volunteer', { eligible: z.boolean() }),
@@ -71,15 +73,18 @@ export const Command = z.discriminatedUnion('op', [
     requiresWorktree: z.boolean().default(true) }),
   payload('task.claim', { taskID: UUID }),
   payload('task.release', { taskID: UUID }),
-  payload('task.prepare', { taskID: UUID, capabilityEvidenceID: UUID }),
+  payload('task.prepare', { taskID: UUID, capabilityEvidenceID: UUID, cwd: absolutePath.optional(), scopeDigest: Digest.optional() }),
+  payload('task.uncertain', { taskID: UUID, attempt: Stamp }),
   payload('evidence.record', { entityID: UUID, kind: EvidenceKind, attempt: Stamp.optional(),
-    admissionID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/).optional(), sameConversationWorktree: z.boolean().optional() }),
+    admissionID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/).optional(), sameConversationWorktree: z.boolean().optional(),
+    artifact: Evidence.shape.artifact }),
   payload('worktree.preview', { taskID: UUID, from: absolutePath, to: absolutePath, configurationDigest: Digest, binding: WorktreeBinding.optional() }),
   payload('worktree.approve', { taskID: UUID, previewID: UUID }),
   payload('worktree.begin', { taskID: UUID, previewID: UUID, claimGeneration: Stamp, configurationDigest: Digest, authorityDigest: Digest }),
   payload('worktree.settle', { transitionID: UUID, outcome: z.enum(['moved', 'failed', 'uncertain']), actualLocation: absolutePath,
     configurationDigest: Digest, authorityDigest: Digest, receiptID: UUID }),
-  payload('task.admission', { taskID: UUID, attempt: Stamp, outcome: z.enum(['admitted', 'unadmitted', 'uncertain']), receiptID: UUID }),
+  payload('task.admission', { taskID: UUID, attempt: Stamp, outcome: z.enum(['admitted', 'unadmitted', 'uncertain']), receiptID: UUID,
+    admissionID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/).optional() }),
   payload('task.started', { taskID: UUID, attempt: Stamp, evidenceID: UUID }),
   payload('task.progress', { taskID: UUID, attempt: Stamp }),
   payload('task.stopped', { taskID: UUID, attempt: Stamp, evidenceID: UUID }),
@@ -103,7 +108,8 @@ export const Task = z.strictObject({ id: UUID, channel: Channel, title: text(200
   claimGeneration: Stamp,
   admission: z.enum(['none', 'admitted', 'unadmitted', 'uncertain']), stoppedEvidence: UUID.optional(), receiptID: UUID.optional(),
   result: z.strictObject({ summary: text(4000), evidence: z.array(UUID).min(1).max(32) }).optional(),
-  missedDecision: z.enum(['run', 'skip']).optional(), dispatchIntentID: UUID.optional() });
+  missedDecision: z.enum(['run', 'skip']).optional(), dispatchIntentID: UUID.optional(),
+  executionScope: z.strictObject({ cwd: absolutePath, digest: Digest }).optional(), nativeAdmissionID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/).optional() });
 export const WorktreePreview = z.strictObject({ id: UUID, channel: Channel, taskID: UUID, agentId: AgentID,
   from: absolutePath, to: absolutePath, configurationDigest: Digest, approved: z.boolean(), at: Stamp, claimGeneration: Stamp,
   binding: WorktreeBinding.optional() });
@@ -129,7 +135,7 @@ export const Event = z.strictObject({ id: UUID, channel: Channel, type: z.enum([
   'evidence.recorded', 'worktree.previewed', 'worktree.approved', 'worktree.prepared', 'worktree.moved', 'worktree.failed', 'worktree.uncertain', 'notice.accepted', 'messages.viewed',
 ]), actor: Actor, at: Stamp, entityID: UUID.optional(), generation: Stamp.optional(), agentId: AgentID.optional(), durable: z.boolean() });
 export const Notice = z.strictObject({ id: UUID, channel: Channel, agentId: AgentID, assignmentID: UUID, generation: Stamp,
-  promptVersion: z.literal(MASTER_PROMPT_VERSION), kind: z.enum(['offer', 'active', 'ended']), text: text(6000), at: Stamp,
+  promptVersion: z.literal(MASTER_PROMPT_VERSION), kind: z.enum(['offer', 'active', 'ended', 'task_review']), text: text(6000), at: Stamp,
   status: z.enum(['pending', 'accepted', 'cancelled']), receiptID: text(128).regex(/^msg_[a-zA-Z0-9_-]+$/).optional() });
 export const freshControlState = () => ({ version: CONTROL_VERSION, lastNow: 0, channels: [], tasks: [], actions: [], incidents: [], evidence: [], previews: [], transitions: [] });
 
@@ -163,6 +169,7 @@ export function validateControlState(input) {
     }
   }
   for (const task of state.tasks) {
+    if (task.executionScope && (!task.dispatchIntentID || task.nativeAdmissionID !== `msg_turnlink_task_${createHash('sha256').update(task.dispatchIntentID).digest('hex')}`)) throw new Error('Invalid native task admission binding');
     if (new Set(task.dependencies).size !== task.dependencies.length || task.dependencies.some(id => tasks.get(id)?.channel !== task.channel) || task.dependencies.includes(task.id)) {
       throw new Error('Invalid task dependency');
     }
@@ -182,6 +189,8 @@ export function validateControlState(input) {
     })) throw new Error('Invalid result evidence');
     if (task.status === 'completed' && !task.stoppedEvidence) throw new Error('Completion without stop evidence');
   }
+  for (const item of state.evidence) if (item.artifact && (item.kind !== 'artifact' || item.agentId !== `${item.artifact.harness}:${item.artifact.sessionID}` ||
+    tasks.get(item.entityID)?.channel !== item.channel)) throw new Error('Invalid native task artifact');
   for (const preview of state.previews) {
     if (tasks.get(preview.taskID)?.channel !== preview.channel || preview.from === preview.to) throw new Error('Invalid worktree preview');
     if (preview.binding && !preview.agentId.startsWith(`${preview.binding.harness}:`)) throw new Error('Invalid worktree harness binding');
