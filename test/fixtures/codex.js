@@ -17,7 +17,7 @@ createInterface({ input: process.stdin }).on('line', line => {
   } else if (request.method === 'fixture/release-admission') {
     if (heldAdmission) { send(heldAdmission); heldAdmission = null; }
     send({ id: request.id, result: {} });
-  } else if (request.method === 'fixture/finish') {
+  } else if (request.method === 'fixture/finish' || request.method === 'turn/interrupt') {
     send({ id: request.id, result: {} });
     send({ method: 'turn/completed', params: { threadId: request.params.threadId, turn: { id: 'turn-active', status: 'completed' } } });
   } else if (request.method === 'fixture/approval') {

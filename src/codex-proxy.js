@@ -10,6 +10,7 @@ import { AdmissionLedger, fingerprint } from './admissions.js';
 import { diagnosticCode } from './diagnostics.js';
 import { resolveExecutable } from './executable.js';
 import { makeCodexControl, roleFingerprint } from './codex-control.js';
+import { CodexAdmissionFence } from './codex-admission-fence.js';
 
 let executable;
 try { executable = resolveExecutable(process.env.AGENT_CHANNEL_CODEX_EXECUTABLE || ''); }
@@ -26,7 +27,7 @@ const childEnv = { ...process.env };
 for (const key of ['AGENT_CHANNEL_TOKEN', 'AGENT_CHANNEL_ADMIN_TOKEN', 'AGENT_CHANNEL_ADAPTER_TOKEN_FILE']) delete childEnv[key];
 const child = spawn(executable, args, { stdio: ['pipe', 'pipe', 'inherit'], env: childEnv, windowsHide: true });
 child.stdin.on('error', () => child.kill());
-if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.startsWith('unix://'))) {
+if (!args.includes('app-server') || args.some(a => /^(?:--listen=)?(?:ws|unix):\/\//.test(a))) {
   process.stdin.pipe(child.stdin); child.stdout.pipe(process.stdout);
 } else {
   const client = new ChannelClient();
@@ -34,7 +35,24 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
   const requests = new Map();
   const own = new Map();
   const approvals = new Map();
-  const write = data => child.stdin.write(`${JSON.stringify(data)}\n`);
+  const forwardEditor = (line, data, internal = false) => {
+    if (!internal && data?.id !== undefined && data.method) requests.set(data.id, { method: data.method, params: data.params });
+    if (data?.id !== undefined && !data.method && approvals.has(data.id)) {
+      const threadId = approvals.get(data.id); approvals.delete(data.id);
+      child.stdin.write(`${line}\n`); void flush(threadId); return;
+    }
+    child.stdin.write(`${line}\n`);
+  };
+  const fence = new CodexAdmissionFence({ write: forwardEditor, reply: data => process.stdout.write(`${JSON.stringify(data)}\n`),
+    activity: threadID => {
+      const state = threads.get(threadID);
+      const all = [...threads.values()];
+      return { known: !!state && all.every(s => s.lifecycleKnown === true), idle: !!state && all.every(s => !s.turnId),
+        blocked: approvals.size > 0, flushing: all.some(s => s.flushing === true) };
+    },
+    onRelease: () => { for (const threadID of threads.keys()) setImmediate(() => void flush(threadID)); },
+    onFatal: () => child.kill() });
+  const write = data => fence.internal(data);
   const timeoutMs = Number(process.env.AGENT_CHANNEL_RPC_TIMEOUT_MS || 30000);
   if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 300000) throw new Error('Invalid RPC timeout');
   const admissionFingerprint = (message, role) => role ? roleFingerprint(message) : fingerprint(message);
@@ -56,6 +74,7 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
     }
   };
   const rpc = (method, params, context) => new Promise((resolve, reject) => {
+    if (fence.held || fence.closed) { reject(new Error('Native admission is fenced or closed')); return; }
     if (own.size >= 128) { reject(new Error('Internal RPC limit reached')); return; }
     const id = `turnlink-internal-${randomUUID()}`;
     const pending = { resolve, reject, context, expired: false };
@@ -71,10 +90,10 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
   });
   const flush = async threadId => {
     const state = threads.get(threadId);
-    if (!state || state.flushing || [...approvals.values()].includes(threadId)) return;
+    if (!state || state.flushing || fence.held || [...approvals.values()].includes(threadId)) return;
     state.flushing = true;
     try {
-      while ((state.queue.length || state.roles.length) && ![...approvals.values()].includes(threadId)) {
+      while ((state.queue.length || state.roles.length) && !fence.held && ![...approvals.values()].includes(threadId)) {
         // Lifecycle notices never wake an idle thread. An already-accepted receipt can still be acknowledged while idle.
         const notice = state.roles.find(n => n.kind === 'offer' || state.turnId || state.ledger.get(n.id)?.state === 'accepted');
         const role = !!notice, message = notice || state.queue[0];
@@ -86,7 +105,7 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
         try {
           if (role) {
             if (!await control.pending(threadId, message)) { state.roles = state.roles.filter(n => n.id !== message.id); continue; }
-            if (threads.get(threadId) !== state || state.generation !== generation || [...approvals.values()].includes(threadId)) break;
+            if (threads.get(threadId) !== state || state.generation !== generation || fence.held || [...approvals.values()].includes(threadId)) break;
           }
           const previous = state.ledger.get(message.id);
           if (previous && previous.fingerprint !== admissionFingerprint(message, role)) throw new Error('Admission fingerprint mismatch');
@@ -152,23 +171,12 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
     }
   });
   createInterface({ input: process.stdin }).on('line', line => {
-    try {
-      const data = JSON.parse(line);
-      if (data.id !== undefined && data.method) requests.set(data.id, { method: data.method, params: data.params });
-      if (data.id !== undefined && !data.method && approvals.has(data.id)) {
-        const threadId = approvals.get(data.id);
-        approvals.delete(data.id);
-        // Forward approval response before resuming delivery.
-        child.stdin.write(`${line}\n`);
-        void flush(threadId);
-        return;
-      }
-    } catch { /* forward non-JSON unchanged */ }
-    child.stdin.write(`${line}\n`);
-  }).on('close', () => { control.close(); client.close(); child.stdin.end(); });
+    try { fence.editor(line); } catch { child.kill(); }
+  }).on('close', () => { fence.close(); control.close(); client.close(); child.stdin.end(); });
   createInterface({ input: child.stdout }).on('line', line => {
     try {
       const data = JSON.parse(line);
+      fence.observe(data);
       if (own.has(data.id)) {
         const pending = own.get(data.id); own.delete(data.id); clearTimeout(pending.timer);
         const { threadId, state, message, generation, role } = pending.context;
@@ -215,7 +223,7 @@ if (!args.includes('app-server') || args.some(a => a.startsWith('ws://') || a.st
   const controlTimer = process.env.AGENT_CHANNEL_CONTROL === '1' && process.env.AGENT_CHANNEL_ADAPTER_TOKEN_FILE ?
     setInterval(() => { for (const threadId of threads.keys()) void control.poll(threadId); }, 30000) : undefined;
   controlTimer?.unref();
-  child.on('exit', () => { control.close(); clearInterval(controlTimer); clearInterval(retry); client.close(); for (const p of own.values()) clearTimeout(p.timer); });
+  child.on('exit', () => { fence.close(); control.close(); clearInterval(controlTimer); clearInterval(retry); client.close(); for (const p of own.values()) clearTimeout(p.timer); });
 }
 child.on('error', error => { console.error(`Turnlink: executable launch failed (${diagnosticCode(error)})`); process.exit(1); });
 child.on('exit', code => { process.stdin.destroy(); process.exitCode = code ?? 1; });

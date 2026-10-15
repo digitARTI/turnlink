@@ -14,6 +14,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { NativeWorktreeSnapshotReader } from '../src/worktree-snapshot.js';
 import { makeCodexSnapshotSource } from '../src/native-snapshot-source.js';
+import { CodexAdmissionFence } from '../src/codex-admission-fence.js';
 
 test('real Codex proxy admits supplemental roles and changes cwd in the same thread without permission overrides (local model fixture)',
   { skip: process.env.TURNLINK_CODEX_INTEGRATION !== '1', timeout: 30000 }, async t => {
@@ -60,6 +61,9 @@ test('real Codex proxy admits supplemental roles and changes cwd in the same thr
     });
     const childClosed = once(child, 'close');
     const pending = new Map(); let sequence = 0, diagnostics = '';
+    const nativeActivity = { known: false, idle: true, blocked: false, flushing: false };
+    const nativeFence = new CodexAdmissionFence({ write: line => child.stdin.write(`${line}\n`), activity: () => nativeActivity,
+      reply: message => { const p = pending.get(message.id); if (p) { pending.delete(message.id); clearTimeout(p.timer); p.reject(new Error('Native fixture admission rejected')); } } });
     child.stderr.on('data', chunk => { diagnostics = (diagnostics + chunk).slice(-4000); });
     const rejectAll = error => { for (const p of pending.values()) { clearTimeout(p.timer); p.reject(error); } pending.clear(); };
     child.on('error', rejectAll); child.on('exit', () => rejectAll(new Error(`Codex fixture exited: ${diagnostics}`)));
@@ -67,19 +71,24 @@ test('real Codex proxy admits supplemental roles and changes cwd in the same thr
     const turnDone = new Promise(resolve => { completed = resolve; });
     createInterface({ input: child.stdout }).on('line', line => {
       const message = JSON.parse(line), p = pending.get(message.id);
+      nativeFence.observe(message);
+      if (message.result?.thread?.id) nativeActivity.known = true;
+      if (message.method === 'turn/started') nativeActivity.idle = false;
+      if (message.method === 'turn/completed') nativeActivity.idle = true;
       if (message.method === 'turn/completed') completed(message.params.turn);
       if (!p) return;
       pending.delete(message.id); clearTimeout(p.timer);
       if (message.error) p.reject(new Error(`Codex gate rejected ${p.method} (${message.error.code}): ${String(message.error.message).slice(0, 500)}`));
       else p.resolve(message.result);
     });
-    const rpc = (method, params) => new Promise((resolve, reject) => {
+    const rpc = (method, params, token) => new Promise((resolve, reject) => {
       const id = ++sequence;
       const timer = setTimeout(() => { pending.delete(id); reject(new Error('Codex gate timed out')); }, 10000);
-      pending.set(id, { resolve, reject, timer, method }); child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
+      pending.set(id, { resolve, reject, timer, method });
+      const frame = { id, method, params }; token ? nativeFence.internal(frame, token) : nativeFence.editor(JSON.stringify(frame));
     });
     t.after(async () => {
-      rejectAll(new Error('Fixture stopped')); child.kill();
+      nativeFence.close(); rejectAll(new Error('Fixture stopped')); child.kill();
       if (child.pid) await childClosed;
       model.closeAllConnections(); await new Promise(resolve => model.close(resolve));
       admin.close(); participant.close(); await broker.close();
@@ -108,8 +117,14 @@ test('real Codex proxy admits supplemental roles and changes cwd in the same thr
     assert.ok(!JSON.stringify(pair).includes('fixture-only'));
     // A resume of an already loaded thread ignores cwd in 0.161.0; the supported transition is turn/start.cwd.
     const secondDone = new Promise(resolve => { completed = resolve; });
-    await rpc('turn/start', { threadId: before.thread.id, cwd: realpathSync(worktree), input: [{ type: 'text', text: 'Verify destination instructions' }] });
-    assert.equal((await secondDone).status, 'completed');
+    let heldResume;
+    await nativeFence.exclusive(before.thread.id, async ({ token }) => {
+      await rpc('turn/start', { threadId: before.thread.id, cwd: realpathSync(worktree), input: [{ type: 'text', text: 'Verify destination instructions' }] }, token);
+      heldResume = rpc('thread/resume', { threadId: before.thread.id, excludeTurns: true });
+      assert.equal(nativeFence.queue.length, 1, 'competing native mutations must remain behind the owning turn');
+      assert.equal((await secondDone).status, 'completed');
+    });
+    assert.equal((await heldResume).thread.id, before.thread.id);
     const after = await rpc('thread/resume', { threadId: before.thread.id, excludeTurns: true });
     assert.equal(after.thread.id, before.thread.id);
     assert.equal(after.cwd, realpathSync(worktree));
