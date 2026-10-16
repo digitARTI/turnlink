@@ -23,7 +23,7 @@
     "proper-lockfile": "^4.1.2",
     "smol-toml": "^1.9.0",
     "ws": "^8.18.0",
-    "zod": "^4.0.0"
+    "zod": "^4.6.7"
   },
   "bin": {
     "turnlink-codex": "./src/codex-proxy.js",
