@@ -116,6 +116,9 @@ async function fixture(t, enabled = true, extra = {}) {
   await once(broker.server, 'listening');
   const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, credentialDirectory: join(root, 'proofs') };
   const clients = [];
+  const brokers = new Set([broker]);
+  const trackBroker = value => { brokers.add(value); return value; };
+  t.after(async () => { clients.forEach(c => c.close()); for (const value of brokers) await value.close(); rmSync(root, { recursive: true, force: true }); });
   const client = (token = HOST) => { const value = new ChannelClient({ ...options, token }); clients.push(value); return value; };
   const admin = client(ADMIN), a = client(), b = client(), c = client();
   const joinAgent = async (connection, sessionId, channel = 'dev') => {
@@ -137,9 +140,8 @@ async function fixture(t, enabled = true, extra = {}) {
     const notice = (await query(a, 'opencode:a', 'notices')).entries.find(n => n.kind === 'offer');
     return { proposalID: result.commandID, notice };
   };
-  t.after(async () => { clients.forEach(c => c.close()); await broker.close(); rmSync(root, { recursive: true, force: true }); });
   if (enabled) await run(admin, undefined, 'channel.configure');
-  return { broker, options, admin, a, b, c, client, run, query, enroll, appoint, joinAgent, advance: ms => { now += ms; }, get now() { return now; } };
+  return { broker, options, admin, a, b, c, client, trackBroker, run, query, enroll, appoint, joinAgent, advance: ms => { now += ms; }, get now() { return now; } };
 }
 
 test('rate-limited requests receive a correlated failure instead of a timeout', async t => {
@@ -427,6 +429,7 @@ test('real broker restart settles a committed effect receipt without reapplying 
   let reapplied = false;
   const restarted = createBroker({ directory: join(f.options.credentialDirectory, '..'), port: 0, secret: HOST, adminSecret: ADMIN,
     now: () => 1000, controlPlane: true, controlEffects: true, effectHooks: { afterEffect: () => { reapplied = true; } } });
+  f.trackBroker(restarted);
   await once(restarted.server, 'listening');
   const admin = new ChannelClient({ token: ADMIN, url: `ws://127.0.0.1:${restarted.server.address().port}` });
   t.after(async () => { admin.close(); await restarted.close(); });
@@ -879,6 +882,7 @@ for (const scenario of ['normal', 'reassigned', 'new_record', 'second_takeover']
   const restarted = createBroker({ directory: join(f.options.credentialDirectory, '..'), port: Number(new URL(f.options.url).port),
     secret: HOST, adminSecret: ADMIN, controlPlane: true, now: () => f.now, hosts,
     worktreeGrants: true, manualWorktreeOnly: true, taskDispatch: true, worktreeTaskDispatch: true });
+  f.trackBroker(restarted);
   t.after(() => restarted.close()); await once(restarted.server, 'listening');
   f.broker = restarted; f.admin = f.client(ADMIN); f.c = f.client(); target = f.client(targetToken); replacement.client = f.c;
   assert.equal((await prepareTakeover()).takeoverID, takeover.takeoverID);
@@ -957,6 +961,7 @@ for (const scenario of ['normal', 'reassigned', 'new_record', 'second_takeover']
     const again = createBroker({ directory: join(f.options.credentialDirectory, '..'), port: Number(new URL(f.options.url).port),
       secret: HOST, adminSecret: ADMIN, controlPlane: true, now: () => f.now, hosts,
       worktreeGrants: true, manualWorktreeOnly: true, taskDispatch: true, worktreeTaskDispatch: true });
+    f.trackBroker(again);
     t.after(() => again.close()); await once(again.server, 'listening');
     f.admin = f.client(ADMIN); f.c = f.client(); target = f.client(targetToken);
     const resumedCoordinator = secondTakeover ? (f.a = f.client()) : f.c;
@@ -999,6 +1004,7 @@ test('manual resume rearms only from the original receiver after a broker restar
   let now = 10000;
   const restarted = createBroker({ directory: join(f.options.credentialDirectory, '..'), port: Number(new URL(f.options.url).port), secret: HOST,
     adminSecret: ADMIN, controlPlane: true, now: () => now, ...settings });
+  f.trackBroker(restarted);
   await once(restarted.server, 'listening');
   const a = new ChannelClient({ ...f.options, token: HOST }), b = new ChannelClient({ ...f.options, token: HOST });
   t.after(async () => { a.close(); b.close(); await restarted.close(); });
@@ -1155,6 +1161,7 @@ for (const [label, destination] of [['POSIX', '/destination'], ['Windows', Strin
     runningBroker = createBroker({ directory: join(f.options.credentialDirectory, '..'), port: Number(new URL(f.options.url).port),
       secret: HOST, adminSecret: ADMIN, controlPlane: true, now: () => restartNow, hosts,
       worktreeGrants: true, manualWorktreeOnly: true, taskDispatch: true, worktreeTaskDispatch: true, ...overrides });
+    f.trackBroker(runningBroker);
     brokers.push(runningBroker); await once(runningBroker.server, 'listening');
     f.advance = milliseconds => { restartNow += milliseconds; };
     f.a = f.client(); f.b = f.client(); f.admin = f.client(ADMIN);
