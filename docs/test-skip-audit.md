@@ -1,7 +1,7 @@
 # Test skip audit
 
 On 2026-11-08, the macOS/Node 24 default suite for the supported branch
-reported **781 passes, 43 skips and no failures**. Skipped checks are not
+reported **758 passes, 42 skips and no failures**. Skipped checks are not
 counted as passes. They include platform-specific Windows and Linux cases and
 opt-in desktop, Docker, VM and official-runtime integration checks; each test
 file states its own prerequisites.

@@ -108,12 +108,7 @@ VM images, instance identifiers and keys are test fixtures: they do not prove
 production guest identity, OS isolation, effective policy parity or a safe
 receiver handoff.
 
-For review, the focused checks are:
-
-```sh
-node --test test/codex-checkpoint-observation.test.js test/codex-vm-checkpoint-transfer.test.js
-GO111MODULE=off GOCACHE=/private/tmp/turnlink-checkpoint-go-cache go test -race -timeout 30s ./test/fixtures/codex-vm-checkpoint-import
-```
+The checkpoint and VM integration checks are archived on the experimental branch.
 
 The former staged native-runtime integration fixture was retired along with the automatic-transfer experiment. The observations above are historical and do not enable automatic transfer.
 
