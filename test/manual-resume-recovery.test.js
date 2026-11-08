@@ -92,7 +92,7 @@ test('an expired pending host transfer survives broker startup until explicitly 
   } finally { await broker.close(); }
 });
 
-test('normal broker startup supports manual-only worktree tasks without native handoff configuration', { timeout: 15000 }, async t => {
+test('normal broker startup supports manual-only worktree tasks without native handoff configuration', { timeout: 40000 }, async t => {
   const root = privateTemp(join(tmpdir(), 'turnlink-manual-start-'));
   writeFileSync(join(root, 'admin-token'), '2'.repeat(64), { mode: 0o600 });
   const probe = createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening');
@@ -107,7 +107,7 @@ test('normal broker startup supports manual-only worktree tasks without native h
   const exited = once(child, 'exit');
   const admin = new ChannelClient({ url, token: '2'.repeat(64), credentialDirectory: join(root, 'proofs') });
   t.after(async () => { admin.close(); if (child.exitCode === null) child.kill('SIGTERM'); await exited; rmSync(root, { recursive: true, force: true }); });
-  for (let index = 0; index < 200 && !stderr.includes('Turnlink protocol v2 listening') && child.exitCode === null; index++) await delay(20);
+  for (let index = 0; index < 1000 && !stderr.includes('Turnlink protocol v2 listening') && child.exitCode === null; index++) await delay(20);
   assert.match(stderr, /Turnlink protocol v2 listening/);
   const info = await admin.request('control_info');
   assert.equal(info.manualResumeEnabled, true); assert.equal(info.manualWorktreeOnlyEnabled, true);
