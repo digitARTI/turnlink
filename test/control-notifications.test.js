@@ -15,7 +15,9 @@ import { channelPrecondition } from '../src/control/contracts.js';
 import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
 
-const rootFor = t => { const root = privateTemp(join(tmpdir(), 'turnlink-notifications-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root; };
+const roots = new Set();
+test.after(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
+const rootFor = () => { const root = privateTemp(join(tmpdir(), 'turnlink-notifications-')); roots.add(root); return root; };
 const context = (now = 1000, kind = 'operator') => ({ actor: { kind }, now, members: [] });
 function overdue(store, channel = 'dev', now = 1000) {
   if (!store.snapshot().channels.some(c => c.id === channel)) store.apply({ id: randomUUID(), op: 'channel.configure', channel }, context(now));

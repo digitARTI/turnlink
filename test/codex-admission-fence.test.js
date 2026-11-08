@@ -62,7 +62,10 @@ test('publication waits for earlier reads and holds new reads until the owner co
 test('failed or interrupted publication never drains queued reads or mutations', async t => {
   for (const mode of ['failure', 'interrupt', 'expiry']) await t.test(mode, async () => {
     const { fence, writes } = fixture({ timeoutMs: 20 });
-    await assert.rejects(fence.exclusive('b', async ({ beginPublication, endPublication }) => {
+    // The production expiry timer is unref'd; keep the test alive while it
+    // waits for that timer on Node versions that do not retain test promises.
+    const keepAlive = setTimeout(() => {}, 1000);
+    try { await assert.rejects(fence.exclusive('b', async ({ beginPublication, endPublication }) => {
       if (mode === 'expiry') fence.editor(JSON.stringify({ id: 1, method: 'thread/read', params: { threadId: 'b' } }));
       const beginning = beginPublication();
       fence.editor(JSON.stringify({ id: 2, method: 'config/read', params: {} }));
@@ -76,7 +79,7 @@ test('failed or interrupted publication never drains queued reads or mutations',
         }
         throw new Error('fixture publication failure');
       }
-    }));
+    })); } finally { clearTimeout(keepAlive); }
     assert.equal(fence.quarantined, true);
     assert.deepEqual(writes.map(w => w.frame.id), mode === 'expiry' ? [1] : mode === 'interrupt' ? [4] : []);
     fence.close();

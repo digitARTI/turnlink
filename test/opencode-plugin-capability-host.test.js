@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { MessageChannel } from 'node:worker_threads';
 import { once } from 'node:events';
@@ -9,6 +9,12 @@ import { createOpenCodePluginCapabilityHost } from '../src/opencode-plugin-capab
 import { createOpenCodePluginCapabilityClient } from '../src/opencode-plugin-capability-client.js';
 import { createOpenCodePluginProcessPort } from '../src/opencode-plugin-process-port.js';
 import { tools, controlTools } from '../src/tools.js';
+
+// Node 22 may unref a MessagePort while a close-event promise is pending.
+// Keep this test file alive, with a deadline so a real deadlock still fails.
+const keepAlive = setInterval(() => {}, 1000);
+const keepAliveDeadline = setTimeout(() => clearInterval(keepAlive), 30000);
+after(() => { clearInterval(keepAlive); clearTimeout(keepAliveDeadline); });
 
 test('plugin capability host scopes methods to one session and revokes pending responses', async () => {
   const { port1, port2 } = new MessageChannel(), controller = new AbortController(); let release;
