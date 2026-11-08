@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, openSync, closeSync, fsyncSync } from 'node:fs';
 import { privateDirectory, readPrivate } from './storage.js';
 
 export const stateDir = process.env.AGENT_CHANNEL_STATE_DIR || join(homedir(), '.local/share/agent-channel');
@@ -19,8 +19,17 @@ function credentialFile(path, create) {
   try { return validateCredential(readPrivate(path, 128).trim()); } catch (error) {
     if (!create || error.code !== 'ENOENT') throw error;
     privateDirectory(join(path, '..'));
-    try { writeFileSync(path, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 }); }
+    let fd;
+    try {
+      fd = openSync(path, 'wx', 0o600);
+      writeFileSync(fd, randomBytes(32).toString('hex'));
+      fsyncSync(fd); closeSync(fd); fd = undefined;
+      if (process.platform !== 'win32') {
+        const parent = openSync(join(path, '..'), 'r'); try { fsyncSync(parent); } finally { closeSync(parent); }
+      }
+    }
     catch (e) { if (e.code !== 'EEXIST') throw e; }
+    finally { if (fd !== undefined) closeSync(fd); }
     return validateCredential(readPrivate(path, 128).trim());
   }
 }
@@ -34,7 +43,36 @@ export function sessionProof(hostId, agentId, directory, create = true) {
   const root = directory || process.env.AGENT_CHANNEL_CREDENTIAL_DIR || join(stateDir, 'session-keys');
   privateDirectory(root);
   const host = join(root, digest(hostId)); privateDirectory(host);
-  return credentialFile(join(host, `${digest(agentId)}.key`), create);
+  const value = credentialFile(join(host, `${digest(agentId)}.key`), create);
+  if (create && process.platform !== 'win32') {
+    // The host-key directory may have just been created; persist its parent
+    // before the proof can be used to rotate a broker ownership binding.
+    for (const directory of [root, join(root, '..')]) {
+      const parent = openSync(directory, 'r'); try { fsyncSync(parent); } finally { closeSync(parent); }
+    }
+  }
+  return value;
+}
+// Destination key must reach private storage before a broker can rotate its
+// proof. A partial write is an error on recovery, never a new identity guess.
+export function receiverHandoffKey(hostId, agentId, transitionID, directory, create = false) {
+  if (typeof transitionID !== 'string' || !/^[0-9a-f-]{36}$/i.test(transitionID)) throw new Error('Invalid receiver transition');
+  const root = directory || process.env.AGENT_CHANNEL_CREDENTIAL_DIR || join(stateDir, 'session-keys');
+  privateDirectory(root);
+  const host = join(root, digest(hostId)); privateDirectory(host);
+  const file = join(host, `${digest(agentId)}.receiver.${digest(transitionID)}.key`);
+  if (create) {
+    let fd;
+    try {
+      fd = openSync(file, 'wx', 0o600);
+      writeFileSync(fd, randomBytes(32).toString('hex')); fsyncSync(fd); closeSync(fd); fd = undefined;
+      if (process.platform !== 'win32') {
+        const parent = openSync(host, 'r'); try { fsyncSync(parent); } finally { closeSync(parent); }
+      }
+    } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    finally { if (fd !== undefined) closeSync(fd); }
+  }
+  return validateCredential(readPrivate(file, 128).trim());
 }
 export const identity = (harness, sessionId) => `${harness}:${sessionId}`;
 export function render(message) {

@@ -14,7 +14,8 @@ export async function openCodeFixture(t, options, overrides = {}) {
   const permissions = new Map(), forms = new Map(), events = new EventEmitter();
   let subscriptions = 0;
   const ctx = {
-    app: { version: '2.0.28' }, location: { directory: '/projects/b' }, options,
+    app: { version: '2.0.28' }, location: overrides.location || { directory: '/projects/b' }, options,
+    rpc: overrides.rpc,
     tool: { transform: async callback => callback({ add: tool => { tools[tool.name] = tool; } }) },
     storage: {
       get: async key => storage.get(key), set: async (key, value) => storage.set(key, value),
@@ -24,6 +25,7 @@ export async function openCodeFixture(t, options, overrides = {}) {
     permission: { list: async ({ sessionID }) => [...(permissions.get(sessionID) || [])] },
     session: {
       get: async ({ sessionID }) => ({ id: sessionID, location: { directory: '/projects/b' }, agent: 'plan', model: { providerID: 'fixture', id: 'test' } }),
+      wait: async () => ({}),
       context: async ({ sessionID }) => [{ type: 'assistant', content: (forms.get(sessionID) || []).map(f => ({
         type: 'tool', name: 'question', id: f.id, state: { status: 'running' },
       })) }],
@@ -32,6 +34,7 @@ export async function openCodeFixture(t, options, overrides = {}) {
     },
     event: { subscribe: async function* ({ signal }) { subscriptions++; for await (const [event] of on(events, 'event', { signal })) yield event; } },
   };
+  overrides.onContext?.(ctx, events);
   const cleanup = await plugin.setup(ctx);
   t.after(cleanup);
   const emit = (type, data) => {

@@ -1,12 +1,20 @@
+import { providerEstablishment, receiptMatchesPlan, cleanupMatchesOwner } from './provider-establishment-contracts.js';
+import { mcpEstablishment, mcpReceiptMatchesPlan, mcpCleanupMatchesOwner } from './mcp-establishment-contracts.js';
+import { transitionHoldsConversation, compatibleResourceHold, destinationOwnersMatch, destinationMovementHoldsOwner } from './worktree-holds.js';
 import { randomUUID, createHash } from 'node:crypto';
-import { Command, Context, validateControlState, Event, MASTER_LEASE_MS, MASTER_PROMPT_VERSION, PROPOSAL_TIMEOUT_MS, ELECTION_TIMEOUT_MS } from './contracts.js';
+import { Command, Context, validateControlState, Event, MASTER_LEASE_MS, MASTER_PROMPT_VERSION, PROPOSAL_TIMEOUT_MS, ELECTION_TIMEOUT_MS, fullyQualifiedManualPath } from './contracts.js';
 import { requireControl as check, actionDecision } from './policy.js';
+import { reduceManagedWorktree } from './worktree-lifecycle-reducer.js';
 
-const occupiesSlot = task => ['dispatching', 'running', 'uncertain', 'review'].includes(task.status) && !task.stoppedEvidence;
+const occupiesSlot = task => task.terminalHold === true || (['dispatching', 'running', 'uncertain', 'review'].includes(task.status) && !task.stoppedEvidence);
+const resourceEstablishment = value => providerEstablishment(value) || mcpEstablishment(value);
+const resourcePlan = value => mcpEstablishment(value) ? value.mcpPlan : value.providerPlan;
+const matchesResource = (receipt, transition) => mcpEstablishment(transition) ? mcpReceiptMatchesPlan(receipt, transition) : receiptMatchesPlan(receipt, transition);
+const matchesCleanup = (receipt, transition) => mcpEstablishment(transition) ? mcpCleanupMatchesOwner(receipt, transition) : cleanupMatchesOwner(receipt, transition);
 
 // Pure state transitions: no model calls, worktree changes, broker cancellation, or permission mutations.
-export function reduceControl(previous, input, suppliedContext) {
-  const state = structuredClone(validateControlState(previous));
+export function reduceControl(previous, input, suppliedContext, storageOptions) {
+  const state = structuredClone(validateControlState(previous, storageOptions));
   const command = Command.parse(input), context = Context.parse(suppliedContext);
   const { actor, now, members } = context;
   check(now >= state.lastNow, 'CLOCK_REGRESSION'); state.lastNow = now;
@@ -72,7 +80,8 @@ export function reduceControl(previous, input, suppliedContext) {
     check(actor.kind === 'adapter' && actor.agentId === value.claimant && command.attempt === value.attempt, 'STALE_TASK_ATTEMPT');
     member(actor.agentId); // A disconnected transport is not an execution-stop signal.
   };
-  const transitionPending = taskID => state.transitions.some(t => t.taskID === taskID && ['prepared', 'uncertain'].includes(t.status));
+  const transitionPending = taskID => state.transitions.some(t => t.taskID === taskID && transitionHoldsConversation(t)) ||
+    state.managedPreviews.some(p => p.preview.taskID === taskID && ['executing', 'uncertain'].includes(p.status));
   const incident = (category, entityID) => {
     const existing = state.incidents.find(i => i.channel === channel.id && i.category === category && i.entityID === entityID && i.status === 'open');
     if (existing) return existing;
@@ -94,6 +103,11 @@ export function reduceControl(previous, input, suppliedContext) {
       check(record.kind !== 'native_idempotent' || record.admissionID === value.admissionID, 'ADMISSION_KEY_REQUIRED');
     }
   };
+
+  // Explicit uncertainty revokes earlier lifecycle callbacks, not just stop
+  // markers. A matching broker epoch is still not authenticated native proof.
+  const observationGeneration = value => check(value.stopGeneration < Number.MAX_SAFE_INTEGER &&
+    (command.stopGeneration === value.stopGeneration || (value.stopGeneration === 0 && command.stopGeneration === undefined)), 'STALE_STOP_GENERATION');
 
   switch (command.op) {
     case 'channel.configure':
@@ -196,7 +210,7 @@ export function reduceControl(previous, input, suppliedContext) {
     }
     case 'action.reconcile': {
       scheduler(); const value = action(); check(value.status === 'executing', 'ACTION_NOT_EXECUTING');
-      check(['pause_delivery', 'resume_delivery', 'cancel_queued'].includes(value.operation), 'CONTROL_OPERATION_DISABLED');
+      check(['pause_delivery', 'resume_delivery', 'cancel_queued', 'retry_delivery', 'change_wake_policy', 'remove_member'].includes(value.operation), 'CONTROL_OPERATION_DISABLED');
       value.status = command.outcome; value.evidenceID = command.evidenceID;
       emit(`action.${command.outcome}`, value.id);
       if (command.outcome === 'uncertain') incident('admission', value.id); break;
@@ -234,6 +248,8 @@ export function reduceControl(previous, input, suppliedContext) {
       check(value.status === 'open', 'TASK_ALREADY_CLAIMED');
       value.claimant = actor.agentId; value.status = 'claimed'; value.claimGeneration++; emit('task.claimed', value.id); break;
     }
+    case 'managed.preview': case 'managed.approve': case 'managed.reject': case 'managed.confirm_manual': case 'managed.begin': case 'managed.revalidate': case 'managed.settle':
+      reduceManagedWorktree({ state, command, actor, channel, now, member, emit, incident }); break;
     case 'task.release': {
       participant(); const value = task();
       check(!transitionPending(value.id), 'WORKTREE_TRANSITION_UNRESOLVED');
@@ -248,6 +264,8 @@ export function reduceControl(previous, input, suppliedContext) {
       scheduler(); const value = task(); member(value.claimant, true);
       check(!transitionPending(value.id), 'WORKTREE_TRANSITION_UNRESOLVED');
       check(value.status === 'claimed', 'TASK_NOT_CLAIMED');
+      check(!state.transitions.some(t => t.agentId === value.claimant && transitionHoldsConversation(t)), 'WORKTREE_TRANSITION_UNRESOLVED');
+      check(!state.managedPreviews.some(p => p.agentId === value.claimant && ['executing', 'uncertain'].includes(p.status)), 'MANAGED_WORKTREE_UNRESOLVED');
       check(!state.tasks.some(t => t.id !== value.id && t.claimant === value.claimant && occupiesSlot(t)), 'CONVERSATION_CAPACITY');
       const capability = [...state.evidence].reverse().find(e => e.channel === channel.id && e.entityID === value.id && e.agentId === value.claimant && e.kind === 'capability');
       check(!!capability && capability.id === command.capabilityEvidenceID && now - capability.at <= 300000, 'VERIFIED_CAPABILITY_REQUIRED');
@@ -256,9 +274,16 @@ export function reduceControl(previous, input, suppliedContext) {
       if (value.requiresWorktree) {
         check(capability.sameConversationWorktree === true, 'WORKTREE_CAPABILITY_REQUIRED');
         const preview = [...state.previews].reverse().find(p => p.taskID === value.id && p.agentId === value.claimant);
-        check(preview?.approved === true && preview.claimGeneration === value.claimGeneration, 'WORKTREE_PREVIEW_APPROVAL_REQUIRED');
+        check(preview?.approved === true && !providerEstablishment(preview) && preview.claimGeneration === value.claimGeneration, 'WORKTREE_PREVIEW_APPROVAL_REQUIRED');
+        const moved = [...state.transitions].reverse().find(t => t.taskID === value.id && t.agentId === value.claimant &&
+          t.channel === channel.id && t.previewID === preview.id && t.claimGeneration === value.claimGeneration &&
+          !resourceEstablishment(t) && t.status === 'moved' && t.from === preview.from && t.to === preview.to &&
+          t.actualLocation === preview.to && t.configurationDigest === preview.configurationDigest && !!t.receiptID);
+        const manual = preview.manualResume === true && context.manualResume?.taskID === value.id &&
+          context.manualResume.previewID === preview.id && !!context.manualResume.receiptID;
+        check((!!moved || manual) && command.cwd === preview.to && !!command.scopeDigest, 'WORKTREE_TRANSITION_REQUIRED');
       }
-      check(value.dependencies.every(id => state.tasks.find(t => t.id === id)?.status === 'completed'), 'DEPENDENCIES_NOT_COMPLETE');
+      check(value.dependencies.every(id => state.tasks.some(t => t.id === id && t.status === 'completed' && !t.terminalHold)), 'DEPENDENCIES_NOT_COMPLETE');
       check(state.tasks.filter(t => t.channel === channel.id && occupiesSlot(t)).length < channel.capacity, 'CHANNEL_CAPACITY');
       check(!value.deadlineAt || now < value.deadlineAt, 'DEADLINE_EXPIRED');
       if (value.schedule) {
@@ -284,68 +309,169 @@ export function reduceControl(previous, input, suppliedContext) {
         const value = state.tasks.find(t => t.id === command.entityID && t.channel === channel.id);
         check(value?.claimant === actor.agentId && value.attempt === command.attempt && ['running', 'uncertain', 'review'].includes(value.status), 'STALE_ARTIFACT_EVIDENCE');
         if (command.artifact) check(actor.agentId === `${command.artifact.harness}:${command.artifact.sessionID}`, 'ARTIFACT_IDENTITY_MISMATCH');
-        if (command.artifact && value.nativeAdmissionID) check(command.artifact.fromMessageID === value.nativeAdmissionID, 'ARTIFACT_IDENTITY_MISMATCH');
+        if (command.artifact && value.nativeAdmissionID) check((command.artifact.type === 'native_turn' ? command.artifact.admissionID :
+          command.artifact.fromMessageID) === value.nativeAdmissionID, 'ARTIFACT_IDENTITY_MISMATCH');
       }
       check(!command.artifact || command.kind === 'artifact', 'INVALID_ARTIFACT_EVIDENCE');
+      check(command.nativeProviderFactory === undefined || command.kind === 'capability', 'INVALID_RESOURCE_CAPABILITY');
+      check(command.nativeMcpRuntime === undefined || command.kind === 'capability', 'INVALID_RESOURCE_CAPABILITY');
+      check(command.nativeModelShutdown === undefined || command.kind === 'capability', 'INVALID_RESOURCE_CAPABILITY');
       state.evidence.push({ id: command.id, channel: channel.id, entityID: command.entityID, agentId: actor.agentId, kind: command.kind, at: now,
         ...(command.attempt !== undefined ? { attempt: command.attempt } : {}), ...(command.admissionID ? { admissionID: command.admissionID } : {}),
         ...(command.sameConversationWorktree !== undefined ? { sameConversationWorktree: command.sameConversationWorktree } : {}),
+        ...(command.nativeProviderFactory !== undefined ? { nativeProviderFactory: command.nativeProviderFactory } : {}),
+        ...(command.nativeMcpRuntime !== undefined ? { nativeMcpRuntime: command.nativeMcpRuntime } : {}),
+        ...(command.nativeModelShutdown !== undefined ? { nativeModelShutdown: command.nativeModelShutdown } : {}),
         ...(command.artifact ? { artifact: command.artifact } : {}) });
       emit('evidence.recorded', command.id); break;
     }
+    case 'worktree.manual_preview': {
+      master(command.generation); const value = task();
+      check(fullyQualifiedManualPath(command.from) && fullyQualifiedManualPath(command.to), 'MANUAL_PATH_NOT_FULLY_QUALIFIED');
+      check(value.requiresWorktree && value.status === 'claimed' && value.claimant && value.claimant !== actor.agentId, 'TASK_NOT_CLAIMED');
+      member(value.claimant, true);
+      check(command.from !== command.to, 'WORKTREE_MUST_DIFFER');
+      check(!transitionPending(value.id) && !state.transitions.some(t => t.agentId === value.claimant && transitionHoldsConversation(t)), 'WORKTREE_TRANSITION_UNRESOLVED');
+      const configurationDigest = createHash('sha256').update(JSON.stringify({ kind: 'manual-resume-preview-v1', taskID: value.id,
+        agentId: value.claimant, claimGeneration: value.claimGeneration, from: command.from, to: command.to })).digest('hex');
+      state.previews.push({ id: command.id, channel: channel.id, taskID: value.id, agentId: value.claimant, from: command.from, to: command.to,
+        configurationDigest, approved: false, at: now, claimGeneration: value.claimGeneration, manualResume: true });
+      emit('worktree.previewed', command.id); break;
+    }
     case 'worktree.preview': {
       check(actor.kind === 'adapter', 'ADAPTER_REQUIRED'); const value = task();
-      check(!transitionPending(value.id), 'WORKTREE_TRANSITION_UNRESOLVED');
+      const candidate = { ...command, agentId: actor.agentId, claimGeneration: value.claimGeneration };
+      if (candidate.destinationOwners) check(destinationOwnersMatch(state, candidate), 'DESTINATION_OWNERS_UNAVAILABLE');
+      check(!state.transitions.some(t => t.taskID === value.id && transitionHoldsConversation(t) && !compatibleResourceHold(t, candidate)) &&
+        !state.managedPreviews.some(p => p.preview.taskID === value.id && ['executing', 'uncertain'].includes(p.status)), 'WORKTREE_TRANSITION_UNRESOLVED');
       check(value.claimant === actor.agentId && value.status === 'claimed', 'TASK_NOT_CLAIMED');
       if (command.binding) check(command.binding.harness === member(actor.agentId).harness, 'HARNESS_BINDING_MISMATCH');
+      if (command.binding?.nativeAuthorityObservation) check(command.binding.nativeAuthorityObservation.source.directory === command.from &&
+        command.binding.nativeAuthorityObservation.destination.directory === command.to, 'NATIVE_AUTHORITY_OBSERVATION_MISMATCH');
       check(command.from !== command.to, 'WORKTREE_MUST_DIFFER');
+      if (resourceEstablishment(command)) { const plan = resourcePlan(command); check(plan.agentId === actor.agentId &&
+        plan.harness === member(actor.agentId).harness && plan.from === command.from &&
+        plan.to === command.to && plan.digest === command.configurationDigest, 'RESOURCE_PLAN_MISMATCH'); }
       state.previews.push({ id: command.id, channel: channel.id, taskID: value.id, agentId: actor.agentId, from: command.from, to: command.to,
         configurationDigest: command.configurationDigest, approved: false, at: now, claimGeneration: value.claimGeneration,
-        ...(command.binding ? { binding: command.binding } : {}) });
+        ...(command.binding ? { binding: command.binding } : {}),
+        ...(command.destinationOwners ? { destinationOwners: command.destinationOwners } : {}),
+        ...(command.sourceMcpShutdown ? { sourceMcpShutdown: true } : {}),
+        ...(command.sourceModelShutdown ? { sourceModelShutdown: true } : {}),
+        ...(command.sourceRetirement ? { sourceRetirement: command.sourceRetirement } : {}),
+        ...(providerEstablishment(command) ? { purpose: command.purpose, providerPlan: command.providerPlan } : mcpEstablishment(command) ? { purpose: command.purpose, mcpPlan: command.mcpPlan } : {}) });
       emit('worktree.previewed', command.id); break;
     }
     case 'worktree.approve': {
       operator(); const value = task();
-      check(!transitionPending(value.id), 'WORKTREE_TRANSITION_UNRESOLVED');
       const preview = [...state.previews].reverse().find(p => p.taskID === value.id && p.agentId === value.claimant);
       check(preview?.id === command.previewID && value.status === 'claimed' && preview.claimGeneration === value.claimGeneration, 'STALE_WORKTREE_PREVIEW');
+      check(command.checkpointConfigSha256 === preview.binding?.checkpointConfigSha256, 'CHECKPOINT_CONFIG_ACK_REQUIRED');
+      check(command.nativeAuthorityObservationDigest === preview.binding?.nativeAuthorityObservation?.digest, 'NATIVE_AUTHORITY_OBSERVATION_ACK_REQUIRED');
+      if (preview.sourceRetirement?.version === 2) check(command.sourceRetirementDigest === preview.sourceRetirement.digest &&
+        command.admittedEffectAfterNativeLoss === 'may_complete', 'SOURCE_RETIREMENT_ACK_REQUIRED');
+      else check(command.sourceRetirementDigest === undefined && command.admittedEffectAfterNativeLoss === undefined, 'SOURCE_RETIREMENT_ACK_INVALID');
+      if (preview.destinationOwners) check(destinationOwnersMatch(state, preview), 'DESTINATION_OWNERS_UNAVAILABLE');
+      check(!state.transitions.some(t => t.taskID === value.id && transitionHoldsConversation(t) && !compatibleResourceHold(t, preview)) &&
+        !state.managedPreviews.some(p => p.preview.taskID === value.id && ['executing', 'uncertain'].includes(p.status)), 'WORKTREE_TRANSITION_UNRESOLVED');
       preview.approved = true; emit('worktree.approved', preview.id); break;
+    }
+    case 'worktree.session_require': {
+      master(command.generation); const value = task();
+      const preview = [...state.previews].reverse().find(p => p.taskID === value.id && p.agentId === value.claimant);
+      check(preview?.id === command.previewID && preview.approved && !preview.purpose && value.status === 'claimed' &&
+        preview.claimGeneration === value.claimGeneration && actor.agentId !== value.claimant, 'STALE_WORKTREE_PREVIEW');
+      // A new current master can take over after an interruption. Rebinding
+      // invalidates the old coordinator's report; it never releases a task.
+      preview.sessionCoordinator = actor.agentId; emit('worktree.session_required', preview.id); break;
+    }
+    case 'worktree.session_takeover': {
+      operator(); const value = task();
+      const preview = [...state.previews].reverse().find(p => p.taskID === value.id && p.agentId === value.claimant);
+      check(preview?.id === command.previewID && preview.manualResume === true && preview.approved && value.status === 'claimed' &&
+        preview.claimGeneration === value.claimGeneration && preview.sessionCoordinator === command.previousCoordinator &&
+        command.previousCoordinator !== command.nextCoordinator && command.nextCoordinator !== value.claimant &&
+        channel.active?.agentId === command.nextCoordinator && channel.active.generation === command.generation && channel.active.expiresAt > now,
+      'MANUAL_RESUME_UNAVAILABLE');
+      member(command.nextCoordinator, true); member(value.claimant, true);
+      preview.sessionCoordinator = command.nextCoordinator; emit('worktree.session_required', preview.id); break;
     }
     case 'worktree.begin': {
       check(actor.kind === 'adapter', 'ADAPTER_REQUIRED'); const value = task(); member(actor.agentId, true);
       check(value.claimant === actor.agentId && value.status === 'claimed' && value.claimGeneration === command.claimGeneration, 'STALE_TASK_CLAIM');
-      check(!state.transitions.some(t => t.agentId === actor.agentId && ['prepared', 'uncertain'].includes(t.status)), 'WORKTREE_TRANSITION_UNRESOLVED');
+      check(!state.managedPreviews.some(p => p.agentId === actor.agentId && ['executing', 'uncertain'].includes(p.status)), 'MANAGED_WORKTREE_UNRESOLVED');
       check(!state.tasks.some(t => t.claimant === actor.agentId && occupiesSlot(t)), 'CONVERSATION_CAPACITY');
       const preview = [...state.previews].reverse().find(p => p.taskID === value.id && p.agentId === actor.agentId);
-      check(preview?.id === command.previewID && preview.approved && preview.claimGeneration === value.claimGeneration && preview.binding, 'STALE_WORKTREE_PREVIEW');
+      check(preview?.id === command.previewID && preview.approved && preview.claimGeneration === value.claimGeneration && (preview.binding || resourceEstablishment(preview)), 'STALE_WORKTREE_PREVIEW');
+      if (preview.destinationOwners) check(destinationOwnersMatch(state, preview), 'DESTINATION_OWNERS_UNAVAILABLE');
+      check(!state.transitions.some(t => t.agentId === actor.agentId && transitionHoldsConversation(t) && !compatibleResourceHold(t, preview)), 'WORKTREE_TRANSITION_UNRESOLVED');
       check(!state.transitions.some(t => t.previewID === preview.id), 'WORKTREE_PREVIEW_CONSUMED');
       check(preview.configurationDigest === command.configurationDigest, 'CONFIGURATION_CHANGED');
-      check(preview.binding.sourceAuthorityDigest === command.authorityDigest && preview.binding.destinationAuthorityDigest === command.authorityDigest, 'PERMISSION_PRESERVATION_REQUIRED');
+      check(preview.binding?.pluginProvenance?.digest === command.pluginProvenanceDigest, 'PLUGIN_PROVENANCE_CHANGED');
+      check(preview.binding?.nativeAuthorityObservation?.digest === command.nativeAuthorityObservationDigest, 'NATIVE_AUTHORITY_OBSERVATION_CHANGED');
+      check(preview.binding?.checkpointConfigSha256 === command.checkpointConfigSha256, 'CHECKPOINT_CONFIG_CHANGED');
+      check(preview.purpose === command.purpose, 'WORKTREE_EFFECT_SCOPE_MISMATCH');
+      if (!resourceEstablishment(preview)) check(preview.binding.sourceAuthorityDigest === command.authorityDigest && preview.binding.destinationAuthorityDigest === command.authorityDigest, 'PERMISSION_PRESERVATION_REQUIRED');
       const capability = [...state.evidence].reverse().find(e => e.entityID === value.id && e.agentId === actor.agentId && e.channel === channel.id && e.kind === 'capability');
-      check(capability?.sameConversationWorktree === true && now - capability.at <= 300000, 'WORKTREE_CAPABILITY_REQUIRED');
+      check((providerEstablishment(preview) ? capability?.nativeProviderFactory === true : mcpEstablishment(preview) ? capability?.nativeMcpRuntime === true : capability?.sameConversationWorktree === true) && now - capability.at <= 300000, 'WORKTREE_CAPABILITY_REQUIRED');
       const runtime = [...state.evidence].reverse().find(e => e.agentId === actor.agentId && ['idle', 'busy'].includes(e.kind));
       check(runtime?.kind === 'idle' && runtime.channel === channel.id && now - runtime.at <= 10000, 'IDLE_EVIDENCE_REQUIRED');
       state.transitions.push({ id: command.id, channel: channel.id, taskID: value.id, agentId: actor.agentId, previewID: preview.id,
         claimGeneration: value.claimGeneration, from: preview.from, to: preview.to, configurationDigest: preview.configurationDigest,
-        authorityDigest: command.authorityDigest, status: 'prepared', preparedAt: now });
+        ...(command.pluginProvenanceDigest ? { pluginProvenanceDigest: command.pluginProvenanceDigest } : {}),
+        ...(command.nativeAuthorityObservationDigest ? { nativeAuthorityObservationDigest: command.nativeAuthorityObservationDigest } : {}),
+        ...(command.checkpointConfigSha256 ? { checkpointConfigSha256: command.checkpointConfigSha256 } : {}),
+        ...(preview.destinationOwners ? { destinationOwners: preview.destinationOwners } : {}),
+        ...(preview.sourceMcpShutdown ? { sourceMcpShutdown: true } : {}),
+        ...(preview.sourceModelShutdown ? { sourceModelShutdown: true } : {}),
+        ...(preview.sourceRetirement ? { sourceRetirement: preview.sourceRetirement } : {}),
+        ...(providerEstablishment(preview) ? { purpose: preview.purpose, providerPlan: preview.providerPlan } : mcpEstablishment(preview) ? { purpose: preview.purpose, mcpPlan: preview.mcpPlan } : { authorityDigest: command.authorityDigest }), status: 'prepared', preparedAt: now });
       emit('worktree.prepared', command.id); break;
     }
     case 'worktree.settle': {
       check(actor.kind === 'adapter', 'ADAPTER_REQUIRED'); member(actor.agentId);
       const value = state.transitions.find(t => t.id === command.transitionID && t.channel === channel.id && t.agentId === actor.agentId);
-      check(value && ['prepared', 'uncertain'].includes(value.status), 'WORKTREE_TRANSITION_NOT_PENDING');
+      check(value && transitionHoldsConversation(value), 'WORKTREE_TRANSITION_NOT_PENDING');
+      if (value.checkpointConfigSha256) check(command.outcome !== 'moved', 'CHECKPOINT_POLICY_UNVERIFIED');
+      check(value.purpose === command.purpose, 'WORKTREE_EFFECT_SCOPE_MISMATCH');
       const claimed = state.tasks.find(t => t.id === value.taskID);
       check(claimed.claimant === actor.agentId && claimed.claimGeneration === value.claimGeneration, 'STALE_TASK_CLAIM');
+      if (resourceEstablishment(value)) {
+        check(!destinationMovementHoldsOwner(state, value), 'DESTINATION_MOVEMENT_UNRESOLVED');
+        check(command.outcome !== 'moved', 'WORKTREE_EFFECT_SCOPE_MISMATCH');
+        if (command.cleanupReceipt) {
+          check(command.outcome === 'failed' && matchesCleanup(command.cleanupReceipt, value), 'RESOURCE_CLEANUP_MISMATCH');
+          check(!value.cleanupReceipt || JSON.stringify(value.cleanupReceipt) === JSON.stringify(command.cleanupReceipt), 'RESOURCE_CLEANUP_MISMATCH');
+          value.cleanupReceipt = command.cleanupReceipt;
+        } else check(!value.resourceReceipt || command.outcome === 'uncertain', 'RESOURCE_OWNERSHIP_RETAINED');
+        if (command.outcome === 'established') check(command.resourceReceipt?.phase === 'constructed', 'RESOURCE_PLAN_MISMATCH');
+        check(!command.resourceReceipt || ['established', 'uncertain'].includes(command.outcome) && matchesResource(command.resourceReceipt, value), 'RESOURCE_PLAN_MISMATCH');
+        check(!command.resourceReceipt || !value.resourceReceipt || JSON.stringify(command.resourceReceipt) === JSON.stringify(value.resourceReceipt), 'RESOURCE_OWNERSHIP_RETAINED');
+        if (command.outcome !== 'uncertain') check(command.configurationDigest === value.configurationDigest && command.actualLocation === value.from, 'CONFIGURATION_CHANGED');
+        if (command.resourceReceipt) value.resourceReceipt = command.resourceReceipt;
+      } else {
+        if (value.pluginProvenanceDigest) check(command.outcome !== 'moved', 'PLUGIN_PROVENANCE_UNVERIFIED');
+        if (value.nativeAuthorityObservationDigest) check(command.outcome !== 'moved', 'NATIVE_AUTHORITY_OBSERVATION_UNVERIFIED');
+        // The gateway independently verifies cancellation before invoking the
+        // reducer; a caller-supplied receipt is never proof on its own.
+        if (value.destinationOwners) {
+          check(command.outcome === 'uncertain' && !command.destinationCancellation ||
+            command.outcome === 'failed' && command.destinationCancellation?.transitionID === value.id &&
+            command.destinationCancellation.stepID === value.destinationOwners.stepID, 'DESTINATION_MOVEMENT_PROOF_REQUIRED');
+          if (command.destinationCancellation) value.destinationCancellation = command.destinationCancellation;
+        } else check(!command.destinationCancellation, 'WORKTREE_EFFECT_SCOPE_MISMATCH');
+        check(command.outcome !== 'established' && !command.resourceReceipt, 'WORKTREE_EFFECT_SCOPE_MISMATCH');
       if (command.outcome !== 'uncertain') {
         check(command.configurationDigest === value.configurationDigest && command.authorityDigest === value.authorityDigest, 'CONFIGURATION_CHANGED');
         check(command.actualLocation === (command.outcome === 'moved' ? value.to : value.from), 'UNEXPECTED_WORKTREE_LOCATION');
+      }
       }
       Object.assign(value, { status: command.outcome, actualLocation: command.actualLocation, receiptID: command.receiptID, settledAt: now });
       emit(`worktree.${command.outcome}`, value.id);
       if (command.outcome === 'uncertain') incident('capability', value.id); break;
     }
     case 'task.admission': {
-      const value = task(); adapter(value);
+      const value = task(); adapter(value); observationGeneration(value);
       const recovering = value.status === 'uncertain' && !!value.executionScope && !value.stoppedEvidence && command.outcome === 'admitted' && command.admissionID === value.nativeAdmissionID;
       check(value.status === 'dispatching' || recovering, 'TASK_NOT_DISPATCHING');
       if (value.executionScope) check(command.admissionID === value.nativeAdmissionID, 'ADMISSION_KEY_REQUIRED');
@@ -353,27 +479,53 @@ export function reduceControl(previous, input, suppliedContext) {
       if (recovering) value.status = 'dispatching';
       state.evidence.push({ id: command.receiptID, channel: channel.id, entityID: value.id, agentId: actor.agentId, kind: command.outcome, at: now, attempt: value.attempt });
       if (command.outcome === 'unadmitted') value.status = 'claimed';
-      if (command.outcome === 'uncertain') { value.status = 'uncertain'; incident('admission', value.id); }
+      if (command.outcome === 'uncertain') {
+        value.stopGeneration = Math.min(Number.MAX_SAFE_INTEGER, value.stopGeneration + 1);
+        delete value.stoppedEvidence;
+        value.status = 'uncertain'; incident('admission', value.id);
+      }
       emit(`task.${command.outcome}`, value.id); break;
     }
     case 'task.started': {
-      const value = task(); adapter(value); check(value.status === 'dispatching' && value.admission === 'admitted', 'ADMISSION_REQUIRED');
+      const value = task(); adapter(value); observationGeneration(value); check(value.status === 'dispatching' && value.admission === 'admitted', 'ADMISSION_REQUIRED');
       state.evidence.push({ id: command.evidenceID, channel: channel.id, entityID: value.id, agentId: actor.agentId, kind: 'started', at: now, attempt: value.attempt });
       value.status = 'running'; value.lastProgressAt = now; value.deadlineIncident = false; emit('task.started', value.id); break;
     }
     case 'task.uncertain': {
-      const value = task(); adapter(value); check(['dispatching', 'running', 'uncertain'].includes(value.status), 'TASK_NOT_ACTIVE');
-      value.status = 'uncertain'; incident('admission', value.id); emit('task.uncertain', value.id); break;
+      const value = task(); adapter(value);
+      const terminal = ['completed', 'cancelled'].includes(value.status);
+      check(['dispatching', 'running', 'uncertain', 'review'].includes(value.status) || (terminal && value.dispatchIntentID), 'TASK_NOT_ACTIVE');
+      // Retain the historical stop record, but it cannot settle newly reported
+      // uncertainty for this attempt or authorize reassignment/capacity release.
+      if (terminal) {
+        value.terminalHold = true; // Preserve accepted result and its historical stop record.
+        value.terminalHoldGeneration = Math.min(Number.MAX_SAFE_INTEGER, value.terminalHoldGeneration + 1);
+      }
+      if (!terminal) {
+        value.stopGeneration = Math.min(Number.MAX_SAFE_INTEGER, value.stopGeneration + 1);
+        delete value.stoppedEvidence;
+      }
+      // Keep a durable participant report pending review; it is not stop proof.
+      if (!terminal && value.status !== 'review') value.status = 'uncertain';
+      incident('admission', value.id); emit('task.uncertain', value.id); break;
     }
     case 'task.progress': {
-      const value = task(); adapter(value); check(value.status === 'running', 'TASK_NOT_RUNNING');
+      const value = task(); adapter(value); observationGeneration(value); check(value.status === 'running', 'TASK_NOT_RUNNING');
       value.lastProgressAt = now; value.deadlineIncident = false; emit('task.progress', value.id, undefined, false); break;
     }
     case 'task.stopped': {
-      const value = task(); adapter(value); check(['dispatching', 'running', 'uncertain', 'review'].includes(value.status), 'TASK_NOT_ACTIVE');
+      const value = task(); adapter(value);
+      const terminal = ['completed', 'cancelled'].includes(value.status);
+      check(['dispatching', 'running', 'uncertain', 'review'].includes(value.status) || (terminal && value.terminalHold), 'TASK_NOT_ACTIVE');
+      // Zero is legacy/unbound; exhaustion stays quarantined. This is a broker
+      // ordering fence, not proof of native observation freshness or ownership.
+      if (terminal) check(value.terminalHoldGeneration > 0 && value.terminalHoldGeneration < Number.MAX_SAFE_INTEGER &&
+        command.holdGeneration === value.terminalHoldGeneration, 'STALE_TERMINAL_HOLD');
+      else observationGeneration(value);
       value.stoppedEvidence = command.evidenceID;
+      value.terminalHold = false;
       state.evidence.push({ id: command.evidenceID, channel: channel.id, entityID: value.id, agentId: actor.agentId, kind: 'stopped', at: now, attempt: value.attempt });
-      if (value.status !== 'review') value.status = 'uncertain'; emit('task.stopped', value.id); break;
+      if (!terminal && value.status !== 'review') value.status = 'uncertain'; emit('task.stopped', value.id); break;
     }
     case 'task.reassign': {
       check(!transitionPending(command.taskID), 'WORKTREE_TRANSITION_UNRESOLVED');
@@ -418,14 +570,15 @@ export function reduceControl(previous, input, suppliedContext) {
       }
       break;
   }
-  return { state: validateControlState(state), events };
+  return { state: validateControlState(state, storageOptions), events };
 }
 
 export function readyTasks(state, channel, now) {
   return state.tasks.filter(t => t.channel === channel && t.status === 'claimed' && (!t.schedule || t.schedule.at <= now) &&
+    !state.transitions.some(transition => transition.agentId === t.claimant && transitionHoldsConversation(transition)) &&
     !state.tasks.some(other => other.id !== t.id && other.claimant === t.claimant && occupiesSlot(other)) &&
     (!t.schedule || now <= t.schedule.at + t.schedule.maxLatenessMs || t.schedule.missed === 'run_late' || t.missedDecision === 'run') &&
     t.missedDecision !== 'skip' &&
-    (!t.deadlineAt || t.deadlineAt > now) && t.dependencies.every(id => state.tasks.find(dep => dep.id === id)?.status === 'completed'))
+    (!t.deadlineAt || t.deadlineAt > now) && t.dependencies.every(id => state.tasks.some(dep => dep.id === id && dep.status === 'completed' && !dep.terminalHold)))
     .sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt || a.id.localeCompare(b.id));
 }

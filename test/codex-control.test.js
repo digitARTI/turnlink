@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { writeFileSync, rmSync } from 'node:fs';
+import { writeFileSync, rmSync, unlinkSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { privateTemp } from '../src/storage.js';
 import { createBroker } from '../src/broker.js';
@@ -17,10 +17,10 @@ async function eventually(check) {
   for (let i = 0; i < 100; i++) { if (await check()) return; await delay(75); }
   throw new Error('Codex control condition timed out');
 }
-async function fixture(t, extraEnv = {}) {
+async function fixture(t, extraEnv = {}, brokerOptions = {}) {
   const root = privateTemp(join(tmpdir(), 'turnlink-codex-control-'));
   const adapterFile = join(root, 'adapter.token'); writeFileSync(adapterFile, '3'.repeat(64), { mode: 0o600 });
-  const broker = createBroker({ directory: join(root, 'broker'), port: 0, secret: '1'.repeat(64), adminSecret: '2'.repeat(64), controlPlane: true });
+  const broker = createBroker({ directory: join(root, 'broker'), port: 0, secret: '1'.repeat(64), adminSecret: '2'.repeat(64), controlPlane: true, ...brokerOptions });
   await once(broker.server, 'listening');
   const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, token: '1'.repeat(64), credentialDirectory: join(root, 'proofs') };
   const participant = new ChannelClient(options), admin = new ChannelClient({ ...options, token: '2'.repeat(64) });
@@ -136,4 +136,84 @@ test('resumed Codex thread with unknown lifecycle cannot be woken by a role offe
   f.send({ id: 400, method: 'turn/start', params: { threadId: 'b', input: [{ type: 'text', text: 'Human authorized turn' }] } });
   await f.admitted();
   assert.equal(f.roleCalls()[0].params.method, 'turn/steer');
+});
+
+test('live Codex proxy obeys paused queue and steer policies while preserving approvals and refusing ambiguous replay', async t => {
+  const f = await fixture(t, { AGENT_CHANNEL_RPC_TIMEOUT_MS: '80' }, { controlEffects: true, sweepIntervalMs: 20 });
+  const proposalID = await f.appoint(); await f.admitted();
+  await f.run(f.participant, 'master.accept', { proposalID, promptVersion: 1 });
+  const generation = (await f.query('channel')).channel.active.generation;
+  const policy = async wakePolicy => {
+    const result = await f.run(f.participant, 'action.request', { generation, operation: 'change_wake_policy', target: 'codex:b', evidence: 'not_applicable', wakePolicy });
+    await eventually(() => f.broker.store.effectReceipts?.[result.commandID]?.outcome === 'succeeded');
+  };
+  await f.participant.request('join', { harness: 'opencode', sessionId: 'sender', name: 'sender', channel: 'dev', role: 'fixture', project: { name: 'fixture', root: '/fixture' } });
+  const send = text => f.participant.request('send', { agentId: 'opencode:sender', to: 'codex:b', text, messageId: text });
+  const peerCalls = text => f.output.filter(m => m.method === 'fixture/received' && m.params.input?.[0]?.text?.includes(text));
+  await policy('paused');
+  const held = await send('policy-paused'); await delay(150);
+  assert.equal(peerCalls('policy-paused').length, 0); assert.deepEqual(f.broker.store.messages.find(m => m.id === held.id).offered, []);
+  await policy('queue'); await delay(2100);
+  assert.equal(peerCalls('policy-paused').length, 0, 'queue waits for the active native turn');
+  f.send({ id: 801, method: 'fixture/finish', params: { threadId: 'b' } });
+  await eventually(() => peerCalls('policy-paused').length === 1);
+  assert.equal(peerCalls('policy-paused')[0].params.method, 'turn/start');
+  await policy('steer');
+  await send('policy-steer'); await eventually(() => peerCalls('policy-steer').length === 1);
+  assert.equal(peerCalls('policy-steer')[0].params.method, 'turn/steer');
+  f.send({ id: 802, method: 'fixture/approval', params: { threadId: 'b' } }); await eventually(() => f.output.some(m => m.id === 999));
+  await send('approval-policy-held'); await delay(2100);
+  assert.equal(peerCalls('approval-policy-held').length, 0, 'steer does not answer pending native approval');
+  f.send({ id: 999, result: { decision: 'approved' } });
+  await eventually(() => peerCalls('approval-policy-held').length === 1);
+  f.send({ id: 803, method: 'fixture/finish', params: { threadId: 'b' } }); await delay(100);
+  const uncertain = await send('delay-admission-policy');
+  await eventually(async () => (await f.query('evidence')).entries.some(e => e.entityID === uncertain.id && e.kind === 'uncertain'));
+  await delay(2100); assert.equal(peerCalls('delay-admission-policy').length, 1, 'unknown native admission is never replayed');
+  const record = (await f.query('evidence')).entries.find(e => e.entityID === uncertain.id && e.kind === 'uncertain');
+  await assert.rejects(f.run(f.participant, 'action.request', { generation, operation: 'retry_delivery', target: 'codex:b', messageID: uncertain.id,
+    evidence: 'known_unadmitted', evidenceID: record.id }), /EVIDENCE_REQUIRED/);
+});
+
+test('known Codex native acceptance survives a failed recovery finish and restart without another native call', async t => {
+  const faultRoot = privateTemp(join(tmpdir(), 'turnlink-codex-finish-fault-'));
+  t.after(() => rmSync(faultRoot, { recursive: true, force: true }));
+  const preload = join(faultRoot, 'transport-fault.mjs'), block = join(faultRoot, 'block-finish');
+  const actionID = randomUUID(), evidenceID = randomUUID();
+  writeFileSync(block, 'hold finish transport', { mode: 0o600 });
+  writeFileSync(preload, `import { ChannelClient } from ${JSON.stringify(new URL('../src/client.js', import.meta.url).href)};
+import { existsSync } from 'node:fs';
+const request = ChannelClient.prototype.request;
+let prepared = false;
+ChannelClient.prototype.request = async function(method, params = {}) {
+  if (method === 'control_delivery_finish' && existsSync(${JSON.stringify(block)})) throw new Error('Fixture finish RPC unavailable');
+  if (method === 'control_delivery_pull' && !prepared) {
+    prepared = true;
+    await request.call(this, 'control_adapter', { agentId: params.agentId, credential: params.credential, command: {
+      id: ${JSON.stringify(evidenceID)}, op: 'evidence.record', channel: 'dev', entityID: params.messageID, kind: 'unadmitted' } });
+    await request.call(this, 'control_command', { agentId: params.agentId, command: {
+      id: ${JSON.stringify(actionID)}, op: 'action.request', channel: 'dev', generation: 1, target: params.agentId,
+      operation: 'retry_delivery', messageID: params.messageID, evidence: 'known_unadmitted', evidenceID: ${JSON.stringify(evidenceID)} } });
+    for (let i = 0; i < 100; i++) {
+      const value = await request.call(this, 'control_query', { agentId: params.agentId, channel: 'dev', view: 'actions' });
+      if (value.entries.find(a => a.id === ${JSON.stringify(actionID)})?.status === 'succeeded') break;
+      await new Promise(resolve => setTimeout(resolve, 75));
+    }
+  }
+  return request.call(this, method, params);
+};`);
+  const f = await fixture(t, { NODE_OPTIONS: `--import=${new URL(`file://${preload}`).href}` }, { controlEffects: true, sweepIntervalMs: 20 });
+  const proposalID = await f.appoint(); await f.admitted();
+  await f.run(f.participant, 'master.accept', { proposalID, promptVersion: 1 });
+  await f.participant.request('join', { harness: 'opencode', sessionId: 'sender', name: 'sender', channel: 'dev', role: 'fixture', project: { name: 'fixture', root: '/fixture' } });
+  const message = await f.participant.request('send', { agentId: 'opencode:sender', to: 'codex:b', text: 'native-finish-restart', messageId: 'native-finish-restart' });
+  const calls = () => f.output.filter(m => m.method === 'fixture/received' && m.params.input?.[0]?.text?.includes('native-finish-restart'));
+  await eventually(() => calls().length === 1);
+  const ledger = () => new AdmissionLedger('local', 'codex:b', f.options.credentialDirectory);
+  await eventually(() => ledger().get(message.id)?.state === 'accepted');
+  assert.equal(f.broker.store.deliveryRetries[actionID].outcome, undefined);
+  assert.equal(f.broker.store.messages.find(m => m.id === message.id).delivered.length, 0);
+  await f.stop(); unlinkSync(block); await f.start();
+  await eventually(() => f.broker.store.deliveryRetries[actionID].outcome === 'admitted' && f.broker.store.messages.find(m => m.id === message.id).delivered.includes('codex:b'));
+  assert.equal(calls().length, 1);
 });

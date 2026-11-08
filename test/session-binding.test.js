@@ -22,6 +22,30 @@ test('tool-argument shaped identity is never treated as Codex outer metadata', (
   assert.throws(() => codexStdioSession({ arguments: meta(one) }), /missing or inconsistent/);
   assert.throws(() => codexStdioSession({ ...meta(one), threadId: '../victim' }), /missing or inconsistent/);
 });
+test('Claude MCP binds joins to the session ID supplied to its server process', async t => {
+  const root = privateTemp(join(tmpdir(), 'turnlink-claude-binding-'));
+  const token = '1'.repeat(64), admin = '2'.repeat(64);
+  const broker = createBroker({ port: 0, directory: join(root, 'broker'), secret: token, adminSecret: admin });
+  await once(broker.server, 'listening');
+  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve('src/mcp.js'), '--claude-channel'],
+    env: { ...process.env, AGENT_CHANNEL_SESSION_ID: '', CLAUDE_CODE_SESSION_ID: one, AGENT_CHANNEL_TOKEN: token,
+      AGENT_CHANNEL_URL: `ws://127.0.0.1:${broker.server.address().port}`, AGENT_CHANNEL_CREDENTIAL_DIR: join(root, 'keys') }, stderr: 'pipe' });
+  const mcp = new Client({ name: 'synthetic-claude', version: '1' });
+  t.after(async () => { await mcp.close(); await broker.close(); rmSync(root, { recursive: true, force: true }); });
+  await mcp.connect(transport);
+  const args = { harness: 'claude', sessionId: one, name: 'claude-test', role: 'test', channel: 'development', project: { name: 'fixture', root: '/fixture' } };
+  assert.ok((await mcp.callTool({ name: 'channel_join', arguments: { ...args, sessionId: two } })).isError);
+  const accepted = await mcp.callTool({ name: 'channel_join', arguments: args });
+  assert.ok(!accepted.isError, JSON.stringify(accepted));
+  assert.equal(broker.store.agents[`claude:${one}`].name, 'claude-test');
+});
+test('Claude MCP refuses conflicting explicit and native session bindings', async t => {
+  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve('src/mcp.js'), '--claude-channel'],
+    env: { ...process.env, AGENT_CHANNEL_SESSION_ID: two, CLAUDE_CODE_SESSION_ID: one }, stderr: 'pipe' });
+  const mcp = new Client({ name: 'synthetic-claude', version: '1' });
+  t.after(() => mcp.close().catch(() => {}));
+  await assert.rejects(mcp.connect(transport));
+});
 test('metadata-bound MCP isolates sessions in one process and rejects model identity overrides', async t => {
   const root = privateTemp(join(tmpdir(), 'turnlink-metadata-binding-'));
   const token = '1'.repeat(64), admin = '2'.repeat(64);

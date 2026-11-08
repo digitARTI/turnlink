@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { privateTemp } from '../src/storage.js';
 import { digest } from '../src/config.js';
-import { NativeWorktreeSnapshotReader } from '../src/worktree-snapshot.js';
+import { NativeWorktreeSnapshotReader, inspectNativeWorktreePair } from '../src/worktree-snapshot.js';
 import { makeOpenCodeSnapshotSource, makeCodexSnapshotSource } from '../src/native-snapshot-source.js';
 
 function fixture(t, harness = 'opencode') {
@@ -27,6 +27,25 @@ function fixture(t, harness = 'opencode') {
   return { root, project, destination, home, globalDirectory, observation, options,
     reader: extra => new NativeWorktreeSnapshotReader({ ...options, ...extra }) };
 }
+
+test('native source project check accepts only distinct worktrees in the same Git project', async t => {
+  const f = fixture(t, 'codex'), nested = join(f.destination, 'nested'), foreign = join(f.root, 'foreign');
+  mkdirSync(nested); mkdirSync(foreign);
+  execFileSync('git', ['init', '--quiet', foreign], { stdio: 'ignore' });
+  const pair = inspectNativeWorktreePair(f.project, f.destination);
+  assert.equal(pair.source, f.project); assert.equal(pair.destination, f.destination);
+  assert.match(pair.projectID, /^[a-f0-9]{64}$/);
+  assert.deepEqual(inspectNativeWorktreePair(f.project, f.destination), pair);
+  const gitLink = join(f.destination, '.git'), original = readFileSync(gitLink);
+  writeFileSync(gitLink, 'gitdir: /temporary/foreign\n'); writeFileSync(gitLink, original);
+  const restored = inspectNativeWorktreePair(f.project, f.destination);
+  assert.equal(restored.projectID, pair.projectID);
+  assert.notDeepEqual(restored.metadata, pair.metadata, 'rewriting and restoring the worktree link must invalidate its observation');
+  assert.throws(() => inspectNativeWorktreePair(f.project, foreign), /WORKTREE_PROJECT_MISMATCH/);
+  assert.throws(() => inspectNativeWorktreePair(f.project, f.project), /WORKTREE_PROJECT_MISMATCH/);
+  assert.throws(() => inspectNativeWorktreePair(f.project, nested), /WORKTREE_PROJECT_MISMATCH/);
+  assert.throws(() => inspectNativeWorktreePair('relative', f.destination), /ABSOLUTE_SNAPSHOT_ROOT_REQUIRED/);
+});
 
 test('offline native snapshots preserve identity, inventory ancestor/global/project guidance, and never authorize movement', async t => {
   const f = fixture(t);

@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { rmSync, readFileSync, unlinkSync } from 'node:fs';
+import { rmSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { privateTemp } from '../src/storage.js';
 import { digest } from '../src/config.js';
 import { createBroker } from '../src/broker.js';
@@ -61,7 +61,7 @@ async function fixture(t, { enabled = true, requiresWorktree = false, master = t
   const runtime = () => makeOpenCodeTasks({ ctx, channel: worker, sessions, options: { tasks: true, credentialDirectory: options.credentialDirectory },
     signal: controller.signal, ownSession: async () => session(), refreshBlockers: async () => !native.blocked, credential: () => '3'.repeat(64), log: error => errors.push(error) });
   const query = async view => (await admin.request('control_query', { channel: 'dev', view })).entries;
-  return { worker, reviewer, admin, run, query, native, state, runtime, errors, taskID: created.commandID, root, messages, options };
+  return { worker, reviewer, admin, run, query, native, state, runtime, errors, taskID: created.commandID, root, messages, options, ctx };
 }
 
 test('authenticated task execution reaches review only after adapter artifact/stop evidence and explicit participant report', async t => {
@@ -78,11 +78,192 @@ test('authenticated task execution reaches review only after adapter artifact/st
   assert.equal((await f.query('tasks'))[0].status, 'completed');
 });
 
+test('a task notification during an empty pull is retained for the next poll', async t => {
+  const f = await fixture(t), runtime = f.runtime(), request = f.worker.request.bind(f.worker);
+  let releasePull, pulling;
+  const entered = new Promise(resolve => { pulling = resolve; });
+  const release = new Promise(resolve => { releasePull = resolve; });
+  t.after(() => releasePull());
+  let first = true;
+  f.worker.request = async (method, params) => {
+    if (method === 'control_task_pull' && first) {
+      first = false; pulling(); await release; return { task: null };
+    }
+    return request(method, params);
+  };
+  const poll = runtime.poll('worker');
+  await entered;
+  await runtime.watch('worker');
+  await runtime.poll('worker');
+  releasePull(); await poll;
+  assert.equal(f.state.taskPending, true);
+  await runtime.poll('worker');
+  assert.deepEqual(f.errors, []);
+  assert.equal(f.native.tasks, 1);
+  assert.equal((await f.query('tasks'))[0].status, 'review');
+});
+
+test('an empty pull without a new notification clears the pending poll', async t => {
+  const f = await fixture(t), runtime = f.runtime(), request = f.worker.request.bind(f.worker);
+  f.worker.request = (method, params) => method === 'control_task_pull' ? Promise.resolve({ task: null }) : request(method, params);
+  await runtime.poll('worker');
+  assert.deepEqual(f.errors, []);
+  assert.equal(f.state.taskPending, false);
+  assert.equal(f.native.tasks, 0);
+});
+
+test('OpenCode callbacks carry a nonzero dispatch-journal epoch after evidence-backed reassignment', async t => {
+  const f = await fixture(t), request = f.worker.request.bind(f.worker);
+  const prior = (await request('control_task_pull', { agentId: 'opencode:worker', credential: '3'.repeat(64), channel: 'dev', cwd: f.root, scopeDigest: 'a'.repeat(64) })).task;
+  for (const [op, fields] of [['task.uncertain', {}], ['task.stopped', { evidenceID: randomUUID(), stopGeneration: 1 }]]) {
+    await request('control_adapter', { agentId: 'opencode:worker', credential: '3'.repeat(64), command: { id: randomUUID(), channel: 'dev', op,
+      taskID: f.taskID, attempt: prior.attempt, ...fields } });
+  }
+  await f.run(f.admin, 'task.reassign', { taskID: f.taskID }); await f.run(f.worker, 'task.claim', { taskID: f.taskID });
+  const callbacks = [];
+  f.worker.request = async (method, params) => {
+    if (['task.admission', 'task.started', 'task.progress', 'task.stopped'].includes(params?.command?.op)) callbacks.push(params.command);
+    return request(method, params);
+  };
+  await f.runtime().poll('worker'); assert.deepEqual(f.errors, []);
+  assert.equal((await f.query('tasks'))[0].status, 'review'); assert.equal(f.native.tasks, 1); assert.equal(f.native.reports, 1);
+  assert.deepEqual(new Set(callbacks.map(c => c.op)), new Set(['task.admission', 'task.started', 'task.progress', 'task.stopped']));
+  assert.ok(callbacks.every(c => c.stopGeneration === 1));
+});
+
+test('late terminal uncertainty retains OpenCode journals and refuses pull without replaying native work/reporting', async t => {
+  const f = await fixture(t); await f.runtime().poll('worker');
+  const task = (await f.query('tasks'))[0];
+  await f.run(f.reviewer, 'task.review', { taskID: f.taskID, generation: 1, evidenceID: task.result.evidence[0], accept: true });
+  await f.worker.request('control_adapter', { agentId: 'opencode:worker', credential: '3'.repeat(64), command: { id: randomUUID(), channel: 'dev',
+    op: 'task.uncertain', taskID: f.taskID, attempt: task.attempt } });
+  const path = join(f.root, 'proofs', digest('local'), `${digest('opencode:worker')}.tasks.json`), original = readFileSync(path, 'utf8');
+  for (let i = 0; i < 2; i++) {
+    delete f.state.taskJournal; f.state.taskPending = true; await f.runtime().poll('worker');
+    assert.equal(readFileSync(path, 'utf8'), original); assert.equal(f.native.tasks, 1); assert.equal(f.native.reports, 1);
+  }
+  const queued = (await f.run(f.admin, 'task.create', { title: 'Next', instructions: 'Wait for hold', criteria: 'No admission', requiresWorktree: false })).commandID;
+  await f.run(f.worker, 'task.claim', { taskID: queued });
+  assert.deepEqual(await f.worker.request('control_task_pull', { agentId: 'opencode:worker', credential: '3'.repeat(64), channel: 'dev', cwd: f.root, scopeDigest: 'a'.repeat(64) }), { task: null, held: true });
+  assert.equal((await f.query('tasks')).find(t => t.id === queued).status, 'claimed');
+  assert.equal((await f.query('tasks')).find(t => t.id === f.taskID).terminalHold, true); assert.deepEqual(f.errors, []);
+});
+
+for (const boundary of ['artifact', 'stopped']) test(`OpenCode preserves the old observation epoch across ${boundary} uncertainty and journal reconstruction`, async t => {
+  const f = await fixture(t), request = f.worker.request.bind(f.worker); let injected = false;
+  f.worker.request = async (method, params) => {
+    const result = await request(method, params);
+    if (!injected && (boundary === 'artifact' ? params?.command?.kind === 'artifact' : params?.command?.op === 'task.stopped')) {
+      injected = true; const task = (await f.query('tasks'))[0];
+      await request('control_adapter', { agentId: 'opencode:worker', credential: '3'.repeat(64), command: { id: randomUUID(), channel: 'dev',
+        op: 'task.uncertain', taskID: f.taskID, attempt: task.attempt } });
+    }
+    return result;
+  };
+  await f.runtime().poll('worker'); assert.ok(injected);
+  const path = join(f.root, 'proofs', digest('local'), `${digest('opencode:worker')}.tasks.json`), original = readFileSync(path, 'utf8');
+  for (let i = 0; i < 2; i++) {
+    delete f.state.taskJournal; f.state.taskPending = true; await f.runtime().poll('worker');
+    assert.equal(readFileSync(path, 'utf8'), original); assert.equal(f.native.tasks, 1); assert.equal(f.native.reports, 0);
+  }
+  const task = (await f.query('tasks'))[0]; assert.equal(task.stopGeneration, 1); assert.equal(task.stoppedEvidence, undefined);
+  assert.equal(JSON.parse(original).records[0].task.stopGeneration, 0);
+  if (boundary === 'artifact') assert.equal(f.errors.at(-1).code, 'STALE_STOP_GENERATION'); else assert.deepEqual(f.errors, []);
+});
+
 test('lost native admission response recovers with the exact native key after adapter restart, without duplicate execution', async t => {
   const f = await fixture(t); f.native.loseAdmission = true;
   await f.runtime().poll('worker'); assert.equal((await f.query('tasks'))[0].status, 'uncertain');
+  const context = f.ctx.session.context;
+  f.ctx.session.context = async (...args) => {
+    const record = JSON.parse(readFileSync(join(f.root, 'proofs', digest('local'), `${digest('opencode:worker')}.tasks.json`), 'utf8')).records[0];
+    assert.equal(record.observationGeneration, 1, 'capture is durable before collecting native segment evidence');
+    return context(...args);
+  };
   delete f.state.taskJournal; await f.runtime().poll('worker');
   assert.equal(f.native.tasks, 1); assert.equal(f.native.reports, 1); assert.equal((await f.query('tasks'))[0].status, 'review');
+  const record = JSON.parse(readFileSync(join(f.root, 'proofs', digest('local'), `${digest('opencode:worker')}.tasks.json`), 'utf8')).records[0];
+  assert.equal(record.task.stopGeneration, 0); assert.equal(record.observationGeneration, 1);
+});
+
+test('repeated OpenCode lost-admission responses replay the original uncertainty receipt without retagging it', async t => {
+  const f = await fixture(t); f.native.loseAdmission = true; await f.runtime().poll('worker');
+  const prompt = f.ctx.session.prompt; f.ctx.session.prompt = async () => { throw new Error('second lost native response'); };
+  delete f.state.taskJournal; await f.runtime().poll('worker');
+  assert.equal((await f.query('tasks'))[0].stopGeneration, 1); assert.equal(f.native.tasks, 1); assert.equal(f.native.reports, 0);
+  assert.ok(!f.errors.some(e => e.code === 'COMMAND_ID_REUSE' || e.code === 'STALE_STOP_GENERATION'));
+  f.ctx.session.prompt = prompt; delete f.state.taskJournal; await f.runtime().poll('worker');
+  assert.equal((await f.query('tasks'))[0].status, 'review'); assert.equal(f.native.tasks, 1); assert.equal(f.native.reports, 1);
+});
+
+for (const boundary of ['additional uncertainty', 'foreign receipt', 'cached proof', 'during observation']) test(`OpenCode admission recovery refuses ${boundary} rather than retagging proof`, async t => {
+  const f = await fixture(t), request = f.worker.request.bind(f.worker); f.native.loseAdmission = true; let injected = false;
+  const uncertain = async () => {
+    const task = (await f.query('tasks'))[0];
+    await request('control_adapter', { agentId: 'opencode:worker', credential: '3'.repeat(64), command: { id: randomUUID(), channel: 'dev', op: 'task.uncertain', taskID: task.id, attempt: task.attempt } });
+  };
+  f.worker.request = async (method, params) => {
+    if (boundary === 'foreign receipt' && params?.command?.op === 'task.admission' && params.command.outcome === 'uncertain') {
+      return request(method, { ...params, command: { ...params.command, receiptID: randomUUID() } });
+    }
+    if (boundary === 'during observation' && !injected && params?.command?.op === 'task.admission' && params.command.outcome === 'admitted') {
+      injected = true; await uncertain();
+    }
+    return request(method, params);
+  };
+  await f.runtime().poll('worker'); assert.equal((await f.query('tasks'))[0].stopGeneration, 1);
+  const path = join(f.root, 'proofs', digest('local'), `${digest('opencode:worker')}.tasks.json`);
+  if (boundary === 'additional uncertainty') await uncertain();
+  if (boundary === 'cached proof') {
+    const saved = JSON.parse(readFileSync(path, 'utf8')); saved.records[0].outputDigest = 'a'.repeat(64);
+    writeFileSync(path, JSON.stringify(saved), { mode: 0o600 });
+  }
+  const before = readFileSync(path, 'utf8'); delete f.state.taskJournal; f.state.taskPending = true; await f.runtime().poll('worker');
+  if (boundary !== 'during observation') assert.equal(readFileSync(path, 'utf8'), before);
+  else {
+    assert.ok(injected); const record = JSON.parse(readFileSync(path, 'utf8')).records[0];
+    assert.equal(record.task.stopGeneration, 0); assert.equal(record.observationGeneration, 1);
+    assert.equal(f.errors.at(-1).code, 'STALE_STOP_GENERATION');
+  }
+  const retained = readFileSync(path, 'utf8'); delete f.state.taskJournal; f.state.taskPending = true; await f.runtime().poll('worker');
+  assert.equal(readFileSync(path, 'utf8'), retained); assert.equal(f.native.tasks, 1); assert.equal(f.native.reports, 0);
+  assert.equal((await f.query('tasks'))[0].stoppedEvidence, undefined);
+});
+
+for (const invalidate of [false, true]) test(`OpenCode rechecks stop eligibility after native scope reads before retrying a report notice (uncertainty: ${invalidate})`, async t => {
+  const f = await fixture(t), prompt = f.ctx.session.prompt;
+  f.ctx.session.prompt = async input => {
+    if (input.metadata.source === 'turnlink-task-result') throw new Error('report notice not submitted');
+    return prompt(input);
+  };
+  await f.runtime().poll('worker');
+  const path = join(f.root, 'proofs', digest('local'), `${digest('opencode:worker')}.tasks.json`);
+  const before = readFileSync(path, 'utf8');
+  assert.equal(JSON.parse(before).records[0].phase, 'reporting');
+  assert.ok((await f.query('tasks'))[0].stoppedEvidence);
+  f.ctx.session.prompt = prompt;
+  const list = f.ctx.tool.list;
+  let injected = false;
+  f.ctx.tool.list = async () => {
+    if (!injected) {
+      injected = true;
+      if (invalidate) {
+        const task = (await f.query('tasks'))[0];
+        await f.worker.request('control_adapter', { agentId: 'opencode:worker', credential: '3'.repeat(64), command: {
+          id: randomUUID(), channel: 'dev', op: 'task.uncertain', taskID: task.id, attempt: task.attempt } });
+      }
+    }
+    return list();
+  };
+  delete f.state.taskJournal; f.state.taskPending = true; await f.runtime().poll('worker');
+  assert.ok(injected); assert.equal(f.native.tasks, 1);
+  if (!invalidate) {
+    assert.equal(f.native.reports, 1); assert.equal((await f.query('tasks'))[0].status, 'review'); return;
+  }
+  assert.equal(f.native.reports, 0);
+  assert.equal(f.state.taskPending, false); assert.equal(readFileSync(path, 'utf8'), before);
+  const task = (await f.query('tasks'))[0];
+  assert.equal(task.status, 'uncertain'); assert.equal(task.stoppedEvidence, undefined);
 });
 
 test('lost artifact acknowledgement reuses the immutable artifact even when later native context advances', async t => {
@@ -178,12 +359,16 @@ test('the enabled task gate still rejects an authenticated Codex receiver and ad
 test('lost stop acknowledgement recovers without repeating execution or duplicating stop evidence', async t => {
   const f = await fixture(t), request = f.worker.request.bind(f.worker); let lost = false;
   f.worker.request = async (method, params) => {
+    if (params?.command?.op === 'task.stopped') assert.equal(Object.hasOwn(params.command, 'stopGeneration'), false, 'zero-generation retries preserve the pre-upgrade fingerprint');
     const result = await request(method, params);
     if (!lost && params?.command?.op === 'task.stopped') { lost = true; throw new Error('lost stop acknowledgement'); }
     return result;
   };
   await f.runtime().poll('worker');
   const before = (await f.query('tasks'))[0]; assert.ok(before.stoppedEvidence); assert.equal(f.native.reports, 0);
+  const path = join(f.root, 'proofs', digest('local'), `${digest('opencode:worker')}.tasks.json`);
+  const legacy = JSON.parse(readFileSync(path, 'utf8')); for (const record of legacy.records) delete record.task.stopGeneration;
+  writeFileSync(path, JSON.stringify(legacy), { mode: 0o600 });
   delete f.state.taskJournal; await f.runtime().poll('worker');
   const after = (await f.query('tasks'))[0];
   assert.equal(after.status, 'review'); assert.equal(after.stoppedEvidence, before.stoppedEvidence);
