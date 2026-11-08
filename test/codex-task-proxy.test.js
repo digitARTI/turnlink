@@ -66,7 +66,14 @@ async function fixture(t, extraEnv = {}, manual = false, brokerOverrides = {}) {
     await eventually(() => output.some(m => m.id === id));
     if (waitForReceiver) await eventually(async () => (await admin.request('control_query', { channel: 'dev', view: 'channel' })).members.find(m => m.agentId === 'codex:worker')?.connected);
   };
-  const stop = async () => { if (child && child.exitCode === null && child.signalCode === null) { child.kill(); await once(child, 'exit'); } };
+  const stop = async () => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const exited = once(child, 'exit');
+      if (process.platform === 'win32') execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      else child.kill();
+      await exited;
+    }
+  };
   t.after(async () => { await stop(); participant.close(); reviewer.close(); admin.close(); await broker.close(); rmSync(root, { recursive: true, force: true }); });
   await participant.request('join', { harness: 'codex', sessionId: 'worker', channel: 'dev', name: 'worker', role: 'existing role', project: { name: 'fixture', root } });
   await reviewer.request('join', { harness: 'opencode', sessionId: 'reviewer', channel: 'dev', name: 'reviewer', role: 'review', project: { name: 'fixture', root } });
@@ -104,7 +111,7 @@ test('Codex proxy leaves native version unknown when the server response does no
   assert.equal(health.report.nativeVersion, undefined);
 });
 
-for (const managed of [false, true]) test(`Codex proxy resumes a manually moved task using the operator-attested receipt${managed ? ' with managed worktree lifecycle' : ''}`, { timeout: 30000 }, async t => {
+for (const managed of [false, true]) test(`Codex proxy resumes a manually moved task using the operator-attested receipt${managed ? ' with managed worktree lifecycle' : ''}`, { timeout: process.platform === 'win32' ? 60000 : 30000 }, async t => {
   const f = await fixture(t, { AGENT_CHANNEL_CODEX_WORKTREE_TASKS: '1' }, true, { managedRecords: managed }); await f.claim();
   let destination = join(f.root, 'destination'), created, lifecycleSettings;
   const operatorState = join(f.root, 'operator-state');
@@ -132,6 +139,7 @@ for (const managed of [false, true]) test(`Codex proxy resumes a manually moved 
     await f.start('thread/resume', f.root);
   } else mkdirSync(destination);
   const tools = new ToolSession(f.reviewer, { harness: 'opencode', sessionId: 'reviewer' });
+  t.after(() => tools.clearSessionWatches());
   tools.agentId = 'opencode:reviewer'; tools.channel = 'dev';
   const previewID = (await tools.call('channel_manual_preview', { taskID: f.taskID, destination })).commandID;
   await f.run(f.admin, 'worktree.approve', { taskID: f.taskID, previewID });
@@ -189,6 +197,7 @@ test('Codex proxy reconnects after a manual transfer to a different broker host'
   await f.claim();
   const destination = join(f.root, 'destination'); mkdirSync(destination);
   const tools = new ToolSession(f.reviewer, { harness: 'opencode', sessionId: 'reviewer' });
+  t.after(() => tools.clearSessionWatches());
   tools.agentId = 'opencode:reviewer'; tools.channel = 'dev';
   const previewID = (await tools.call('channel_manual_preview', { taskID: f.taskID, destination })).commandID;
   await f.run(f.admin, 'worktree.approve', { taskID: f.taskID, previewID });
