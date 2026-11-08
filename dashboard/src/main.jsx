@@ -6,13 +6,14 @@ import { MantineProvider, createTheme, DEFAULT_THEME, AppShell, Group, Text, Tit
 import '@mantine/core/styles.css';
 import './style.css';
 import { api } from './api.js';
+import { initialTaskForm, taskFields } from './task-form.js';
 
 const theme = createTheme({ primaryColor: 'teal', primaryShade: 9, defaultRadius: 'sm', fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
   colors: { teal: [...DEFAULT_THEME.colors.teal.slice(0, 8), '#087f5b', '#066649'] },
   headings: { fontFamily: 'inherit', fontWeight: '600' } });
 const modeLabel = { safe: 'Safe automatic', automatic: 'Automatic', approval: 'Approval required' };
-const sections = ['Overview', 'Tasks', 'Messages', 'Incidents', 'Actions', 'Governance', 'Evidence', 'Events', 'Activity', 'Storage'];
-const viewFor = { Overview: 'channel', Governance: 'channel', Tasks: 'tasks', Messages: 'messages', Incidents: 'incidents', Actions: 'actions', Evidence: 'evidence', Events: 'events', Activity: 'activity' };
+const sections = ['Overview', 'Tasks', 'Messages', 'Incidents', 'Actions', 'Governance', 'Evidence', 'Events', 'Activity', 'Health', 'Notifications', 'Storage'];
+const viewFor = { Overview: 'channel', Governance: 'channel', Tasks: 'tasks', Messages: 'messages', Incidents: 'incidents', Actions: 'actions', Evidence: 'evidence', Events: 'events', Activity: 'activity', Health: 'health', Notifications: 'notifications' };
 const stamp = value => value == null ? 'Not available' : new Date(value).toLocaleString();
 const count = value => typeof value === 'number' ? value.toLocaleString() : 'Not available';
 const identifier = value => <Code className="identifier">{value || 'None'}</Code>;
@@ -66,9 +67,9 @@ function Paged({ data, columns, row }) {
   </Table></Table.ScrollContainer>;
 }
 function Tasks({ data, propose, disabled }) {
-  const [opened, setOpened] = useState(false), [form, setForm] = useState({ title: '', instructions: '', criteria: '' });
+  const [opened, setOpened] = useState(false), [form, setForm] = useState(initialTaskForm), [formError, setFormError] = useState('');
   return <Stack><Group justify="space-between"><Text className="muted">Claims are voluntary. Only the master can accept a participant’s result.</Text>
-    <Button disabled={disabled} onClick={() => setOpened(true)}>New task</Button></Group>
+    <Button disabled={disabled} onClick={() => { setFormError(''); setOpened(true); }}>New task</Button></Group>
     {!data.entries.length && <Empty>Create a task, then let a participant explicitly claim it. No task runs merely because it appears here.</Empty>}
     {data.entries.map(task => <Paper key={task.id} withBorder p="md"><Group justify="space-between" align="start">
       <div><Text fw={600}>{task.title}</Text>{identifier(task.id)}</div><StateBadge value={task.status} /></Group>
@@ -76,22 +77,46 @@ function Tasks({ data, propose, disabled }) {
         <Text size="sm">Attempt {task.attempt}</Text><Text size="sm">{task.requiresWorktree ? 'Worktree required · blocked' : 'Existing conversation'}</Text></Group>
       {task.schedule && <Text size="sm" mt="xs">Scheduled: {stamp(task.schedule.at)} · missed policy: {task.schedule.missed}</Text>}
       {task.deadlineAt && <Text size="sm">Deadline: {stamp(task.deadlineAt)}</Text>}
+      {task.terminalHold && <Alert mt="sm" color="red" styles={{ label: { color: 'var(--mantine-color-text)' } }} title="Terminal task: stop-confirmation hold">The recorded completion or cancellation is preserved. Later uncertainty blocks capacity reuse and managed workspace effects; historical stop evidence is not a current release receipt. Broker hold generation: {task.terminalHoldGeneration || 'legacy/unbound'}.</Alert>}
+      {task.status === 'review' && !task.stoppedEvidence && <Alert mt="sm" color="yellow" styles={{ label: { color: 'var(--mantine-color-text)' } }} title="Review held: stop evidence missing">The participant report is retained. Master acceptance and capacity reuse remain blocked until matching stop evidence is recorded. No native work was stopped by this view.</Alert>}
       <details className="detail"><summary>Instructions, criteria and result</summary><Stack gap="xs" mt="sm">
         <Text fw={600} size="sm">Instructions</Text><Text className="collaboration">{task.instructions}</Text>
         <Text fw={600} size="sm">Acceptance criteria</Text><Text className="collaboration">{task.criteria}</Text>
         {task.result && <><Text fw={600} size="sm">Participant report</Text><Text className="collaboration">{task.result.summary}</Text><Text size="sm">Artifact references: {task.result.evidence.join(', ')}</Text></>}
         <Text size="sm">Stop evidence: {task.stoppedEvidence || 'Not recorded'}</Text>
         <Text size="sm">Dependencies: {task.dependencies.length ? task.dependencies.join(', ') : 'None'}</Text>
+        <Text size="sm">Progress timeout: {task.progressTimeoutMs / 1000} seconds</Text>
       </Stack></details>
       {task.schedule?.missed === 'ask' && !task.missedDecision && ['open', 'claimed'].includes(task.status) && Date.now() > task.schedule.at + task.schedule.maxLatenessMs &&
         <Group mt="md"><Button size="xs" disabled={disabled} onClick={() => propose('task.missed', { taskID: task.id, run: true })}>Preview run late</Button>
           <Button size="xs" variant="default" disabled={disabled} onClick={() => propose('task.missed', { taskID: task.id, run: false })}>Preview skip</Button></Group>}
+      {['claimed', 'running', 'uncertain'].includes(task.status) && <Stack gap="xs" mt="md">
+        <Text size="sm" className="muted">Reassignment only reopens this task for voluntary claims. It does not stop native work or grant cleanup authority.</Text>
+        {task.admission === 'unadmitted' || task.stoppedEvidence || (task.status === 'claimed' && task.admission === 'none' && !task.dispatchIntentID)
+          ? <Button size="xs" variant="default" disabled={disabled} onClick={() => propose('task.reassign', { taskID: task.id })}>Preview reassignment</Button>
+          : <Text size="sm">Reassignment blocked: matching non-start, unadmitted or stop evidence is required.</Text>}
+      </Stack>}
     </Paper>)}
     <Modal opened={opened} onClose={() => setOpened(false)} title="New task" size="lg" transitionProps={{ duration: 0 }} closeButtonProps={{ 'aria-label': 'Close task form' }}>
-      <form onSubmit={event => { event.preventDefault(); setOpened(false); propose('task.create', { ...form, requiresWorktree: false }); }}><Stack>
+      <form onSubmit={event => { event.preventDefault();
+        try { const fields = taskFields(form); setFormError(''); setOpened(false); propose('task.create', fields); }
+        catch (error) { setFormError(error.message); }
+      }}><Stack>
         <TextInput label="Title" maxLength={200} required value={form.title} onChange={e => setForm({ ...form, title: e.currentTarget.value })} />
         <Textarea label="Instructions" description="Collaboration content, not an override of native instructions or permissions." minRows={4} maxLength={12000} required value={form.instructions} onChange={e => setForm({ ...form, instructions: e.currentTarget.value })} />
         <Textarea label="Acceptance criteria" minRows={3} maxLength={4000} required value={form.criteria} onChange={e => setForm({ ...form, criteria: e.currentTarget.value })} />
+        <Textarea label="Dependency task IDs" description="Optional existing tasks in this channel; separate UUIDs with commas or new lines. All dependencies must be completed before dispatch. Claims remain voluntary." minRows={2} maxLength={2400} value={form.dependencies} onChange={e => setForm({ ...form, dependencies: e.currentTarget.value })} />
+        <SimpleGrid cols={{ base: 1, sm: 2 }}>
+          <TextInput label="Priority" description="0–100; higher values are offered first." type="number" required min={0} max={100} step={1} value={form.priority} onChange={e => setForm({ ...form, priority: e.currentTarget.value })} />
+          <TextInput label="Progress timeout (seconds)" description="Flags missing progress; never proves execution stopped." type="number" required min={1} max={2592000} step={1} value={form.progressTimeoutSeconds} onChange={e => setForm({ ...form, progressTimeoutSeconds: e.currentTarget.value })} />
+          <TextInput label="Scheduled start (UTC)" description="Optional. Enter UTC, not your local timezone." type="datetime-local" step={60} min="1970-01-01T00:00" value={form.scheduledAt} onChange={e => setForm({ ...form, scheduledAt: e.currentTarget.value })} />
+          <TextInput label="Deadline (UTC)" description="Optional. Deadline alerts do not stop native work." type="datetime-local" step={60} min="1970-01-01T00:00" value={form.deadlineAt} onChange={e => setForm({ ...form, deadlineAt: e.currentTarget.value })} />
+        </SimpleGrid>
+        {form.scheduledAt && <><Select label="Missed-schedule policy" allowDeselect={false} value={form.missed} onChange={value => setForm({ ...form, missed: value })} data={[
+          { value: 'ask', label: 'Ask the operator (default)' }, { value: 'skip', label: 'Skip without running' }, { value: 'run_late', label: 'Run late when otherwise eligible' },
+        ]} />
+          <TextInput label="Maximum lateness (seconds)" description="After this window, apply the selected missed-schedule policy. No policy bypasses dependencies, capacity or native approvals." type="number" required min={1} max={2592000} step={1} value={form.maxLatenessSeconds} onChange={e => setForm({ ...form, maxLatenessSeconds: e.currentTarget.value })} /></>}
+        {formError && <Alert color="red" title="Task not previewed" role="alert">{formError}</Alert>}
         <Text size="sm" className="muted">Uses the existing conversation/cwd only. Managed worktree execution is unavailable.</Text><Button type="submit">Preview task</Button>
       </Stack></form>
     </Modal>
@@ -134,7 +159,7 @@ function ChannelOverview({ data, info }) {
 function Storage({ status }) {
   const { storage, activity } = status;
   return <Stack><Group><Title order={2} size="h3">Storage pressure</Title><StateBadge value={storage.pressure.level} /></Group>
-    <Text className="muted">Export does not reclaim durable receipt capacity. Never delete unresolved evidence to make space.</Text>
+    <Text className="muted">Export alone preserves records. The operator CLI can reclaim command receipts from a verified private archive; unresolved evidence remains protected.</Text>
     {storage.unresolved && <SimpleGrid cols={{ base: 2, sm: 4 }} spacing="md">{Object.entries(storage.unresolved).map(([name, value]) => <div className="readout" key={name}><Text size="sm" className="muted">Unresolved {name}</Text><Text fw={600} className="numeric">{count(value)}</Text></div>)}</SimpleGrid>}
     <Table.ScrollContainer minWidth={600} type="native" tabIndex={0} role="region" aria-label="Storage quotas table"><Table verticalSpacing="sm"><Table.Thead><Table.Tr><Table.Th>Resource</Table.Th><Table.Th>Used</Table.Th><Table.Th>Limit</Table.Th><Table.Th>Pressure</Table.Th></Table.Tr></Table.Thead>
       <Table.Tbody>{storage.quotas.map(q => <Table.Tr key={q.resource}><Table.Td>{q.resource.replaceAll('_', ' ')}</Table.Td><Table.Td className="numeric">{count(q.used)}</Table.Td><Table.Td className="numeric">{count(q.limit)}</Table.Td><Table.Td><StateBadge value={q.level} /></Table.Td></Table.Tr>)}</Table.Tbody></Table></Table.ScrollContainer>
@@ -151,7 +176,7 @@ function Workspace({ session, expired }) {
   const [preview, setPreview] = useState(null), [pending, setPending] = useState(false), [notice, setNotice] = useState(null), [uncertain, setUncertain] = useState(false);
   useEffect(() => { const timer = setInterval(() => { if (!document.hidden) setTick(n => n + 1); }, 15000); return () => clearInterval(timer); }, []);
   const status = useRemote('/api/status', tick, expired), view = viewFor[section], cursor = cursors.at(-1);
-  const path = !view || (section === 'Messages' && !messageConsent) ? null : `/api/channels/${encodeURIComponent(channel)}/${view}?${['activity', 'events'].includes(view) ? 'after' : 'offset'}=${cursor}`;
+  const path = !view || (section === 'Messages' && !messageConsent) ? null : `/api/channels/${encodeURIComponent(channel)}/${view}?${['activity', 'events', 'notifications'].includes(view) ? 'after' : 'offset'}=${cursor}`;
   const resource = useRemote(path, tick, expired), disabled = pending || uncertain || status.value?.control.available !== true;
   const navigate = value => { setSection(value); setCursors([0]); setMessageConsent(false); setMobile(false); };
   const propose = async (op, fields = {}) => {
@@ -166,12 +191,12 @@ function Workspace({ session, expired }) {
     setPending(true);
     try {
       const result = await api('/api/execute', { csrf: session.csrf, body: { previewID: preview.previewID } });
-      setNotice({ message: 'Broker command recorded.', commandID: result.commandID }); setPreview(null); setTick(n => n + 1);
+      setNotice({ message: preview.command.op === 'notification.ack' ? 'Notification marked as seen. No recovery or resolution was performed.' : 'Broker command recorded.', commandID: result.commandID }); setPreview(null); setTick(n => n + 1);
     } catch (error) {
       if (error.status === 401) expired();
       else {
         const unknown = !error.status || ['COMMAND_OUTCOME_UNCERTAIN', 'COMMAND_UNCERTAIN_OR_PENDING'].includes(error.message);
-        setUncertain(unknown); setNotice({ error: error.message, commandID: error.commandID || preview.command.id, commandChannel: preview.command.channel, uncertain: unknown }); setPreview(null);
+        setUncertain(unknown); setNotice({ error: error.message, commandID: error.commandID || preview.command.id, commandChannel: preview.command.channel, notification: preview.command.op === 'notification.ack', uncertain: unknown }); setPreview(null);
       }
     } finally { setPending(false); }
   }
@@ -181,8 +206,8 @@ function Workspace({ session, expired }) {
   }
   async function checkReceipt() {
     try {
-      const receipt = await api(`/api/receipt?channel=${encodeURIComponent(notice.commandChannel)}&commandID=${encodeURIComponent(notice.commandID)}`);
-      setNotice(old => ({ ...old, receipt }));
+      const receipt = await api(notice.notification ? `/api/notification?channel=${encodeURIComponent(notice.commandChannel)}&id=${encodeURIComponent(notice.commandID)}` : `/api/receipt?channel=${encodeURIComponent(notice.commandChannel)}&commandID=${encodeURIComponent(notice.commandID)}`);
+      setNotice(old => ({ ...old, receipt: notice.notification ? { known: receipt.acknowledgedAt !== null } : receipt }));
     } catch (error) { if (error.status === 401) expired(); else setNotice(old => ({ ...old, receiptError: error.message })); }
   }
   const page = resource.value, info = status.value?.control;
@@ -201,7 +226,7 @@ function Workspace({ session, expired }) {
           {notice.error && <Text size="sm">{notice.error}</Text>}{notice.commandID && <Text size="sm">Command: {identifier(notice.commandID)}</Text>}
           {notice.uncertain && <Stack gap="xs" mt="sm"><Text size="sm">Inspect the broker’s durable receipt using this exact command ID before taking further action. Controls remain disabled in this view.</Text>
             <Button size="xs" variant="default" onClick={checkReceipt}>Check receipt</Button>
-            {notice.receipt && <Text size="sm">{notice.receipt.known ? 'Broker receipt found. This proves a recorded command, not native execution or task completion.' : 'No receipt is visible yet. This is not proof that the operation cannot still arrive or execute. Do not repeat it.'}</Text>}
+            {notice.receipt && <Text size="sm">{notice.receipt.known ? notice.notification ? 'Acknowledgement receipt found. Only this notice was marked as seen; no resolution or recovery occurred.' : 'Broker receipt found. This proves a recorded command, not native execution or task completion.' : 'No receipt is visible yet. This is not proof that the operation cannot still arrive or execute. Do not repeat it.'}</Text>}
             {notice.receiptError && <Text size="sm">Receipt lookup unavailable: {notice.receiptError}</Text>}</Stack>}</Alert>}
         {section === 'Storage' ? status.value ? <Storage status={status.value} /> : !status.error && <Loading />
           : section === 'Messages' && !messageConsent ? <Alert title="Private collaboration content" color="gray">
@@ -219,9 +244,17 @@ function Workspace({ session, expired }) {
               <Paged data={page} columns={['Operation', 'Target', 'Evidence', 'Status', 'Decision']} row={a => <><Table.Td>{a.operation.replaceAll('_', ' ')}<Text size="xs" className="muted">{a.id}</Text></Table.Td><Table.Td>{identifier(a.target)}</Table.Td><Table.Td>{a.evidence}</Table.Td><Table.Td><StateBadge value={a.status} /></Table.Td><Table.Td>
                 {a.status === 'awaiting_approval' ? <Stack gap="xs"><Group gap="xs"><Button size="xs" disabled={disabled || !info?.effectsEnabled || !info?.effectOperations?.includes(a.operation)} onClick={() => propose('action.approve', { actionID: a.id })}>Preview approval</Button>
                   <Button size="xs" variant="default" disabled={disabled} onClick={() => propose('action.reject', { actionID: a.id })}>Preview rejection</Button></Group>{(!info?.effectsEnabled || !info?.effectOperations?.includes(a.operation)) && <Text size="xs">Executor unavailable</Text>}</Stack> : 'No decision pending'}</Table.Td></>} /></Stack>}
-            {section === 'Activity' && <Stack><Text className="muted">Metadata observations only. An offer, acknowledgement or disconnect is not native stop proof.</Text><Paged data={page} columns={['Observed', 'Type', 'Participant', 'Message']} row={a => <><Table.Td>{stamp(a.at)}</Table.Td><Table.Td>{a.type}</Table.Td><Table.Td>{identifier(a.agentId)}</Table.Td><Table.Td>{identifier(a.messageID)}</Table.Td></>} /></Stack>}
+             {section === 'Activity' && <Stack><Text className="muted">Metadata observations only. An offer, acknowledgement or disconnect is not native stop proof.</Text><Paged data={page} columns={['Observed', 'Type', 'Participant', 'Message']} row={a => <><Table.Td>{stamp(a.at)}</Table.Td><Table.Td>{a.type}</Table.Td><Table.Td>{identifier(a.agentId)}</Table.Td><Table.Td>{identifier(a.messageID)}</Table.Td></>} /></Stack>}
+             {section === 'Health' && <Stack><Alert color="gray" title="Observational metadata only">Fresh idle observations are not native stop proof or permission to replay work. Unreported, stale and unknown states are not healthy confirmations.</Alert>
+               <Paged data={page} columns={['Participant', 'Observation', 'Native snapshot', 'Turnlink queue', 'Blockers', 'Uncertainty', 'Received']} row={h => <>
+                 <Table.Td>{identifier(h.agentId)}</Table.Td><Table.Td><StateBadge value={h.status} /></Table.Td>
+                 <Table.Td>{h.fresh ? h.report?.nativeStatus || 'Unknown' : 'Not current'}<Text size="xs" className="muted">{h.report ? `Adapter ${h.report.adapterVersion} · native ${h.report.nativeVersion || 'Not reported'}` : 'Health reporting not observed'}</Text></Table.Td>
+                 <Table.Td>{count(h.report?.queuedMessages)}</Table.Td><Table.Td>{count(h.report?.blockers)}</Table.Td><Table.Td><Text size="sm">Messages: {count(h.report?.uncertainMessages)}</Text><Text size="sm">Tasks: {count(h.uncertainTasks)}</Text></Table.Td><Table.Td>{stamp(h.observedAt)}</Table.Td></>} /></Stack>}
             {section === 'Evidence' && <Stack><Text className="muted">Adapter records are distinct from participant reports and master acceptance. Artifact references do not independently prove correctness.</Text><Paged data={page} columns={['Kind', 'Entity', 'Adapter', 'Recorded', 'Reference']} row={e => <><Table.Td>{e.kind}</Table.Td><Table.Td>{identifier(e.entityID)}</Table.Td><Table.Td>{identifier(e.agentId)}</Table.Td><Table.Td>{stamp(e.at)}</Table.Td><Table.Td><details><summary>Evidence details</summary><Code block className="command-preview" tabIndex={0} role="region" aria-label="Evidence record">{JSON.stringify(e, null, 2)}</Code></details></Table.Td></>} /></Stack>}
-            {section === 'Events' && <Paged data={page} columns={['Time', 'Event', 'Actor', 'Entity']} row={e => <><Table.Td>{stamp(e.at)}</Table.Td><Table.Td>{e.type}</Table.Td><Table.Td>{e.actor.kind}{e.actor.agentId && <Text size="xs">{e.actor.agentId}</Text>}</Table.Td><Table.Td>{identifier(e.entityID)}</Table.Td></>} />}
+             {section === 'Events' && <Paged data={page} columns={['Time', 'Event', 'Actor', 'Entity']} row={e => <><Table.Td>{stamp(e.at)}</Table.Td><Table.Td>{e.type}</Table.Td><Table.Td>{e.actor.kind}{e.actor.agentId && <Text size="xs">{e.actor.agentId}</Text>}</Table.Td><Table.Td>{identifier(e.entityID)}</Table.Td></>} />}
+             {section === 'Notifications' && <Stack><Alert color="gray" title="Durable operator inbox">Event-backed notices survive reconnects and broker restarts. Reading is not acknowledgement. Marking a notice as seen does not resolve an incident, accept a task or authorize recovery. OS background delivery is not enabled.</Alert>
+               <Paged data={page} columns={['Time', 'Notification', 'Entity', 'Seen', 'Acknowledgement']} row={n => <><Table.Td>{stamp(n.at)}</Table.Td><Table.Td>{n.type}</Table.Td><Table.Td>{identifier(n.entityID)}</Table.Td><Table.Td>{n.acknowledgedAt === null ? 'Not acknowledged' : stamp(n.acknowledgedAt)}</Table.Td><Table.Td>
+                 {n.acknowledgedAt === null ? <Button size="xs" disabled={disabled} onClick={() => propose('notification.ack', { id: n.id })}>Preview acknowledgement</Button> : 'Recorded'}</Table.Td></>} /></Stack>}
             {Array.isArray(page.entries) && <Group justify="space-between"><Button variant="default" size="xs" disabled={cursors.length === 1} onClick={() => setCursors(old => old.slice(0, -1))}>Previous page</Button>
               <Text size="xs" className="muted">Page {cursors.length} · {page.entries.length} records</Text><Button variant="default" size="xs" disabled={!page.entries.length || page.next <= cursor} onClick={() => setCursors(old => [...old, page.next])}>Next page</Button></Group>}
           </>}
@@ -230,7 +263,7 @@ function Workspace({ session, expired }) {
     <Modal opened={!!preview} onClose={() => { if (!pending) setPreview(null); }} closeOnClickOutside={!pending} closeOnEscape={!pending} withCloseButton={!pending} title="Confirm broker command" size="lg" transitionProps={{ duration: 0 }} closeButtonProps={{ 'aria-label': 'Close confirmation' }}>
       {preview && <Stack><Text size="sm">{preview.notice}</Text><Text size="sm">Current policy: {modeLabel[preview.current.mode]} · revision {preview.current.policyRevision}. Master: {preview.current.master || 'None'} · generation {preview.current.generation}.</Text>
         {preview.current.proposedMaster && <Text size="sm">Pending replacement: {preview.current.proposedMaster}</Text>}
-        {preview.proposal && <Code block className="command-preview" tabIndex={0} role="region" aria-label="Affected recovery proposal">{JSON.stringify(preview.proposal, null, 2)}</Code>}
+        {preview.proposal && <Code block className="command-preview" tabIndex={0} role="region" aria-label={preview.command.op === 'task.create' ? 'Task scheduling details' : 'Affected recovery proposal'}>{JSON.stringify(preview.proposal, null, 2)}</Code>}
         <Code block className="command-preview" tabIndex={0} role="region" aria-label="Exact broker command">{JSON.stringify(preview.command, null, 2)}</Code><Text size="sm" className="muted">Expires {stamp(preview.expiresAt)}. Stale policy or authority changes invalidate this preview.</Text>
         <Group justify="end"><Button variant="default" disabled={pending} onClick={() => setPreview(null)}>Cancel</Button><Button onClick={execute} loading={pending} disabled={disabled}>Confirm command</Button></Group></Stack>}
     </Modal>

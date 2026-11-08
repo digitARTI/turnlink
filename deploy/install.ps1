@@ -1,10 +1,12 @@
+param([string]$Profile = $env:USERPROFILE)
 $ErrorActionPreference = 'Stop'
+if (-not $Profile) { throw 'A Windows profile path is required' }
 $root = 'C:\ProgramData\agent-channel'
 if (-not (Test-Path $root -PathType Container)) { throw 'Deployment directory missing' }
 Set-Location $root
 & 'C:\Program Files\nodejs\npm.cmd' ci --no-audit --no-fund
 if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
-& 'C:\Program Files\nodejs\node.exe' "$root\deploy\configure.js" $root 'C:\Users\Administrator' --prepare
+& 'C:\Program Files\nodejs\node.exe' "$root\deploy\configure.js" $root $Profile --prepare
 if ($LASTEXITCODE -ne 0) { throw 'Launcher preparation failed' }
 & "$root\bin\agent-channel-codex.exe" --version
 if ($LASTEXITCODE -ne 0) { throw 'Launcher passthrough check failed' }

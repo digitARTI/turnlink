@@ -10,6 +10,13 @@ import { privateTemp } from '../src/storage.js';
 import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
 import { openCodeFixture } from './fixtures/opencode.js';
+import { setupOpenCode } from '../adapters/opencode-runtime.js';
+
+test('OpenCode refuses retired automatic transfer configuration', async () => {
+  for (const options of [{ receiverHandoff: true }, { initialMovement: true }, { movementTokenFile: '/unused' }]) {
+    await assert.rejects(setupOpenCode({ app: { version: '2.2.6' }, options }), /Automatic native transfer is not supported/);
+  }
+});
 
 test('OpenCode role notices use native idempotent admission without changing existing agent/model/permissions', async t => {
   const root = privateTemp(join(tmpdir(), 'turnlink-opencode-control-'));
@@ -64,4 +71,32 @@ test('OpenCode role notices use native idempotent admission without changing exi
   for (let i = 0; i < 100; i++) { if (f.calls.some(c => c.metadata?.kind === 'ended')) break; await delay(30); }
   assert.equal(f.calls.find(c => c.metadata?.kind === 'ended').resume, false);
   f.cleanup();
+});
+
+test('OpenCode restores the claimed task watch after an explicit join in a moved session', async t => {
+  const root = privateTemp(join(tmpdir(), 'turnlink-opencode-task-rejoin-'));
+  const tokenFile = join(root, 'host.token'), adapterTokenFile = join(root, 'adapter.token');
+  writeFileSync(tokenFile, '1'.repeat(64), { mode: 0o600 }); writeFileSync(adapterTokenFile, '3'.repeat(64), { mode: 0o600 });
+  const broker = createBroker({ directory: join(root, 'broker'), port: 0, secret: '1'.repeat(64), adminSecret: '2'.repeat(64), controlPlane: true, taskDispatch: true });
+  await once(broker.server, 'listening');
+  const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, tokenFile, credentialDirectory: join(root, 'proofs'),
+    control: true, tasks: true, worktreeTasks: true, adapterTokenFile };
+  const admin = new ChannelClient({ ...options, token: '2'.repeat(64) });
+  t.after(async () => { admin.close(); await broker.close(); rmSync(root, { recursive: true, force: true }); });
+  const command = (op, fields = {}) => ({ id: randomUUID(), op, channel: 'dev', ...fields });
+  await admin.request('control_command', { command: command('channel.configure') });
+  await admin.request('control_enroll_adapter', { hostId: 'local', credential: '3'.repeat(64) });
+  const first = await openCodeFixture(t, options), context = { sessionID: 'b' };
+  await first.tools.channel_join.execute({ channel: 'dev', name: 'b', role: 'fixture', project: { name: 'fixture' } }, context);
+  const taskID = (await admin.request('control_command', { command: command('task.create', { title: 'Resume', instructions: 'fixture', criteria: 'fixture', requiresWorktree: true }) })).commandID;
+  await first.tools.channel_control.execute({ command: command('task.claim', { taskID }) }, context);
+  first.emit('session.moved', { sessionID: 'b', directory: '/projects/destination' });
+  for (let i = 0; i < 100 && first.storage.has('memberships/b'); i++) await delay(20);
+  assert.equal(first.storage.has('memberships/b'), false);
+  const resumed = await openCodeFixture(t, options, { location: { directory: '/projects/destination' }, session: {
+    get: async ({ sessionID }) => ({ id: sessionID, location: { directory: '/projects/destination' }, agent: 'plan', model: { providerID: 'fixture', id: 'test' } }),
+  } });
+  await resumed.tools.channel_join.execute({ channel: 'dev', name: 'b', role: 'fixture', project: { name: 'fixture' } }, context);
+  assert.equal(resumed.storage.get('memberships/b')?.taskWatch, true);
+  assert.equal((await admin.request('control_query', { channel: 'dev', view: 'tasks', entityID: taskID })).entries[0].status, 'claimed');
 });

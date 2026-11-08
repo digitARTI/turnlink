@@ -88,7 +88,7 @@ test('real Codex proxy preserves governance/cwd and completes the native MCP tas
       cwd: project, env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: join(home, '.codex'), TURNLINK_FIXTURE_KEY: 'fixture-only',
         AGENT_CHANNEL_CODEX_EXECUTABLE: process.env.TURNLINK_CODEX_EXECUTABLE || 'codex', AGENT_CHANNEL_URL: options.url,
         AGENT_CHANNEL_TOKEN: options.token, AGENT_CHANNEL_CREDENTIAL_DIR: options.credentialDirectory,
-        AGENT_CHANNEL_CONTROL: '1', AGENT_CHANNEL_CODEX_TASKS: '1', AGENT_CHANNEL_ADAPTER_TOKEN_FILE: adapterFile }, stdio: ['pipe', 'pipe', 'pipe'],
+        AGENT_CHANNEL_CONTROL: '1', AGENT_CHANNEL_CODEX_TASKS: '1', AGENT_CHANNEL_HEALTH: '1', AGENT_CHANNEL_ADAPTER_TOKEN_FILE: adapterFile }, stdio: ['pipe', 'pipe', 'pipe'],
     });
     const childClosed = once(child, 'close');
     const pending = new Map(), nativeRequests = []; let sequence = 0, diagnostics = '';
@@ -225,4 +225,12 @@ test('real Codex proxy preserves governance/cwd and completes the native MCP tas
     const taskState = await rpc('thread/resume', { threadId: before.thread.id, excludeTurns: true });
     assert.equal(taskState.thread.id, roleState.thread.id); assert.equal(taskState.cwd, roleState.cwd); assert.equal(taskState.model, roleState.model);
     assert.deepEqual(taskState.sandbox, roleState.sandbox); assert.deepEqual(taskState.approvalPolicy, roleState.approvalPolicy);
+    let health;
+    for (let i = 0; i < 150; i++) {
+      health = (await admin.request('control_query', { channel: 'gate', view: 'health' })).entries.find(h => h.agentId === `codex:${before.thread.id}`);
+      if (health?.report) break;
+      await delay(20);
+    }
+    assert.equal(health?.coverage, 'observational'); assert.equal(health?.fresh, true);
+    assert.equal(health.report.features.tasks, true); assert.equal(health.report.features.managedWorktrees, false);
   });

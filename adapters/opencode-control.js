@@ -7,7 +7,7 @@ import { digest, identity, validateCredential } from '../src/config.js';
 export function makeOpenCodeControl({ ctx, channel, sessions, options, signal, ownSession, refreshBlockers, log }) {
   const poll = async sessionID => {
     const state = sessions.get(sessionID);
-    if (signal.aborted || options.control !== true || !options.adapterTokenFile || !state?.tools.agentId || !state.controlChannel || state.controlPolling) return;
+    if (signal.aborted || options.control !== true || !options.adapterTokenFile || !state?.tools.agentId || !state.controlChannel || state.controlPolling || state.handoffPending) return;
     state.controlPolling = true;
     const generation = state.generation;
     const valid = () => !signal.aborted && state.generation === generation && !!state.tools.agentId;

@@ -17,16 +17,16 @@ import { NativeWorktreeSnapshotReader } from '../src/worktree-snapshot.js';
 import { makeOpenCodeSnapshotSource } from '../src/native-snapshot-source.js';
 
 test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects (local model fixture)',
-  { skip: process.env.TURNLINK_OPENCODE_INTEGRATION !== '1', timeout: 90000 }, async t => {
+  { skip: process.env.TURNLINK_OPENCODE_INTEGRATION !== '1', timeout: process.env.TURNLINK_TEST_STOP_MOVE_REJOIN === '1' ? 150000 : 90000 }, async t => {
     const root = privateTemp(join(tmpdir(), 'turnlink-opencode-service-'));
     const project = join(root, 'project'); mkdirSync(project);
     const home = join(root, 'home'); mkdirSync(home);
     const token = '1'.repeat(64), tokenFile = join(root, 'host.token'), adapterTokenFile = join(root, 'adapter.token');
     writeFileSync(tokenFile, token, { mode: 0o600 });
     writeFileSync(adapterTokenFile, '3'.repeat(64), { mode: 0o600 });
-    const broker = createBroker({ port: 0, secret: token, adminSecret: '2'.repeat(64), directory: join(root, 'broker'), controlPlane: true, taskDispatch: true });
+    const broker = createBroker({ port: 0, secret: token, adminSecret: '2'.repeat(64), directory: join(root, 'broker'), controlPlane: true, controlEffects: true, sweepIntervalMs: 100, taskDispatch: true });
     await once(broker.server, 'listening');
-    const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, tokenFile, credentialDirectory: join(root, 'credentials'), control: true, tasks: true, adapterTokenFile };
+    const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, tokenFile, credentialDirectory: join(root, 'credentials'), control: true, tasks: true, alerts: true, health: true, adapterTokenFile };
     const sender = new ChannelClient(options);
     const admin = new ChannelClient({ ...options, token: '2'.repeat(64) });
     const controlCommand = (op, fields = {}) => ({ id: randomUUID(), op, channel: 'development', ...fields });
@@ -94,10 +94,32 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
       } catch (error) { res.writeHead(500); res.end(String(error)); }
     });
     model.listen(0, '127.0.0.1'); await once(model, 'listening');
+    // Only the isolated test loses one response AFTER actual native admission.
+    const shim = join(root, 'adapters/opencode-recovery'); mkdirSync(shim, { recursive: true });
+    const nativeCalls = join(root, 'native-delivery-calls.jsonl');
+    writeFileSync(join(shim, 'package.json'), JSON.stringify({ name: 'turnlink-opencode-fixture', version: '0.0.0', type: 'module', exports: './index.js' }));
+    writeFileSync(join(shim, 'index.js'), String.raw`import plugin from ${JSON.stringify(pathToFileURL(resolve('adapters/opencode.js')).href)};
+import { appendFileSync } from 'node:fs';
+let lost = false;
+export default { ...plugin, setup(ctx) {
+  const session = new Proxy(ctx.session, { get(target, name) {
+    if (name !== 'prompt') return Reflect.get(target, name);
+    return async (...args) => {
+      const input = args[0];
+      const result = await target.prompt(...args);
+      if (input.metadata?.messageID && input.text.includes('TURNLINK_NATIVE_RESPONSE_LOSS')) {
+        appendFileSync(${JSON.stringify(nativeCalls)}, JSON.stringify({ id: input.id, nativeID: result.id, sessionID: result.sessionID, delivery: input.delivery }) + '\n');
+        if (!lost) { lost = true; throw new Error('Fixture lost response after actual native admission'); }
+      }
+      return result;
+    };
+  } });
+  return plugin.setup(new Proxy(ctx, { get(target, name) { return name === 'session' ? session : Reflect.get(target, name); } }));
+} };`);
     const config = {
       model: 'fixture/test', snapshots: false,
       permissions: [{ action: '*', resource: '*', effect: 'allow' }, { action: 'turnlink.fixture', resource: '*', effect: 'ask' }],
-      plugins: [{ package: pathToFileURL(resolve('adapters/opencode')).href, options }],
+      plugins: [{ package: pathToFileURL(shim).href, options }],
       providers: { fixture: { env: ['TURNLINK_FIXTURE_KEY'], package: '@opencode/ai/providers/openai-compatible',
         settings: { baseURL: `http://127.0.0.1:${model.address().port}/v1` },
         models: { test: { capabilities: { tools: true, input: ['text'], output: ['text'] }, limit: { context: 32000, output: 2048 } } } } },
@@ -114,11 +136,12 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     const reservation = createServer(); reservation.listen(0, '127.0.0.1'); await once(reservation, 'listening');
     const port = reservation.address().port; await new Promise(resolve => reservation.close(resolve));
     const base = `http://127.0.0.1:${port}`;
-    const child = spawn(process.env.TURNLINK_OPENCODE_EXECUTABLE || 'opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port), '--print-logs'], {
+    const spawnService = () => spawn(process.env.TURNLINK_OPENCODE_EXECUTABLE || 'opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port), '--print-logs'], {
       cwd: project, env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, 'config'), XDG_DATA_HOME: join(home, 'data'),
         XDG_CACHE_HOME: join(home, 'cache'), XDG_STATE_HOME: join(home, 'state'), TURNLINK_FIXTURE_KEY: 'fixture-only', OPENCODE_LOG_LEVEL: 'ERROR' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    let child = spawnService();
     let logs = '', password, childError;
     child.on('error', error => { childError = error; });
     const collect = chunk => {
@@ -138,8 +161,9 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
       model.closeAllConnections(); await new Promise(resolve => model.close(resolve));
       await broker.close(); rmSync(root, { recursive: true, force: true });
     });
+    let currentDirectory = project;
     const api = async (path, body, method = body === undefined ? 'GET' : 'POST') => {
-      const response = await fetch(base + path, { method, headers: { 'content-type': 'application/json', 'x-opencode-directory': encodeURIComponent(project),
+      const response = await fetch(base + path, { method, headers: { 'content-type': 'application/json', 'x-opencode-directory': encodeURIComponent(currentDirectory),
         ...(password ? { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}` } : {}) },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.any([t.signal, AbortSignal.timeout(10000)]) });
       if (!response.ok) throw new Error(`${method} ${path}: ${response.status} ${await response.text()}\n${diagnostics()}`);
@@ -158,6 +182,8 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
       throw new Error(`Real-service condition timed out; model requests=${requests.length}; tools=${JSON.stringify(requests.at(-1)?.tools?.map(t => t.function.name))}; tool results=${JSON.stringify(requests.at(-1)?.messages.filter(m => m.role === 'tool'))}\n${diagnostics()}`);
     };
     await wait(async () => { try { return !!await api('/api/info'); } catch { return false; } });
+    const nativeInfo = await api('/api/info'); assert.match(nativeInfo.version, /^2\./);
+    t.diagnostic(`Isolated fixture native version: ${nativeInfo.version}`);
     const session = await api('/api/session', { location: { directory: project }, title: 'Turnlink fixture', agent: 'plan',
       permissions: [{ action: 'edit', resource: '*', effect: 'deny' }] });
     const prefix = `/api/session/${session.id}`;
@@ -167,9 +193,25 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     assert.ok(JSON.stringify(loaded).includes('adapters/opencode'), JSON.stringify(loaded));
     await wait(async () => JSON.stringify(await api('/api/plugin')).includes('turnlink'));
     const pluginStatus = (await api('/api/plugin')).find(p => p.id === 'turnlink');
-    assert.equal(pluginStatus?.state.status, 'active', JSON.stringify(pluginStatus));
+    assert.equal(pluginStatus?.state.status, 'active', JSON.stringify(await api('/api/plugin')));
     await wait(() => !!broker.store.agents[`opencode:${session.id}`]);
     await api(`/api/experimental/session/${session.id}/wait`, {});
+    const alertCallsBefore = requests.length;
+    const alertReply = await api('/api/rpc/turnlink.alerts/snapshot', { input: { sessionID: session.id } });
+    assert.equal(alertReply.output.available, true); assert.equal(alertReply.output.registered, true);
+    assert.equal(alertReply.output.summary.agentId, `opencode:${session.id}`);
+    assert.equal(alertReply.output.summary.channel, 'development');
+    assert.equal(requests.length, alertCallsBefore, 'reading passive alerts must not invoke the model');
+    for (const forbidden of ['credential', 'proof', 'artifact', 'instructions', 'tokenFile', 'authorityDigest'])
+      assert.ok(!JSON.stringify(alertReply).includes(forbidden), `alert RPC leaked ${forbidden}`);
+    let health;
+    await wait(async () => {
+      health = (await admin.request('control_query', { channel: 'development', view: 'health' })).entries.find(h => h.agentId === `opencode:${session.id}`);
+      return !!health?.report;
+    });
+    assert.equal(health.coverage, 'observational'); assert.equal(health.fresh, true); assert.equal(health.report.nativeVersion, nativeInfo.version);
+    assert.equal(health.report.features.managedWorktrees, false);
+    assert.equal(requests.length, alertCallsBefore, 'native health observation must not wake the model');
     await sender.request('join', { harness: 'codex', sessionId: 'sender', name: 'sender', channel: 'development', role: 'fixture', project: { name: 'fixture', root } });
     const send = text => sender.request('send', { agentId: 'codex:sender', to: `opencode:${session.id}`, text, messageId: text });
     const delivered = id => broker.store.messages.find(m => m.id === id)?.delivered.includes(`opencode:${session.id}`);
@@ -216,6 +258,46 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     assert.equal(roleSession.agent, 'plan'); assert.deepEqual(roleSession.permissions, session.permissions);
     const roleRequest = requests.find(r => JSON.stringify(r.messages).includes('Turnlink supplemental master role'));
     assert.ok(roleRequest); assert.match(JSON.stringify(roleRequest.messages), /GLOBAL_WORKTREE_GATE/); assert.match(JSON.stringify(roleRequest.messages), /PROJECT_WORKTREE_GATE/);
+    const generation = (await admin.request('control_query', { channel: 'development', view: 'channel' })).channel.active.generation;
+    const recoveryAction = async fields => {
+      const command = controlCommand('action.request', { generation, target: `opencode:${session.id}`, evidence: 'not_applicable', ...fields });
+      await sender.request('control_command', { agentId: `opencode:${session.id}`, command });
+      await admin.request('control_command', { command: controlCommand('action.approve', { actionID: command.id }) });
+      await wait(() => broker.store.effectReceipts?.[command.id]?.outcome === 'succeeded'); return command.id;
+    };
+    await admin.request('control_command', { command: controlCommand('channel.configure', { mode: 'approval' }) });
+    await recoveryAction({ operation: 'change_wake_policy', wakePolicy: 'paused' });
+    const paused = await send('real policy paused'); await delay(2200); assert.equal(delivered(paused.id), false);
+    await recoveryAction({ operation: 'change_wake_policy', wakePolicy: 'queue' });
+    await wait(() => delivered(paused.id)); await api(`/api/experimental/session/${session.id}/wait`, {});
+    busyReached = false;
+    await api(`${prefix}/prompt`, { text: 'TURNLINK_BUSY' }); await wait(() => busyReached);
+    const queued = await send('real policy queue'); await wait(() => delivered(queued.id));
+    assert.ok((await api(`${prefix}/inbox`)).some(item => item.id === admissionID(session.id, queued.id) && item.delivery === 'queue'));
+    releaseBusy(); await api(`/api/experimental/session/${session.id}/wait`, {});
+    await recoveryAction({ operation: 'change_wake_policy', wakePolicy: 'steer' });
+    busyReached = false;
+    await api(`${prefix}/prompt`, { text: 'TURNLINK_BUSY' }); await wait(() => busyReached);
+    const steered = await send('real policy steer'); await wait(() => delivered(steered.id));
+    assert.ok((await api(`${prefix}/inbox`)).some(item => item.id === admissionID(session.id, steered.id) && item.delivery === 'steer'));
+    releaseBusy(); await api(`/api/experimental/session/${session.id}/wait`, {});
+    const lost = await send('TURNLINK_NATIVE_RESPONSE_LOSS');
+    let replayEvidence;
+    await wait(async () => { replayEvidence = (await admin.request('control_query', { channel: 'development', view: 'evidence' })).entries.find(e => e.entityID === lost.id && e.kind === 'native_idempotent'); return !!replayEvidence; });
+    await delay(2200); assert.equal(delivered(lost.id), false);
+    const attempts = () => readFileSync(nativeCalls, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(attempts().length, 1, 'native uncertain result needs explicit action approval');
+    const nativeBlocker = await api(`${prefix}/permission`, { action: 'turnlink.fixture', resources: ['recovery'] });
+    const retryID = await recoveryAction({ operation: 'retry_delivery', messageID: lost.id, evidence: 'native_idempotent', evidenceID: replayEvidence.id, admissionID: admissionID(session.id, lost.id) });
+    await delay(2200); assert.equal(attempts().length, 1, 'approved replay cannot answer the existing native permission');
+    await api(`${prefix}/permission/${nativeBlocker.id}/reply`, { decision: 'once' });
+    await wait(() => delivered(lost.id) && broker.store.deliveryRetries?.[retryID]?.outcome === 'admitted');
+    assert.equal(attempts().length, 2); assert.equal(attempts()[0].nativeID, attempts()[1].nativeID);
+    assert.equal(attempts()[0].id, admissionID(session.id, lost.id));
+    const afterRecovery = await api(prefix);
+    assert.equal(afterRecovery.agent, roleSession.agent); assert.deepEqual(afterRecovery.permissions, roleSession.permissions);
+    await admin.request('control_command', { command: controlCommand('channel.configure', { mode: 'safe' }) });
+    await api(`/api/experimental/session/${session.id}/wait`, {});
     const worker = await api('/api/session', { location: { directory: project }, title: 'Task worker', agent: 'plan',
       permissions: [{ action: 'edit', resource: '*', effect: 'deny' }] });
     const workerPrefix = `/api/session/${worker.id}`;
@@ -240,6 +322,7 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     await api(`/api/experimental/session/${session.id}/wait`, {});
     await admin.request('control_command', { command: controlCommand('master.revoke') });
     const beforeMove = await api(prefix);
+    const beforeMembership = structuredClone(broker.store.agents[`opencode:${session.id}`]);
     const worktree = await api('/api/worktree', { projectID: beforeMove.projectID, name: 'turnlink-gate' });
     const nativeSource = makeOpenCodeSnapshotSource({ sessionID: session.id, readSession: () => api(prefix),
       readAgent: agent => api(`/api/agent/${agent}`), readTools: async () => requests.at(-1).tools,
@@ -253,6 +336,37 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     assert.equal(pair.source.agentId, `opencode:${session.id}`); assert.equal(pair.executionEligible, false);
     assert.ok(pair.issues.includes('DYNAMIC_OR_UNRESOLVED_CONFIGURATION'), 'destination plugins must not be treated as statically verified authority');
     assert.ok(!JSON.stringify(pair).includes(token));
+    if (process.env.TURNLINK_TEST_STOP_MOVE_REJOIN === '1') {
+      const exited = once(child, 'exit'); child.kill('SIGTERM'); await exited;
+      for (let i = 0; i < 100 && broker.store.agents[`opencode:${session.id}`]?.disconnectedAt === null; i++) await delay(50);
+      assert.ok(broker.store.agents[`opencode:${session.id}`], 'fixture membership must remain reserved');
+      assert.notEqual(broker.store.agents[`opencode:${session.id}`].disconnectedAt, null, 'old fixture receiver must disconnect');
+      // Same executable, private HOME and database; no other fixture process
+      // is permitted to access this synthetic store during restart.
+      logs = ''; password = undefined; childError = undefined; child = spawnService();
+      child.on('error', error => { childError = error; }); child.stdout.on('data', collect); child.stderr.on('data', collect);
+      await wait(async () => { try { return !!await api('/api/info'); } catch { return false; } });
+      const reopened = await api(prefix); assert.equal(reopened.id, beforeMove.id); assert.equal(reopened.location.directory, project);
+      await api(`/api/experimental/session/${session.id}/wait`, {});
+      await api('/api/plugin');
+      await wait(async () => {
+        try { return (await api(`/api/agent/${reopened.agent}`))?.id === reopened.agent; }
+        catch { return false; }
+      }, 100);
+      let freshPair;
+      // A preview is read-only. The agent registry may still be initializing
+      // after restart, so retry a changed observation until one is stable;
+      // never reuse the previous preview or retry a move.
+      await wait(async () => {
+        try { freshPair = await snapshotReader.inspectPair(worktree.directory); return true; }
+        catch (error) { if (error.code === 'NATIVE_SNAPSHOT_CHANGED') return false; throw error; }
+      }, 100);
+      assert.equal(freshPair.source.agentId, `opencode:${session.id}`);
+      assert.equal(freshPair.source.directory, pair.source.directory);
+      assert.equal(freshPair.destination.directory, pair.destination.directory);
+      assert.equal(freshPair.source.authorityDigest, pair.source.authorityDigest);
+      assert.equal(freshPair.destination.authorityDigest, pair.destination.authorityDigest);
+    }
     await api(`${prefix}/move`, { directory: worktree.directory, delivery: 'queue' });
     await api(`/api/experimental/session/${session.id}/wait`, {});
     const afterMove = await api(prefix);
@@ -264,6 +378,20 @@ test('real OpenCode V2 service loads tools, wakes, steers, blocks and reconnects
     await wait(async () => !(await admin.request('control_query', { channel: 'development', view: 'channel' })).members.find(m => m.agentId === `opencode:${session.id}`)?.connected);
     const detachedMessage = await send('must not automatically follow an arbitrary move');
     await delay(100); assert.equal(delivered(detachedMessage.id), false);
+    if (process.env.TURNLINK_TEST_STOP_MOVE_REJOIN === '1') {
+      currentDirectory = worktree.directory;
+      await api(`${prefix}/prompt`, { text: 'TURNLINK_JOIN' });
+      await api(`/api/experimental/session/${session.id}/wait`, {});
+      await wait(async () => !!(await admin.request('control_query', { channel: 'development', view: 'channel' })).members
+        .find(member => member.agentId === `opencode:${session.id}` && member.connected));
+      const rejoined = await api(prefix); assert.equal(rejoined.id, beforeMove.id); assert.equal(rejoined.location.directory, worktree.directory);
+      const afterMembership = broker.store.agents[`opencode:${session.id}`];
+      for (const field of ['agentId', 'channel', 'name', 'role']) assert.equal(afterMembership[field], beforeMembership[field]);
+      await wait(() => delivered(detachedMessage.id));
+      const message = await send('after stop and rejoin'); await wait(() => delivered(message.id));
+      await api(`/api/experimental/session/${session.id}/wait`, {});
+      assert.ok(requests.some(request => JSON.stringify(request.messages).includes('after stop and rejoin')));
+    }
     await api(`${prefix}/prompt`, { text: 'WORKTREE_GATE_VERIFY' });
     await api(`/api/experimental/session/${session.id}/wait`, {});
     const request = requests.find(r => JSON.stringify(r.messages).includes('WORKTREE_GATE_VERIFY'));

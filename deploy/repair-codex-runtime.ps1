@@ -1,5 +1,6 @@
-param([string]$Root = 'C:\ProgramData\turnlink-v0.2', [string]$Profile = 'C:\Users\Administrator')
+param([string]$Root = 'C:\ProgramData\turnlink-v0.2', [string]$Profile = $env:USERPROFILE)
 $ErrorActionPreference = 'Stop'
+if (-not $Profile) { throw 'A Windows profile path is required' }
 $bin = Join-Path $Root 'bin'
 if (-not [IO.Directory]::Exists($bin)) { throw 'Expected prepared deployment bin directory' }
 $configPath = Join-Path $bin 'launcher.json'
