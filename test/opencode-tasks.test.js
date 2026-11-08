@@ -12,8 +12,10 @@ import { ChannelClient } from '../src/client.js';
 import { makeOpenCodeTasks } from '../adapters/opencode-tasks.js';
 
 async function fixture(t, { enabled = true, requiresWorktree = false, master = true, scheduleDelayMs } = {}) {
+  let now = Date.now();
   const root = privateTemp(join(tmpdir(), 'turnlink-live-tasks-')), broker = createBroker({ directory: join(root, 'broker'), port: 0,
-    secret: '1'.repeat(64), adminSecret: '2'.repeat(64), controlPlane: true, taskDispatch: enabled, sweepIntervalMs: 25 });
+    secret: '1'.repeat(64), adminSecret: '2'.repeat(64), controlPlane: true, taskDispatch: enabled, sweepIntervalMs: 25,
+    ...(scheduleDelayMs ? { now: () => now } : {}) });
   await once(broker.server, 'listening');
   const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, token: '1'.repeat(64), credentialDirectory: join(root, 'proofs') };
   const worker = new ChannelClient(options), reviewer = new ChannelClient(options), admin = new ChannelClient({ ...options, token: '2'.repeat(64) });
@@ -34,7 +36,7 @@ async function fixture(t, { enabled = true, requiresWorktree = false, master = t
     await run(reviewer, 'master.accept', { proposalID: proposal.commandID, promptVersion: 1 });
   }
   const created = await run(admin, 'task.create', { title: 'Task', instructions: 'Produce a native result', criteria: 'Result and evidence', requiresWorktree,
-    ...(scheduleDelayMs ? { schedule: { at: Date.now() + scheduleDelayMs, missed: 'ask', maxLatenessMs: 5000 } } : {}) });
+    ...(scheduleDelayMs ? { schedule: { at: now + scheduleDelayMs, missed: 'ask', maxLatenessMs: 5000 } } : {}) });
   await run(worker, 'task.claim', { taskID: created.commandID });
   const messages = [], native = { busy: false, blocked: false, tasks: 0, reports: 0, loseAdmission: false, permissions: [] };
   const state = { tools: { agentId: 'opencode:worker' }, controlChannel: 'dev', generation: 0, taskPending: true, blocked: new Set() };
@@ -61,7 +63,7 @@ async function fixture(t, { enabled = true, requiresWorktree = false, master = t
   const runtime = () => makeOpenCodeTasks({ ctx, channel: worker, sessions, options: { tasks: true, credentialDirectory: options.credentialDirectory },
     signal: controller.signal, ownSession: async () => session(), refreshBlockers: async () => !native.blocked, credential: () => '3'.repeat(64), log: error => errors.push(error) });
   const query = async view => (await admin.request('control_query', { channel: 'dev', view })).entries;
-  return { worker, reviewer, admin, run, query, native, state, runtime, errors, taskID: created.commandID, root, messages, options, ctx };
+  return { worker, reviewer, admin, run, query, native, state, runtime, errors, taskID: created.commandID, root, messages, options, ctx, advance: ms => { now += ms; } };
 }
 
 test('authenticated task execution reaches review only after adapter artifact/stop evidence and explicit participant report', async t => {
@@ -315,7 +317,8 @@ test('scheduled claimed work receives a passive due notification without waking 
   const f = await fixture(t, { scheduleDelayMs: 500 }), runtime = f.runtime();
   await runtime.watch('worker'); await runtime.poll('worker');
   assert.equal(f.native.tasks, 0); assert.equal(f.state.taskPending, false);
-  const [event] = await once(f.worker, 'task_available');
+  const available = once(f.worker, 'task_available'); f.advance(500);
+  const [event] = await available;
   assert.equal(event.agentId, 'opencode:worker'); assert.equal(f.native.tasks, 0);
   f.state.taskPending = true; await runtime.poll('worker'); assert.equal(f.native.tasks, 1);
 });
