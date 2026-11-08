@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { acknowledgeOpenCodeVMHashProbe } from '../src/opencode-vm-hash-ack.js';
 
-test('VM hash acknowledgement carries the exact terminal ticket and fails on lost ACK', async t => {
+test('VM hash acknowledgement carries the exact terminal ticket and fails on lost ACK', { skip: process.platform === 'win32' && 'Unix socket fixture requires POSIX' }, async t => {
   const directory = mkdtempSync(join(tmpdir(), 'turnlink-hash-ack-')), socket = join(directory, 'daemon.sock'), id = 'a'.repeat(64);
   let lose = false, seen = 0;
   const server = createServer((req, res) => {
