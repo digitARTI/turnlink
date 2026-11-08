@@ -17,7 +17,9 @@ import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
 
 const HOST = '1'.repeat(64), ADMIN = '2'.repeat(64);
-const rootFor = t => { const root = privateTemp(join(tmpdir(), 'turnlink-telemetry-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root; };
+const roots = new Set();
+test.after(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
+const rootFor = () => { const root = privateTemp(join(tmpdir(), 'turnlink-telemetry-')); roots.add(root); return root; };
 const observation = (extra = {}) => ({ id: randomUUID(), runID: randomUUID(), at: 1000, channel: 'dev', agentId: 'opencode:a', type: 'member.joined', ...extra });
 const storeFor = (t, options) => { const root = rootFor(t), store = new ControlStore(join(root, 'control'), options); t.after(() => store.close()); return { store, root }; };
 
