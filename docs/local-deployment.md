@@ -2,12 +2,15 @@
 
 > This document records the original machine-specific setup. For portable installation instructions, start with the [project README](../README.md).
 
+Paths and host names below are anonymized examples; replace them with local
+values before running any commands.
+
 Local, all-to-all messaging for coding-agent sessions. Each member declares its role and project. Incoming tasks can wake an open conversation after its agent has finished responding.
 
 ## Start
 
 ```sh
-cd /Users/sandrovita/Progetti/agent-channel
+cd /path/to/turnlink
 npm install
 npm start
 ```
@@ -23,32 +26,32 @@ Add this plugin entry to your project's existing `opencode.json`, preserving oth
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["file:///Users/sandrovita/Progetti/agent-channel/adapters/opencode.js"]
+  "plugins": ["file:///path/to/turnlink/adapters/opencode"]
 }
 ```
 
-Quit and restart OpenCode. Ask the agent to join a channel with its name, role and project. Native tools bind identity to the actual session automatically. Idle delivery uses `session.promptAsync`; busy delivery inserts context using `noReply`. Busy insertion is not a guarantee that a tool call already selected by the model will be reconsidered. Permission/question events pause delivery where exposed by the installed harness.
+Use OpenCode >=2.0.28 and <3; the adapter is V2-only. Configure the directory above, not the former JavaScript file URL. The background service owns the plugin; save active work before restarting it when necessary. Ask the agent to join a channel with its name, role and project. Native tools bind identity to the actual session automatically. Delivery uses durable `session.prompt` admission with `delivery: "steer"` and `resume: true`, preserving the session agent/model. Permissions, running questions and observed forms pause delivery. See [V2 migration and recovery](opencode-v2.md).
 
 ## Codex in the official VS Code extension
 
 The adapter is a transparent stdio proxy between the extension and **its own app-server process**. It observes thread creation/resume and turn lifecycle, and inserts `turn/start` when idle or `turn/steer` when busy. It does not launch a second conversation or change the Codex extension files.
 
-1. Make the proxy executable: `chmod +x /Users/sandrovita/Progetti/agent-channel/src/codex-proxy.js`.
+1. Make the proxy executable: `chmod +x /path/to/turnlink/src/codex-proxy.js`.
 2. Set `AGENT_CHANNEL_CODEX_EXECUTABLE` to the real Codex binary (ideally the binary bundled with your extension). It must not point at the proxy. Ensure this variable is inherited by the VS Code process; fully quit VS Code before launching it from a configured shell. `node` must also be on its PATH.
-3. Set VS Code's `chatgpt.cliExecutable` to `/Users/sandrovita/Progetti/agent-channel/src/codex-proxy.js`.
+3. Set VS Code's `chatgpt.cliExecutable` to `/path/to/turnlink/src/codex-proxy.js`.
 4. Add the following to `~/.codex/config.toml` or a trusted project's `.codex/config.toml`:
 
 ```toml
 [mcp_servers.agent_channel]
 command = "node"
-args = ["/Users/sandrovita/Progetti/agent-channel/src/mcp.js"]
+args = ["/path/to/turnlink/src/mcp.js"]
 
 [[hooks.SessionStart]]
 matcher = "startup|resume|compact"
 
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "node /Users/sandrovita/Progetti/agent-channel/src/session-hook.js"
+command = "node /path/to/turnlink/src/session-hook.js"
 ```
 
 Review/trust the hook using Codex `/hooks`, then restart the extension and open/resume the conversation. The hook tells the model its session ID. Ask it to call `channel_join` with `harness="codex"`, that session ID, its name, role, project and channel.
@@ -64,7 +67,7 @@ Register the MCP server in the project's `.mcp.json`:
   "mcpServers": {
     "agent_channel": {
       "command": "node",
-      "args": ["/Users/sandrovita/Progetti/agent-channel/src/mcp.js", "--claude-channel"]
+      "args": ["/path/to/turnlink/src/mcp.js", "--claude-channel"]
     }
   }
 }
@@ -78,7 +81,7 @@ Add a `SessionStart` command hook to Claude's settings, merging with existing ho
     "SessionStart": [{
       "hooks": [{
         "type": "command",
-        "command": "node /Users/sandrovita/Progetti/agent-channel/src/session-hook.js --claude"
+        "command": "node /path/to/turnlink/src/session-hook.js --claude"
       }]
     }]
   }
@@ -135,7 +138,7 @@ Name lifecycle tests use a controlled clock to exercise the full 300-second boun
 To check the bundled binary explicitly on this machine:
 
 ```sh
-AGENT_CHANNEL_CODEX_EXECUTABLE=/Users/sandrovita/.vscode/extensions/openai.chatgpt-26.1002.51308-darwin-arm64/bin/macos-aarch64/codex npm run doctor
+AGENT_CHANNEL_CODEX_EXECUTABLE=/Users/example/.vscode/extensions/openai.chatgpt-26.1002.51308-darwin-arm64/bin/macos-aarch64/codex npm run doctor
 ```
 
 Installed versions inspected during initial implementation: OpenCode 1.18.35, Codex CLI 0.161.0, Codex VS Code extension 26.1002.51308, Claude Code 2.1.86. After approved installation, OpenCode's global plugin entry and the Windows game-server's user/application Codex settings were configured. Live remote Codex idle wake-up passed on 2026-10-09: the same session processed an unsolicited peer message and replied without polling. See [remote wake proof](remote-wake-proof.md) for broker and persisted-turn evidence. Claude live-model wake-up and further live busy/reconnect checks remain unverified.
@@ -171,8 +174,8 @@ Verified remotely: Node v24.18.0; native executable version passthrough and real
 The active development tunnel maps game-server loopback `47322` to Mac broker `47321`; its control socket is `dist/game-server-tunnel.sock`. Check or stop it with:
 
 ```sh
-ssh -S /Users/sandrovita/Progetti/agent-channel/dist/game-server-tunnel.sock -O check bangerrp-fx
-ssh -S /Users/sandrovita/Progetti/agent-channel/dist/game-server-tunnel.sock -O exit bangerrp-fx
+ssh -S /path/to/turnlink/dist/game-server-tunnel.sock -O check example-windows-host
+ssh -S /path/to/turnlink/dist/game-server-tunnel.sock -O exit example-windows-host
 ```
 
 This tunnel survives the launching terminal but is not a persistent reconnect service and depends on the Mac staying awake. See `docs/external-host-design.md` for always-on deployment options.

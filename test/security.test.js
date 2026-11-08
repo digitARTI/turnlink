@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import WebSocket from 'ws';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, symlinkSync } from 'node:fs';
+import { rmSync, readFileSync, writeFileSync, symlinkSync } from 'node:fs';
+import { privateTemp as mkdtempSync } from '../src/storage.js';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createBroker } from '../src/broker.js';
@@ -131,7 +132,7 @@ test('request rate limits contain a flood and another host can still operate', a
   let limited = false;
   for (let i = 0; i < 45; i++) {
     const response = await attacker.call('hello');
-    if (response.error?.includes('Rate limit')) { limited = true; break; }
+    if (response.error === 'BROKER_RATE_LIMITED_BEFORE_DISPATCH') { limited = true; break; }
   }
   assert.ok(limited);
   const b = s.client(B); await b.request('join', reg('b'));

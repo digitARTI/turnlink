@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { privateTemp as mkdtempSync } from '../src/storage.js';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';

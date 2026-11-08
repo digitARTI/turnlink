@@ -1,10 +1,12 @@
-# External hosts: BangerRP development-channel proposal
+# External hosts: example project development-channel proposal
+
+Host names, project names and local paths in this proposal are anonymized.
 
 Status: user-approved development deployment installed; live remote idle-wake proof passed. See `remote-wake-proof.md` for exact session, turn and message evidence.
 
 ## Inputs
 
-Local source: `BangerRP-migration/docs/fivem-mcp.md`, section 5. The legacy relay is a JSONL store on REBORN, exposed on loopback HTTP port 8902 through SSH reverse forwarding to the game-server. It supports POST, cursor-based GET, and MCP `channel_post` / `channel_read`. Storage acceptance does not wake an idle model.
+Local source: `example-migration/docs/fivem-mcp.md`, section 5. The legacy relay is a JSONL store on WINDOWS-HOST, exposed on loopback HTTP port 8902 through SSH reverse forwarding to the game-server. It supports POST, cursor-based GET, and MCP `channel_post` / `channel_read`. Storage acceptance does not wake an idle model.
 
 Peer evidence from `banger-bridge` in the development channel:
 
@@ -18,7 +20,7 @@ These are peer-reported read-only observations, not a live wake-up proof. The la
 ```text
 Mac: broker ws://127.0.0.1:47321
     |
-    | separate SSH reverse forward, Mac initiates through bangerrp-fx
+    | separate SSH reverse forward, Mac initiates through example-windows-host
     v
 game-server: ws://127.0.0.1:47322
     |
@@ -34,12 +36,12 @@ Proposed tunnel command (not run):
 ```sh
 ssh -N -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-  -R 127.0.0.1:47322:127.0.0.1:47321 bangerrp-fx
+  -R 127.0.0.1:47322:127.0.0.1:47321 example-windows-host
 ```
 
 Provision channel credentials out of band, independently of legacy telemetry credentials. Do not use token query parameters. The current broker uses one shared trust token; per-host authorization is a prerequisite for treating external hosts as distinct trust domains.
 
-Mac sleep/disconnection makes this topology unavailable until connectivity returns. An always-on deployment can use a standalone broker on game-server or REBORN. Keep it separate from the bridge's interactive desktop process and revise forwarding accordingly. Broker persistence cannot make a sleeping recipient execute a model turn.
+Mac sleep/disconnection makes this topology unavailable until connectivity returns. An always-on deployment can use a standalone broker on game-server or WINDOWS-HOST. Keep it separate from the bridge's interactive desktop process and revise forwarding accordingly. Broker persistence cannot make a sleeping recipient execute a model turn.
 
 ## Windows launcher
 

@@ -1,0 +1,14 @@
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { parse } from 'smol-toml';
+import { applyConfiguration } from './config-transaction.js';
+const root = process.argv[2], profile = process.argv[3];
+if (process.platform !== 'win32' || !root || !profile) throw new Error('Usage on Windows: add-binding-probe <staged-root> <actual-profile>');
+const path = join(profile, '.codex', 'config.toml');
+const old = readFileSync(path, 'utf8');
+if (parse(old).mcp_servers?.turnlink_binding_probe) throw new Error('Binding probe already configured');
+const added = `\n# Temporary read-only Turnlink session-binding diagnostic\n[mcp_servers.turnlink_binding_probe]\ncommand = "C:\\\\Program Files\\\\nodejs\\\\node.exe"\nargs = [${JSON.stringify(join(root, 'src', 'binding-probe.js'))}]\n`;
+parse(old + added);
+const journal = join(root, 'private', 'binding-probe-journal.json');
+if (existsSync(journal)) throw new Error('Prior probe journal exists; inspect recovery before reconfiguring');
+console.log(JSON.stringify(applyConfiguration(journal, [{ path, content: old + added }])));
