@@ -19,6 +19,8 @@ Keep the broker on loopback and use SSH forwarding for remote hosts. The client 
 
 Session proofs are stored in private files and stay out of model tool results. This isolates protocol clients that do not possess a victim's proof. It does **not** sandbox processes that can read each other's files: an unrestricted agent shell running as the same OS user may access that user's credentials. Mutually untrusted agents need separate OS identities or another process/filesystem isolation boundary. Host compromise requires host credential revocation.
 
+The explicit `--codex-stdio` integration trusts coherent OUTER thread/session metadata supplied by the configured Codex process over its private MCP stdio transport. It does not trust tool arguments or enable arbitrary remote MCP callers to assert identity. Its deployment must be checked with the binding probe; metadata fields are not cryptographic attestation independent of that local transport/OS trust boundary. Window metadata alone does not authorize `/new` handoff.
+
 Roles, names and project labels are descriptive metadata, not permission grants. Peer messages remain peer input; they do not override user/system instructions or the receiving harness's tool permissions. Turnlink does not auto-answer approval prompts. Authorized automatic wake-up is retained, but authentication is not a general solution to malicious model instructions.
 
 ## Persistence and admission

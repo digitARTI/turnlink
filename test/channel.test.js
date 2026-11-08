@@ -9,10 +9,13 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
-import plugin from '../adapters/opencode.js';
+import { openCodeFixture } from './fixtures/opencode.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
+import { WebSocketServer } from 'ws';
+import { randomUUID } from 'node:crypto';
+import { receiverHandoffKey, sessionProof } from '../src/config.js';
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const TOKEN = '1'.repeat(64), ADMIN = '2'.repeat(64);
@@ -31,6 +34,75 @@ async function setup(t, extra = {}) {
   return { broker, options, make, directory };
 }
 const registration = (sessionId, harness = 'codex') => ({ harness, sessionId, channel: 'development', name: sessionId, role: 'implementation', project: { name: sessionId, root: `/projects/${sessionId}` } });
+
+test('a second host cannot take a disconnected session merely by copying its proof', async t => {
+  const destinationToken = '3'.repeat(64);
+  const f = await setup(t, { hosts: [
+    { hostId: 'source', credential: TOKEN, channels: ['*'], broadcast: true },
+    { hostId: 'destination', credential: destinationToken, channels: ['*'], broadcast: true },
+  ] });
+  const source = f.make(), target = new ChannelClient({ ...f.options, token: destinationToken });
+  t.after(() => target.close());
+  const identity = 'codex:cross-host';
+  await source.request('join', registration('cross-host'));
+  await source.subscribe(identity); await source.unsubscribe(identity);
+  await target.connect();
+  const copiedProof = sessionProof('source', identity, f.options.credentialDirectory, false);
+  await assert.rejects(target.rpc('join', { ...registration('cross-host'), proof: copiedProof }), /Session ownership denied/);
+  await assert.rejects(target.rpc('subscribe', { agentId: identity, proof: copiedProof }), /Session ownership denied/);
+  assert.equal(f.broker.store.bindings[identity].hostId, 'source');
+});
+
+test('receiver activity disappears as soon as its socket starts closing', () => {
+  const client = new ChannelClient(), id = 'codex:closing';
+  client.hostId = 'local'; client.socket = { readyState: 1 }; client.activeSubscriptions.add(id);
+  assert.equal(client.activeSubscriptions.has(id), true);
+  client.socket.readyState = 2;
+  assert.equal(client.activeSubscriptions.has(id), false, 'CLOSING is not a live receiver even before the close event');
+});
+
+test('guarded broker requests enforce synchronous checks at the actual send boundary', async () => {
+  const client = new ChannelClient(); let sent = 0, checks = 0;
+  client.connect = async () => {}; client.authorize = (_method, params) => params;
+  client.rpc = async () => { sent++; return { ok: true }; };
+  client.request = async () => { throw new Error('unguarded request hook must not be used'); };
+  assert.deepEqual(await client.requestGuarded('control_query', {}, () => { checks++; }), { ok: true });
+  assert.equal(checks, 3); assert.equal(sent, 1);
+  for (const method of ['control_adapter', 'control_task_pull'])
+    assert.deepEqual(await client.requestGuarded(method, {}, () => {}), { ok: true });
+  await assert.rejects(client.requestGuarded('control_query', {}, () => false), /Guarded request unavailable/);
+  await assert.rejects(client.requestGuarded('control_query', {}, async () => true), /Guarded request unavailable/);
+  for (const method of ['join', 'leave', 'subscribe', 'unsubscribe', 'send', 'control_receiver_release'])
+    await assert.rejects(client.requestGuarded(method, {}, () => {}), /Guarded request unavailable/);
+  assert.equal(sent, 3, 'refused guards must not dispatch');
+});
+
+test('a replacement socket cannot inherit subscriptions before its own ACK', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${server.address().port}`, token: TOKEN });
+  t.after(async () => { client.close(); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); });
+  const subscriptions = [];
+  server.on('connection', socket => socket.on('message', raw => {
+    const request = JSON.parse(raw.toString());
+    if (request.method === 'hello') socket.send(JSON.stringify({ v: 2, id: request.id, result: { protocol: 2, hostId: 'local', admin: true } }));
+    else if (request.method === 'subscribe') {
+      subscriptions.push({ socket, request });
+      if (subscriptions.length === 1) socket.send(JSON.stringify({ v: 2, id: request.id, result: { subscribed: true } }));
+    }
+  }));
+  await client.connect(); const id = 'codex:replacement'; await client.subscribe(id);
+  assert.equal(client.activeSubscriptions.has(id), true);
+  let disconnected = 0; client.on('disconnected', () => { disconnected++; });
+  client.socket.terminate();
+  const connecting = client.connect();
+  assert.equal(client.activeSubscriptions.has(id), false);
+  assert.equal(disconnected, 1, 'superseded socket invalidates in-flight work immediately');
+  await eventually(() => subscriptions.length === 2);
+  assert.equal(client.activeSubscriptions.has(id), false, 'new open socket cannot inherit the old ACK');
+  subscriptions[1].socket.send(JSON.stringify({ v: 2, id: subscriptions[1].request.id, result: { subscribed: true } }));
+  await connecting;
+  assert.equal(client.activeSubscriptions.has(id), true);
+});
 
 test('onboarding, cross-project routing, duplicate send, offline replay and authorized ack', async t => {
   const { make, broker } = await setup(t);
@@ -84,13 +156,213 @@ test('receiver reconnects and replays messages sent while its socket is disconne
   await a.request('join', registration('a'));
   await b.request('join', registration('b'));
   await b.subscribe('codex:b');
+  assert.equal(b.activeSubscriptions.has('codex:b'), true);
   const disconnected = once(b, 'disconnected');
   b.socket.terminate();
+  assert.equal(b.activeSubscriptions.has('codex:b'), false, 'termination immediately invalidates receiver authority');
   await disconnected;
+  assert.equal(b.subscriptions.has('codex:b'), true, 'reconnect intent remains');
+  assert.equal(b.activeSubscriptions.has('codex:b'), false, 'closed socket has no receiver authority');
   const received = once(b, 'message');
+  b.once('message', () => assert.equal(b.activeSubscriptions.has('codex:b'), true, 'subscribe ACK precedes replay delivery'));
   const message = await a.request('send', { agentId: 'codex:a', to: 'codex:b', text: 'offline task', messageId: 'reconnect' });
   assert.equal((await received)[0].id, message.id);
   await b.request('ack', { agentId: 'codex:b', id: message.id });
+});
+
+test('subscription ACK cannot revive ownership across unsubscribe and a replacement subscribe', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${server.address().port}`, token: TOKEN });
+  t.after(async () => { client.close(); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); });
+  const requests = []; let peer;
+  server.on('connection', socket => { peer = socket; socket.on('message', raw => {
+    const request = JSON.parse(raw.toString());
+    if (request.method === 'hello') socket.send(JSON.stringify({ v: 2, id: request.id, result: { protocol: 2, hostId: 'local', admin: true } }));
+    else requests.push(request);
+  }); });
+  await client.connect(); const id = 'codex:race';
+  const first = client.subscribe(id).then(() => null, error => error);
+  await eventually(() => requests.length === 1);
+  const remove = client.unsubscribe(id), replacement = client.subscribe(id);
+  assert.equal(client.activeSubscriptions.has(id), false);
+  await delay(30); assert.deepEqual(requests.map(value => value.method), ['subscribe']);
+  peer.send(JSON.stringify({ v: 2, id: requests[0].id, result: { subscribed: true } }));
+  assert.match((await first).message, /superseded/i);
+  await eventually(() => requests.length === 2);
+  assert.equal(requests[1].method, 'unsubscribe');
+  assert.equal(client.activeSubscriptions.has(id), false, 'stale ACK must not activate ownership');
+  peer.send(JSON.stringify({ v: 2, id: requests[1].id, result: {} })); await remove;
+  await eventually(() => requests.length === 3);
+  assert.equal(requests[2].method, 'subscribe');
+  assert.equal(client.activeSubscriptions.has(id), false);
+  peer.send(JSON.stringify({ v: 2, id: requests[2].id, result: { subscribed: true } })); await replacement;
+  assert.equal(client.activeSubscriptions.has(id), true);
+});
+
+test('leave and membership removal invalidate pending subscribe generations', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${server.address().port}`, token: TOKEN });
+  t.after(async () => { client.close(); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); });
+  const requests = []; let peer;
+  server.on('connection', socket => { peer = socket; socket.on('message', raw => {
+    const request = JSON.parse(raw.toString());
+    if (request.method === 'hello') socket.send(JSON.stringify({ v: 2, id: request.id, result: { protocol: 2, hostId: 'local', admin: true } }));
+    else requests.push(request);
+  }); });
+  await client.connect(); const firstID = 'codex:leave-race';
+  const first = client.subscribe(firstID).then(() => null, error => error);
+  await eventually(() => requests.length === 1);
+  const leave = client.request('leave', { agentId: firstID });
+  peer.send(JSON.stringify({ v: 2, id: requests[0].id, result: { subscribed: true } }));
+  assert.match((await first).message, /superseded/i);
+  await eventually(() => requests.length === 2);
+  assert.equal(requests[1].method, 'leave');
+  assert.equal(client.activeSubscriptions.has(firstID), false);
+  peer.send(JSON.stringify({ v: 2, id: requests[1].id, result: {} })); await leave;
+  assert.equal(client.subscriptions.has(firstID), false);
+  const secondID = 'codex:removed-race';
+  const second = client.subscribe(secondID).then(() => null, error => error);
+  await eventually(() => requests.length === 3);
+  peer.send(JSON.stringify({ v: 2, event: 'membership_removed', agentId: secondID, reason: 'control_removed_member' }));
+  peer.send(JSON.stringify({ v: 2, id: requests[2].id, result: { subscribed: true } }));
+  assert.match((await second).message, /superseded/i);
+  assert.equal(client.activeSubscriptions.has(secondID), false);
+  assert.equal(client.subscriptions.has(secondID), false);
+});
+
+test('failed membership resume invalidates desired receiver before reconnect replay', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${server.address().port}`, token: TOKEN });
+  t.after(async () => { client.close(); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); });
+  const requests = [], id = 'codex:expired';
+  client.registrations.set(id, {}); client.subscriptions.add(id); client.subscriptionGenerations.set(id, 1);
+  server.on('connection', socket => socket.on('message', raw => {
+    const request = JSON.parse(raw.toString()); requests.push(request.method);
+    const result = request.method === 'hello' ? { protocol: 2, hostId: 'local', admin: true }
+      : request.method === 'resume' ? { registered: false } : { subscribed: true };
+    socket.send(JSON.stringify({ v: 2, id: request.id, result }));
+  }));
+  let removed = 0; client.on('membership_removed', event => { if (event.agentId === id) removed++; });
+  await client.connect();
+  assert.deepEqual(requests, ['hello', 'resume']);
+  assert.equal(removed, 1);
+  assert.equal(client.subscriptions.has(id), false);
+  assert.equal(client.activeSubscriptions.has(id), false);
+  assert.equal(client.subscriptionGenerations.get(id), 2);
+});
+
+test('subscription with an observed cwd falls back only when an older broker rejects its schema', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${server.address().port}`, token: TOKEN });
+  t.after(async () => { client.close(); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); });
+  const attempts = [];
+  server.on('connection', socket => socket.on('message', raw => {
+    const request = JSON.parse(raw.toString());
+    if (request.method === 'hello') return socket.send(JSON.stringify({ v: 2, id: request.id, result: { protocol: 2, hostId: 'local', admin: true } }));
+    attempts.push(request.params);
+    const response = request.params.observedCwd ? { error: 'Invalid request schema or protocol version' } : { result: { subscribed: true } };
+    socket.send(JSON.stringify({ v: 2, id: request.id, ...response }));
+  }));
+  assert.equal((await client.subscribe('codex:old-broker', { observedCwd: '/destination' })).subscribed, true);
+  assert.deepEqual(attempts, [{ agentId: 'codex:old-broker', observedCwd: '/destination' }, { agentId: 'codex:old-broker' }]);
+});
+
+test('operator-supervised worktree subscription never drops its guard for an older broker', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${server.address().port}`, token: TOKEN });
+  t.after(async () => { client.close(); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); });
+  const attempts = [];
+  server.on('connection', socket => socket.on('message', raw => {
+    const request = JSON.parse(raw.toString());
+    if (request.method === 'hello') return socket.send(JSON.stringify({ v: 2, id: request.id, result: { protocol: 2, hostId: 'local', admin: true } }));
+    attempts.push(request.params);
+    socket.send(JSON.stringify({ v: 2, id: request.id, error: 'Invalid request schema or protocol version' }));
+  }));
+  await assert.rejects(client.subscribe('codex:old-broker', { observedCwd: '/source', manualWorktreeHost: true }), /Invalid request schema/);
+  assert.deepEqual(attempts, [{ agentId: 'codex:old-broker', observedCwd: '/source', manualWorktreeHost: true }]);
+  assert.equal(client.subscriptions.size, 0);
+  assert.equal(client.manualWorktreeSubscriptions.size, 0);
+});
+
+test('operator-supervised worktree subscription preserves its guard after reconnect', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${server.address().port}`, token: TOKEN });
+  t.after(async () => { client.close(); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); });
+  const attempts = []; let firstSocket;
+  server.on('connection', socket => {
+    firstSocket ??= socket;
+    socket.on('message', raw => {
+      const request = JSON.parse(raw.toString());
+      if (request.method === 'hello') return socket.send(JSON.stringify({ v: 2, id: request.id, result: { protocol: 2, hostId: 'local', admin: true } }));
+      if (request.method === 'subscribe') attempts.push(request.params);
+      socket.send(JSON.stringify({ v: 2, id: request.id, result: { subscribed: true } }));
+    });
+  });
+  await client.subscribe('codex:fixture', { manualWorktreeHost: true });
+  firstSocket.terminate();
+  await eventually(() => attempts.length === 2);
+  assert.deepEqual(attempts, [{ agentId: 'codex:fixture', manualWorktreeHost: true }, { agentId: 'codex:fixture', manualWorktreeHost: true }]);
+});
+
+test('target handoff racing an older unsubscribe fails closed and drops the socket', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${server.address().port}`, token: TOKEN });
+  t.after(async () => { client.close(); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); });
+  const requests = []; let peer;
+  server.on('connection', socket => { peer = socket; socket.on('message', raw => {
+    const request = JSON.parse(raw.toString());
+    if (request.method === 'hello') socket.send(JSON.stringify({ v: 2, id: request.id, result: { protocol: 2, hostId: 'local', admin: true } }));
+    else requests.push(request);
+  }); });
+  await client.connect(); const id = 'codex:race-target';
+  const subscribed = client.subscribe(id); await eventually(() => requests.length === 1);
+  peer.send(JSON.stringify({ v: 2, id: requests[0].id, result: { subscribed: true } })); await subscribed;
+  await eventually(() => !client.subscriptionOperations.has(id));
+  const remove = client.unsubscribe(id).then(() => null, error => error); await eventually(() => requests.length === 2);
+  const offerID = randomUUID(); client.handoffCandidates.set(offerID, { agentId: id, key: 'c'.repeat(64) });
+  let handoffPublished = false; client.on('receiver_handoff', () => { handoffPublished = true; });
+  const disconnected = once(client, 'disconnected');
+  peer.send(JSON.stringify({ v: 2, event: 'receiver_handoff', agentId: id, offerID, role: 'target' }));
+  await disconnected; assert.ok(await remove);
+  assert.equal(client.activeSubscriptions.has(id), false);
+  assert.equal(client.subscriptions.has(id), false);
+  assert.equal(handoffPublished, false, 'ambiguous target ownership must not be published');
+});
+
+test('contained owner recovery confirms the current socket before replay and rejects superseded recovery', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'turnlink-owner-ack-'));
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${server.address().port}`, token: TOKEN, credentialDirectory: directory });
+  t.after(async () => { client.close(); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); rmSync(directory, { recursive: true, force: true }); });
+  const requests = []; let peer;
+  server.on('connection', socket => { peer = socket; socket.on('message', raw => {
+    const request = JSON.parse(raw.toString());
+    if (request.method === 'hello') socket.send(JSON.stringify({ v: 2, id: request.id, result: { protocol: 2, hostId: 'local', admin: true } }));
+    else requests.push(request);
+  }); });
+  await client.connect(); const id = 'opencode:owner-ack', previousID = randomUUID(), transitionID = randomUUID();
+  receiverHandoffKey('local', id, previousID, directory, true);
+  const recovered = client.recoverContainedOwner(id, '3'.repeat(64), previousID, { id: transitionID, agentId: id, channel: 'dev' });
+  await eventually(() => requests.length === 1);
+  assert.equal(client.activeSubscriptions.has(id), false);
+  let activeAtNotification = false;
+  client.once('task_available', () => { activeAtNotification = client.activeSubscriptions.has(id); });
+  peer.send(JSON.stringify({ v: 2, id: requests[0].id, result: { transferred: true, transitionID } }));
+  peer.send(JSON.stringify({ v: 2, event: 'task_available', agentId: id }));
+  await recovered;
+  await eventually(() => activeAtNotification);
+  assert.equal(client.activeSubscriptions.has(id), true);
+  assert.equal(client.subscriptions.has(id), true);
+  assert.ok(client.receiverKeys.has(id));
+  const other = 'opencode:owner-race', old = randomUUID(), next = randomUUID();
+  receiverHandoffKey('local', other, old, directory, true);
+  const pending = client.recoverContainedOwner(other, '3'.repeat(64), old, { id: next, agentId: other, channel: 'dev' }).then(() => null, error => error);
+  await eventually(() => requests.length === 2);
+  const removal = client.unsubscribe(other).catch(() => {});
+  const disconnected = once(client, 'disconnected');
+  peer.send(JSON.stringify({ v: 2, id: requests[1].id, result: { transferred: true, transitionID: next } }));
+  assert.match((await pending).message, /unavailable/i); await disconnected; await removal;
+  assert.equal(client.activeSubscriptions.has(other), false);
 });
 
 test('Codex proxy wakes same idle thread, steers busy thread, isolates sessions and preserves approvals', async t => {
@@ -137,7 +409,39 @@ test('Codex proxy wakes same idle thread, steers busy thread, isolates sessions 
   assert.equal(stderr, '');
 });
 
-test('OpenCode plugin wakes idle existing session and inserts busy context', async t => {
+test('Codex queued delivery waits for receiver confirmation after broker disconnect', async t => {
+  const { options, make, broker } = await setup(t);
+  const child = spawn(process.execPath, ['src/codex-proxy.js', 'test/fixtures/codex.js', 'app-server'], {
+    cwd: resolve('.'), env: { ...process.env, AGENT_CHANNEL_CODEX_EXECUTABLE: process.execPath, AGENT_CHANNEL_URL: options.url,
+      AGENT_CHANNEL_TOKEN: options.token, AGENT_CHANNEL_CREDENTIAL_DIR: options.credentialDirectory }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const exited = once(child, 'exit'); child.stderr.resume();
+  const output = []; createInterface({ input: child.stdout }).on('line', line => output.push(JSON.parse(line)));
+  const send = data => child.stdin.write(`${JSON.stringify(data)}\n`);
+  try {
+    send({ id: 1, method: 'initialize', params: {} }); await eventually(() => output.some(frame => frame.id === 1));
+    send({ id: 2, method: 'thread/start', params: { fixtureId: 'thread-disconnect' } });
+    await eventually(() => output.some(frame => frame.id === 2));
+    const sender = make(); await sender.request('join', registration('sender')); await sender.request('join', registration('thread-disconnect'));
+    await eventually(() => broker.store.agents['codex:thread-disconnect']?.disconnectedAt === null);
+    send({ id: 3, method: 'fixture/approval', params: { threadId: 'thread-disconnect' } });
+    await eventually(() => output.some(frame => frame.id === 999));
+    await sender.request('send', { agentId: 'codex:sender', to: 'codex:thread-disconnect', text: 'queued while held', messageId: 'receiver-loss' });
+    await delay(100);
+    for (const socket of broker.server.clients) socket.terminate();
+    await eventually(() => broker.store.agents['codex:thread-disconnect']?.disconnectedAt != null);
+    send({ id: 999, result: { decision: 'approved' } });
+    await delay(200);
+    assert.equal(output.some(frame => frame.method === 'fixture/received'), false, 'queued work must not start on a lost receiver');
+    await eventually(() => output.some(frame => frame.method === 'fixture/received'));
+    assert.match(output.find(frame => frame.method === 'fixture/received').params.input[0].text, /queued while held/);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await exited;
+  }
+});
+
+test('OpenCode V2 admits peer input in the existing session without overriding agent/model', async t => {
   const { options, make, broker } = await setup(t);
   const before = { url: process.env.AGENT_CHANNEL_URL, token: process.env.AGENT_CHANNEL_TOKEN, credentials: process.env.AGENT_CHANNEL_CREDENTIAL_DIR };
   process.env.AGENT_CHANNEL_URL = options.url; process.env.AGENT_CHANNEL_TOKEN = options.token;
@@ -147,27 +451,18 @@ test('OpenCode plugin wakes idle existing session and inserts busy context', asy
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
   });
-  const calls = []; let busy = false;
-  const hooks = await plugin({ directory: '/projects/b', client: {
-    session: {
-      status: async () => ({ data: { b: { type: busy ? 'busy' : 'idle' } } }),
-      messages: async () => ({ data: [{ info: { role: 'user', agent: 'plan', model: { providerID: 'fixture', modelID: 'test' }, tools: { edit: false } } }] }),
-      promptAsync: async input => { calls.push({ method: 'wake', input }); },
-      prompt: async input => { calls.push({ method: 'context', input }); },
-    }, app: { log: async () => {} },
-  } });
-  t.after(() => hooks.dispose());
-  await hooks.tool.channel_join.execute({ name: 'b', role: 'frontend', channel: 'development', project: { name: 'ui' } }, { sessionID: 'b' });
+  const { tools, calls } = await openCodeFixture(t, options);
+  await tools.channel_join.execute({ name: 'b', role: 'frontend', channel: 'development', project: { name: 'ui' } }, { sessionID: 'b' });
   const a = make(); await a.request('join', registration('a'));
   await a.request('send', { agentId: 'codex:a', to: 'opencode:b', text: 'wake', messageId: 'open-wake' });
   await eventually(() => calls.length === 1);
-  assert.equal(calls[0].method, 'wake'); assert.equal(calls[0].input.path.id, 'b');
-  assert.equal(calls[0].input.body.agent, 'plan'); assert.equal(calls[0].input.body.tools.edit, false);
+  assert.equal(calls[0].sessionID, 'b'); assert.equal(calls[0].delivery, 'steer'); assert.equal(calls[0].resume, true);
+  assert.equal(calls[0].agent, undefined); assert.equal(calls[0].model, undefined); assert.equal(calls[0].tools, undefined);
+  assert.match(calls[0].id, /^msg_turnlink_/);
   await eventually(() => broker.store.messages[0].delivered.includes('opencode:b'));
-  busy = true;
   await a.request('send', { agentId: 'codex:a', to: 'opencode:b', text: 'steer', messageId: 'open-steer' });
   await eventually(() => calls.length === 2);
-  assert.equal(calls[1].method, 'context'); assert.equal(calls[1].input.body.noReply, true);
+  assert.equal(calls[1].delivery, 'steer'); assert.notEqual(calls[0].id, calls[1].id);
 });
 
 test('Claude MCP channel pushes unsolicited messages and requires explicit model acknowledgement', async t => {
@@ -182,6 +477,9 @@ test('Claude MCP channel pushes unsolicited messages and requires explicit model
   assert.ok(mcp.getServerCapabilities().experimental['claude/channel']);
   const joined = await mcp.callTool({ name: 'channel_join', arguments: registration('claude-b', 'claude') });
   assert.ok(!joined.isError);
+  const registered = JSON.parse(joined.content[0].text).agent;
+  assert.equal(registered.connected, true);
+  assert.equal(registered.nameState, 'claimed');
   const a = make(); await a.request('join', registration('a'));
   const message = await a.request('send', { agentId: 'codex:a', to: 'claude:claude-b', text: 'idle task', messageId: 'claude-push' });
   await eventually(() => events.length === 1);
@@ -204,52 +502,41 @@ test('OpenCode leave clears pending wake before the harness has admitted the tas
   });
   let resumeStatus;
   const calls = [];
-  const hooks = await plugin({ directory: '/projects/b', client: {
-    session: {
-      status: () => new Promise(resolve => { resumeStatus = resolve; }),
-      promptAsync: async input => { calls.push(input); },
-      prompt: async input => { calls.push(input); },
-    }, app: { log: async () => {} },
+  const fixture = await openCodeFixture(t, options, { session: {
+    prompt: async input => { calls.push(input); return { id: input.id, sessionID: input.sessionID }; },
   } });
-  t.after(() => hooks.dispose());
+  fixture.ctx.permission.list = () => new Promise(resolve => { resumeStatus = resolve; });
   const context = { sessionID: 'b' };
-  await hooks.tool.channel_join.execute({ name: 'b', role: 'frontend', channel: 'development', project: { name: 'ui' } }, context);
+  await fixture.tools.channel_join.execute({ name: 'b', role: 'frontend', channel: 'development', project: { name: 'ui' } }, context);
   const a = make(); await a.request('join', registration('a'));
   await a.request('send', { agentId: 'codex:a', to: 'opencode:b', text: 'must not wake after leave', messageId: 'leave-race' });
   await eventually(() => !!resumeStatus);
-  await hooks.tool.channel_leave.execute({}, context);
-  resumeStatus({ data: { b: { type: 'idle' } } });
+  await fixture.tools.channel_leave.execute({}, context);
+  resumeStatus([]);
   await delay(30);
   assert.equal(calls.length, 0);
   assert.equal(broker.store.agents['opencode:b'], undefined);
   assert.equal(broker.store.messages[0].cancelled['opencode:b'], 'explicit_leave');
 });
 
-test('OpenCode v2 permission/question prompts remain blocking until both are answered', async t => {
+test('OpenCode V2 permissions/forms remain blocking until both are answered', async t => {
   const { options, make } = await setup(t);
   const calls = [];
   // Plugin credentials are supplied through a private synthetic host file, not the real user token.
   const file = join(options.credentialDirectory, '..', 'host.token');
   writeFileSync(file, TOKEN, { mode: 0o600 });
-  const configured = await plugin({ directory: '/test', client: {
-    session: {
-      status: async () => ({ data: { b: { type: 'idle' } } }),
-      messages: async () => ({ data: [{ info: { role: 'user', agent: 'plan', model: { providerID: 'fixture', modelID: 'test' } } }] }),
-      promptAsync: async args => calls.push(args), prompt: async args => calls.push(args),
-    }, app: { log: async () => {} },
-  } }, { url: options.url, credentialDirectory: options.credentialDirectory, tokenFile: file });
-  t.after(() => configured.dispose());
-  await configured.tool.channel_join.execute({ channel: 'development', name: 'b', role: 'worker', project: { name: 'test' } }, { sessionID: 'b' });
-  await configured.event({ event: { type: 'permission.v2.asked', properties: { sessionID: 'b', id: 'permission' } } });
-  await configured.event({ event: { type: 'question.v2.asked', properties: { sessionID: 'b', id: 'question' } } });
+  const configured = await openCodeFixture(t, { url: options.url, credentialDirectory: options.credentialDirectory, tokenFile: file }, { session: {
+    prompt: async input => { calls.push(input); return { id: input.id, sessionID: input.sessionID }; },
+  } });
+  await configured.tools.channel_join.execute({ channel: 'development', name: 'b', role: 'worker', project: { name: 'test' } }, { sessionID: 'b' });
+  configured.emit('permission.asked', { sessionID: 'b', id: 'permission' });
+  configured.emit('form.created', { form: { sessionID: 'b', id: 'question' } });
   const a = make(); await a.request('join', registration('a'));
   await a.request('send', { agentId: 'codex:a', to: 'opencode:b', text: 'pending approval wake', messageId: 'approval-v2' });
   await delay(30); assert.equal(calls.length, 0);
-  await configured.event({ event: { type: 'permission.v2.replied', properties: { sessionID: 'b', requestID: 'permission' } } });
-  await configured.event({ event: { type: 'session.idle', properties: { sessionID: 'b' } } });
+  configured.emit('permission.replied', { sessionID: 'b', requestID: 'permission' });
   await delay(30); assert.equal(calls.length, 0);
-  await configured.event({ event: { type: 'question.v2.replied', properties: { sessionID: 'b', requestID: 'question' } } });
-  await configured.event({ event: { type: 'session.idle', properties: { sessionID: 'b' } } });
+  configured.emit('form.replied', { sessionID: 'b', id: 'question' });
   await eventually(() => calls.length === 1);
-  assert.equal(calls[0].body.agent, 'plan');
+  assert.equal(calls[0].agent, undefined);
 });

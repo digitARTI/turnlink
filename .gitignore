@@ -1,4 +1,6 @@
-node_modules/
+node_modules
+.native-runtimes/
+.opencode/goals/
 .DS_Store
 *.log
 dist/
@@ -18,3 +20,6 @@ session-keys/
 *.admissions.json
 config-journal.json
 migration.json
+control.db
+control.db-wal
+control.db-shm
