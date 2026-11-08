@@ -119,7 +119,14 @@ async function fixture(t, enabled = true, extra = {}) {
   const brokers = new Set([broker]);
   const trackBroker = value => { brokers.add(value); return value; };
   t.after(async () => { clients.forEach(c => c.close()); for (const value of brokers) await value.close(); rmSync(root, { recursive: true, force: true }); });
-  const client = (token = HOST) => { const value = new ChannelClient({ ...options, token }); clients.push(value); return value; };
+  const client = (token = HOST) => {
+    const value = new ChannelClient({ ...options, token });
+    if (process.platform === 'win32') {
+      const rpc = value.rpc.bind(value);
+      value.rpc = (method, params, timeoutMs = 30000, context) => rpc(method, params, timeoutMs, context);
+    }
+    clients.push(value); return value;
+  };
   const admin = client(ADMIN), a = client(), b = client(), c = client();
   const joinAgent = async (connection, sessionId, channel = 'dev') => {
     await connection.request('join', { harness: 'opencode', sessionId, name: sessionId, role: 'full project access', channel,
