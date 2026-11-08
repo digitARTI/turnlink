@@ -25,8 +25,16 @@ const serialIdentity = path => {
   const encode = item => item <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(item) : item.toString();
   return { dev: encode(value.dev), ino: encode(value.ino) };
 };
-const sameGitPath = (a, b) => typeof a === 'string' && (process.platform === 'win32' ? win32.normalize(a).toLowerCase() === win32.normalize(b).toLowerCase() : a === b);
 const resolvedDirectory = path => { const value = lstatSync(realpathSync(path), { bigint: true }); return value.isDirectory() ? value : undefined; };
+const sameGitPath = (a, b) => {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (process.platform !== 'win32') return a === b;
+  if (win32.normalize(a).toLowerCase() === win32.normalize(b).toLowerCase()) return true;
+  // Git can expand a Windows 8.3 alias that Node retained in the input path.
+  // Resolve both existing directories and compare their filesystem identities.
+  try { return same(resolvedDirectory(a), resolvedDirectory(b)); }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+};
 // Git for Windows understands the Windows device name, but rejects Node's
 // \\.\nul namespace spelling when reading GIT_CONFIG_GLOBAL.
 const gitNull = process.platform === 'win32' ? 'NUL' : devNull;

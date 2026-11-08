@@ -103,9 +103,17 @@ const repository = (directory, includeGitdir = false) => {
   const env = { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null' };
   const git = (...args) => execFileSync('git', ['-C', directory, 'rev-parse', ...args], { env, encoding: 'utf8', timeout: 3000, maxBuffer: 16384, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   try {
-    const root = realpathSync(git('--show-toplevel')), common = realpathSync(git('--path-format=absolute', '--git-common-dir'));
+    let root = realpathSync(git('--show-toplevel'));
+    const common = realpathSync(git('--path-format=absolute', '--git-common-dir'));
+    // Keep the caller's spelling for the same directory: Git may expand an
+    // 8.3 alias and mixing spellings loses ancestor/configuration discovery.
+    if (sameDirectory(root, directory)) root = directory;
     return { directory, root, common, ...(includeGitdir ? { gitdir: realpathSync(git('--absolute-git-dir')) } : {}) };
   } catch { throw new ControlError('SNAPSHOT_REPOSITORY_UNVERIFIED'); }
+};
+const sameDirectory = (a, b) => {
+  const left = lstatSync(a, { bigint: true }), right = lstatSync(b, { bigint: true });
+  return left.isDirectory() && right.isDirectory() && left.dev === right.dev && left.ino === right.ino;
 };
 
 // Witness Git's worktree link and backlink files without reading arbitrary
@@ -148,7 +156,7 @@ function worktreeMetadata(path) {
 export function inspectNativeWorktreePair(from, to) {
   check(typeof from === 'string' && isAbsolute(from) && typeof to === 'string' && isAbsolute(to), 'ABSOLUTE_SNAPSHOT_ROOT_REQUIRED');
   const source = repository(from, true), destination = repository(to, true);
-  check(source.common === destination.common && destination.root === destination.directory && source.root !== destination.root,
+  check(sameDirectory(source.common, destination.common) && sameDirectory(destination.root, destination.directory) && !sameDirectory(source.root, destination.root),
     'WORKTREE_PROJECT_MISMATCH');
   const metadata = [source, destination].flatMap(repo => [join(repo.root, '.git'), repo.gitdir, repo.common,
     join(repo.gitdir, 'commondir'), join(repo.gitdir, 'gitdir')].map(worktreeMetadata));
@@ -280,7 +288,7 @@ export class NativeWorktreeSnapshotReader {
     try {
       check(isAbsolute(to), 'ABSOLUTE_SNAPSHOT_ROOT_REQUIRED');
       const native = await this.readNative(), sourceRepo = repository(native.directory), destinationRepo = repository(to);
-      check(sourceRepo.common === destinationRepo.common && destinationRepo.root === destinationRepo.directory, 'WORKTREE_PROJECT_MISMATCH');
+      check(sameDirectory(sourceRepo.common, destinationRepo.common) && sameDirectory(destinationRepo.root, destinationRepo.directory), 'WORKTREE_PROJECT_MISMATCH');
       const inventory = new Inventory(this.limits), base = { harness: this.harness, home: this.home, globalDirectory: this.globalDirectory,
         systemDirectories: this.systemDirectories, environment: this.environment, inventory };
       const sourceProfile = discover({ ...base, repo: sourceRepo }), destinationProfile = discover({ ...base, repo: destinationRepo });
