@@ -146,7 +146,8 @@ test('actual process exit after Git effect leaves durable evidence and restart o
   const f = fixture(t), preview = await f.preview();
   const crash = (op, id) => {
     assert.throws(() => execFileSync(process.execPath, [fileURLToPath(new URL('./fixtures/worktree-lifecycle-crash.js', import.meta.url)),
-      f.repository, join(f.root, 'state'), join(f.root, 'trees'), f.taskID, op, id], { stdio: ['ignore', 'pipe', 'pipe'] }), error => error.signal === 'SIGKILL');
+      f.repository, join(f.root, 'state'), join(f.root, 'trees'), f.taskID, op, id], { stdio: ['ignore', 'pipe', 'pipe'] }),
+    error => (error.signal === 'SIGKILL' || (process.platform === 'win32' && error.status !== 0)) && String(error.stderr).includes('FIXTURE_AFTER_EFFECT'));
   };
   crash('create', preview.id);
   // proper-lockfile conservatively holds a crashed writer for its stale timeout.

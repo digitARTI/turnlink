@@ -37,7 +37,8 @@ test('native source project check accepts only distinct worktrees in the same Gi
   assert.match(pair.projectID, /^[a-f0-9]{64}$/);
   assert.deepEqual(inspectNativeWorktreePair(f.project, f.destination), pair);
   const gitLink = join(f.destination, '.git'), original = readFileSync(gitLink);
-  writeFileSync(gitLink, 'gitdir: /temporary/foreign\n'); writeFileSync(gitLink, original);
+  // Git marks .git hidden on Windows, where opening it with 'w' is refused.
+  writeFileSync(gitLink, 'gitdir: /temporary/foreign\n', { flag: 'r+' }); writeFileSync(gitLink, original, { flag: 'r+' });
   const restored = inspectNativeWorktreePair(f.project, f.destination);
   assert.equal(restored.projectID, pair.projectID);
   assert.notDeepEqual(restored.metadata, pair.metadata, 'rewriting and restoring the worktree link must invalidate its observation');
