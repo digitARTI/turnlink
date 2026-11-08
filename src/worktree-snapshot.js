@@ -97,16 +97,64 @@ const parseConfig = (record, harness) => {
   } catch { throw new ControlError('SNAPSHOT_CONFIG_INVALID'); }
 };
 
-const repository = directory => {
+const repository = (directory, includeGitdir = false) => {
   directory = realpathSync(directory); check(lstatSync(directory).isDirectory(), 'SNAPSHOT_FILE_REFUSED');
   // rev-parse is read-only; ignore caller-selected Git directories/config/environment redirects.
   const env = { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null' };
   const git = (...args) => execFileSync('git', ['-C', directory, 'rev-parse', ...args], { env, encoding: 'utf8', timeout: 3000, maxBuffer: 16384, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   try {
     const root = realpathSync(git('--show-toplevel')), common = realpathSync(git('--path-format=absolute', '--git-common-dir'));
-    return { directory, root, common };
+    return { directory, root, common, ...(includeGitdir ? { gitdir: realpathSync(git('--absolute-git-dir')) } : {}) };
   } catch { throw new ControlError('SNAPSHOT_REPOSITORY_UNVERIFIED'); }
 };
+
+// Witness Git's worktree link and backlink files without reading arbitrary
+// repository contents. File ctime detects a change followed by restoration;
+// directory mtimes are intentionally excluded because ordinary Git operations
+// update them without changing their identity.
+function worktreeMetadata(path) {
+  let link;
+  try { link = lstatSync(path, { bigint: true }); }
+  catch (error) { if (error.code === 'ENOENT') return { path, present: false }; throw error; }
+  const resolved = realpathSync(path), initial = lstatSync(resolved, { bigint: true });
+  check(initial.isFile() || initial.isDirectory(), 'SNAPSHOT_FILE_REFUSED');
+  const id = stat => ({ device: String(stat.dev), inode: String(stat.ino), mode: String(stat.mode) });
+  const isLink = link.isSymbolicLink();
+  const linkWitness = { ...id(link), ...(isLink ? { changed: String(link.ctimeNs) } : {}) };
+  let content;
+  if (initial.isFile()) {
+    check(initial.size <= 65536n, 'SNAPSHOT_BUDGET_EXCEEDED');
+    const fd = openSync(resolved, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+    try {
+      const opened = fstatSync(fd, { bigint: true });
+      check(opened.isFile() && opened.dev === initial.dev && opened.ino === initial.ino && opened.size <= 65536n, 'SNAPSHOT_SOURCE_CHANGED');
+      const bytes = Buffer.alloc(Number(opened.size) + 1); let length = 0;
+      while (length < bytes.length) { const count = readSync(fd, bytes, length, bytes.length - length, null); if (!count) break; length += count; }
+      const after = fstatSync(fd, { bigint: true });
+      check(BigInt(length) === opened.size && opened.size === after.size && opened.ctimeNs === after.ctimeNs && opened.mtimeNs === after.mtimeNs, 'SNAPSHOT_SOURCE_CHANGED');
+      content = { digest: digest(bytes.subarray(0, length)), changed: String(opened.ctimeNs), modified: String(opened.mtimeNs) };
+    } finally { closeSync(fd); }
+  }
+  const finalLink = lstatSync(path, { bigint: true }), final = lstatSync(resolved, { bigint: true });
+  check(link.dev === finalLink.dev && link.ino === finalLink.ino && link.mode === finalLink.mode &&
+    (!isLink || link.ctimeNs === finalLink.ctimeNs) && initial.dev === final.dev && initial.ino === final.ino &&
+    (!content || initial.ctimeNs === final.ctimeNs && initial.mtimeNs === final.mtimeNs && initial.size === final.size), 'SNAPSHOT_SOURCE_CHANGED');
+  return { path, present: true, resolved, link: linkWitness, target: id(initial), ...(content ? { content } : {}) };
+}
+
+// Resolve the actual Git common directory for both existing worktrees. This is
+// project-identity evidence only; it is not a native authority digest, a lock
+// on Git metadata, or permission to publish a destination.
+export function inspectNativeWorktreePair(from, to) {
+  check(typeof from === 'string' && isAbsolute(from) && typeof to === 'string' && isAbsolute(to), 'ABSOLUTE_SNAPSHOT_ROOT_REQUIRED');
+  const source = repository(from, true), destination = repository(to, true);
+  check(source.common === destination.common && destination.root === destination.directory && source.root !== destination.root,
+    'WORKTREE_PROJECT_MISMATCH');
+  const metadata = [source, destination].flatMap(repo => [join(repo.root, '.git'), repo.gitdir, repo.common,
+    join(repo.gitdir, 'commondir'), join(repo.gitdir, 'gitdir')].map(worktreeMetadata));
+  return { source: source.directory, sourceRoot: source.root, destination: destination.directory,
+    projectID: hash({ gitCommonDirectory: source.common }), metadata };
+}
 
 const dynamicKeys = new Set(['plugins', 'mcp', 'skills', 'references', 'commands', 'agents', 'policies', 'formatter', 'lsp', 'shell',
   'mcp_servers', 'features', 'profiles', 'profile', 'projects', 'developer_instructions', 'model_instructions_file', 'experimental_instructions_file',

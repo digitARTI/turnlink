@@ -1,6 +1,6 @@
 import { constants, openSync, closeSync, writeFileSync, fsyncSync, renameSync, unlinkSync,
   mkdirSync, mkdtempSync, lstatSync, fstatSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, toNamespacedPath } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import lockfile from 'proper-lockfile';
 import { execFileSync } from 'node:child_process';
@@ -20,7 +20,7 @@ function windowsPermissions(path, created = false) {
   env.PSModulePath = '';
   try {
     execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
-      fileURLToPath(new URL('./windows-permissions.ps1', import.meta.url)), '-Path', path, '-Created', created === true ? 'true' : created === 'file' ? 'file' : 'false'],
+      fileURLToPath(new URL('./windows-permissions.ps1', import.meta.url)), '-Path', toNamespacedPath(path), '-Created', created === true ? 'true' : created === 'file' ? 'file' : 'false'],
     { env, windowsHide: true, timeout: 10000, stdio: ['ignore', 'ignore', 'ignore'] });
     if (created !== 'file') verifiedWindows.add(path);
   } catch { throw new Error('Private Windows path needs owner/administrator/SYSTEM-only ACLs'); }

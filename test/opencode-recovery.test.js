@@ -1,0 +1,65 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { writeFileSync, rmSync } from 'node:fs';
+import { privateTemp } from '../src/storage.js';
+import { createBroker } from '../src/broker.js';
+import { ChannelClient } from '../src/client.js';
+import { openCodeFixture } from './fixtures/opencode.js';
+
+const wait = async check => { for (let i = 0; i < 70; i++) { const result = await check(); if (result) return result; await delay(100); } throw new Error('Recovery condition timed out'); };
+test('OpenCode recovery requires current approved exact-key evidence and keeps native blockers and wake policy', async t => {
+  const root = privateTemp(join(tmpdir(), 'turnlink-native-recovery-'));
+  const tokenFile = join(root, 'host.token'), adapterTokenFile = join(root, 'adapter.token');
+  writeFileSync(tokenFile, '1'.repeat(64), { mode: 0o600 }); writeFileSync(adapterTokenFile, '3'.repeat(64), { mode: 0o600 });
+  const broker = createBroker({ directory: join(root, 'broker'), port: 0, secret: '1'.repeat(64), adminSecret: '2'.repeat(64), controlPlane: true, controlEffects: true, sweepIntervalMs: 20 });
+  await once(broker.server, 'listening');
+  const options = { url: `ws://127.0.0.1:${broker.server.address().port}`, tokenFile, credentialDirectory: join(root, 'proofs'), control: true, adapterTokenFile };
+  const admin = new ChannelClient({ ...options, token: '2'.repeat(64) }), sender = new ChannelClient({ ...options, token: '1'.repeat(64) });
+  t.after(async () => { admin.close(); sender.close(); await broker.close(); rmSync(root, { recursive: true, force: true }); });
+  const command = (op, fields = {}) => ({ id: randomUUID(), op, channel: 'dev', ...fields });
+  await admin.request('control_command', { command: command('channel.configure', { mode: 'approval' }) });
+  await admin.request('control_enroll_adapter', { hostId: 'local', credential: '3'.repeat(64) });
+  const native = [];
+  const nativePrompt = async input => {
+    if (input.metadata?.messageID) { native.push(input); if (native.length === 1) throw new Error('Native response lost'); }
+    return { id: input.id, sessionID: input.sessionID };
+  };
+  let f = await openCodeFixture(t, options, { session: { prompt: nativePrompt } });
+  t.after(() => f.cleanup());
+  await f.tools.channel_join.execute({ channel: 'dev', name: 'b', role: 'worker', project: { name: 'fixture' } }, { sessionID: 'b' });
+  await f.tools.channel_control.execute({ command: command('master.volunteer', { eligible: true }) }, { sessionID: 'b' });
+  const appoint = command('master.appoint', { candidate: 'opencode:b' }); await admin.request('control_command', { command: appoint });
+  await f.tools.channel_status.execute({ channel: 'dev', view: 'channel' }, { sessionID: 'b' });
+  await wait(async () => (await admin.request('control_query', { channel: 'dev', view: 'events' })).entries.some(e => e.type === 'notice.accepted'));
+  await f.tools.channel_control.execute({ command: command('master.accept', { proposalID: appoint.id, promptVersion: 1 }) }, { sessionID: 'b' });
+  await sender.request('join', { harness: 'opencode', sessionId: 'sender', channel: 'dev', name: 'sender', role: 'worker', project: { name: 'fixture', root: '/fixture' } });
+  const originalRequest = ChannelClient.prototype.request;
+  let evidenceAvailable = false;
+  ChannelClient.prototype.request = function (method, params) {
+    if (!evidenceAvailable && method === 'control_adapter' && params.command?.kind === 'native_idempotent') return Promise.reject(new Error('Fixture evidence capacity exhausted'));
+    return originalRequest.call(this, method, params);
+  };
+  t.after(() => { ChannelClient.prototype.request = originalRequest; });
+  const message = await sender.request('send', { agentId: 'opencode:sender', to: 'opencode:b', text: 'recover exact native ID', messageId: 'native-recovery' });
+  await wait(() => native.length === 1);
+  await delay(150); f.cleanup(); await delay(100);
+  evidenceAvailable = true;
+  f = await openCodeFixture(t, options, { storage: f.storage, session: { prompt: nativePrompt } });
+  const evidence = await wait(async () => (await admin.request('control_query', { channel: 'dev', view: 'evidence' })).entries.find(e => e.entityID === message.id && e.kind === 'native_idempotent'));
+  await delay(2200); assert.equal(native.length, 1, 'approval mode must not replay uncertain native admission');
+  const action = command('action.request', { generation: 1, operation: 'retry_delivery', target: 'opencode:b', messageID: message.id, evidence: 'native_idempotent', evidenceID: evidence.id, admissionID: native[0].id });
+  await f.tools.channel_control.execute({ command: action }, { sessionID: 'b' });
+  f.permissions.set('b', [{ id: 'block-recovery' }]);
+  await admin.request('control_command', { command: command('action.approve', { actionID: action.id }) });
+  await delay(2200); assert.equal(native.length, 1, 'approval cannot bypass native permissions');
+  f.permissions.clear();
+  await wait(() => native.length === 2);
+  assert.equal(native[1].id, native[0].id); assert.equal(native[1].agent, undefined); assert.equal(native[1].permissions, undefined);
+  await wait(() => broker.store.deliveryRetries?.[action.id]?.outcome === 'admitted');
+  assert.equal(broker.store.deliveryRetries[action.id].admissionID, native[0].id);
+});

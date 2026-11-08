@@ -64,7 +64,9 @@ export function stageCodexRuntime(root, codex) {
     const temporary = join(bin, `.runtime-${randomUUID()}`);
     try {
       mkdirSync(temporary);
-      cpSync(source, temporary, { recursive: true, errorOnExist: true, force: false });
+      for (const name of readdirSync(source)) {
+        cpSync(join(source, name), join(temporary, name), { recursive: true, errorOnExist: true, force: false });
+      }
       if (JSON.stringify(inventory(temporary)) !== JSON.stringify(files)) throw new Error('Runtime copy verification failed');
       renameSync(temporary, runtime);
     } finally { rmSync(temporary, { recursive: true, force: true }); }

@@ -44,6 +44,20 @@ The macOS hardening cutover helper now accepts native V2 config only. It preserv
 
 No exactly-once task-completion guarantee is introduced. Membership removal cannot undo work already admitted to OpenCode.
 
+## Passive CLI alerts (separate opt-in)
+
+The package now includes a `./tui` entry and a read-only, Location/session-fenced
+alert RPC. Enable server `control`/`alerts` and the separate CLI-owned `alerts`
+option only if desired. No broker credentials are needed in CLI configuration,
+and alerts never enter the model inbox. See [setup and verification](opencode-alerts.md).
+
+## Passive health observations (separate opt-in)
+
+Server `health: true` additionally requires control and the enrolled adapter token
+file. It publishes bounded native/session metadata, never prompts or native
+messages, and does not modify live delivery blockers. No CLI setting is needed.
+See [native health, operator views and limits](adapter-health.md).
+
 ## Verification
 
 ```sh

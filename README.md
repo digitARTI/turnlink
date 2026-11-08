@@ -34,7 +34,10 @@ When the recipient has finished responding, its harness adapter can start a new 
 
 ## What you get
 
-An opt-in [control-plane experiment](docs/control-plane.md) adds authenticated governance/task records and OpenCode/Codex supplemental master notices. A separate experimental gate supports broker delivery pause/resume and never-offered cancellation. Task dispatch and the dashboard remain pending.
+An opt-in [control plane](docs/control-plane.md) adds authenticated governance/task records and OpenCode/Codex supplemental master notices. Separate default-off gates support receipt-backed broker delivery effects and existing-conversation task execution. An experimental [React/Mantine operator console](docs/operator-dashboard.md) provides scoped local views and guarded commands; optional [passive OpenCode CLI alerts](docs/opencode-alerts.md) show coordination hints without waking a model. An [operator-supervised managed worktree flow](docs/worktree-lifecycle.md) supports creation and cleanup. Session moves use the agreed stop-and-resume procedure; automatic live transfer and independent native writer exclusion are not supported.
+
+All six opt-in [recovery executors](docs/control-recovery.md) now have durable receipts and receiver-bound native outcomes. Verified private archives support explicit [receipt reclamation](docs/control-receipt-reclamation.md); [history and entity-capacity recovery](docs/control-history-reclamation.md) preserves late holds and exact receipts. Current scope is tracked in the [execution ledger](docs/remaining-development.md). The separate [operator attention process](docs/operator-attention.md) records native submission uncertainty across restart without acknowledging the broker inbox. These development features do not install or activate production services.
+
 
 | Capability | Behavior |
 | :--- | :--- |
@@ -143,6 +146,25 @@ The plugin registers native channel tools, supplies the real session identity, a
 
 ### Codex in VS Code
 
+For the interactive Codex CLI, Turnlink provides a launcher that connects the
+terminal UI to its stdio proxy over an authenticated, loopback-only WebSocket.
+The launcher runs the official Codex executable; it does not replace or patch it.
+Configure the MCP server below, then set `AGENT_CHANNEL_CODEX_EXECUTABLE` to the
+absolute path of the official executable and set `AGENT_CHANNEL_URL`,
+`AGENT_CHANNEL_TOKEN_FILE`, and `AGENT_CHANNEL_CREDENTIAL_DIR` to the same
+broker and private credentials used by the MCP server. Start a new terminal
+session with `npm run codex --` or resume one with
+`npm run codex -- resume <session-id>`. Stop the original session before
+resuming it; this launcher does not provide native writer exclusion. The
+launcher is for the terminal UI and does not automatically reconfigure the
+Codex desktop application or an already-running interface. Verify that the
+session's receiver is connected after joining the channel.
+
+When the conversation is owned by the local shared Codex app-server daemon,
+set `AGENT_CHANNEL_CODEX_DAEMON_PROXY=1` for the launcher. Turnlink connects to
+that daemon's existing local socket instead of starting another app-server.
+The daemon must already be running.
+
 <details>
 <summary><strong>macOS / Linux: connect the official extension through the stdio proxy</strong></summary>
 
@@ -241,7 +263,44 @@ node /absolute/path/turnlink/src/launch-claude.js --dangerously-load-development
 
 Accept the channel and MCP prompts. Join with `harness="claude"` and the session ID from the hook. This setup requires a channel-capable Claude version and applicable organization settings. The documented launch path is the interactive CLI, including VS Code's integrated terminal; IDE-specific activation must be checked separately.
 
+Claude Code versions that provide `CLAUDE_CODE_SESSION_ID` to stdio MCP
+servers can bind directly to that harness-supplied ID. If an explicit
+`AGENT_CHANNEL_SESSION_ID` is also set, it must match. Claude Code documents
+that an MCP server retains the ID from when it was started, including after
+`/clear`: restart the MCP server or start a fresh session before using the
+channel after a session change. The Code tab and Claude Desktop chat have
+different MCP configuration and channel behavior; loading tools alone does not
+prove unsolicited wake-up in either surface.
+
 Claude must call `channel_ack(id)` after reading an incoming event. Writing an MCP notification alone does not confirm model delivery: Claude can silently drop notifications if the channel is disabled. Ordinary MCP mode exposes messaging tools but does not enable native idle wake-up.
+
+An experimental alternative for Claude Code sessions with the `Monitor` tool
+sets `AGENT_CHANNEL_CLAUDE_MONITOR=1` in the Claude MCP server environment. The
+MCP receiver then writes incoming messages to a private per-session inbox
+instead of using Claude channel notifications. `channel_join` provides the
+session-bound Monitor command, which reads `CLAUDE_CODE_SESSION_ID` from the
+harness and uses the same state directory as the MCP server. Each line contains the
+broker ID and peer text; long messages are split into numbered parts and sent
+with a short delay to reduce notification batching. Claude combines all parts
+before calling `channel_ack`. If a part is missing or
+truncated by the Monitor surface, retrieve the message with `channel_history`
+before acknowledging it. Restarting the monitor replays unconfirmed entries.
+The monitor does not subscribe to the broker or acknowledge messages.
+Monitor availability, permission prompts, delivery while idle and restart
+behavior depend on the actual Claude Code surface and must be verified there.
+Individual Monitor watches expire; this setup does not independently guarantee
+watch startup or renewal and does not promise exactly-once processing.
+
+In monitor mode, `channel_join` also reports whether a recently active monitor
+was observed and provides the exact session-bound command. Claude Code can start
+that command with `Monitor` using `CLAUDE_CODE_SESSION_ID`; no model-supplied
+session ID is needed. A fresh heartbeat is only a local liveness hint, not a
+delivery receipt. Starting or renewing the watch still depends on Claude Code's
+tool availability and permission policy; verify this in the installed surface.
+After a successful `channel_leave`, or removal for a reason other than a channel
+change, the MCP receiver requests the active monitor instance to stop. Changing
+channels keeps the monitor running. Session closure also ends the Claude-managed
+monitor; an abrupt exit can leave a short-lived stale heartbeat.
 
 </details>
 
@@ -427,7 +486,7 @@ npm test
 npm run doctor
 ```
 
-The suite covers real sockets/MCP stdio, authorization attacks, routing, replay, session isolation, approvals, name lifecycle, exclusive persistence, malformed traffic, failed-write recovery, installer rollback, uncertain/late admission, private Windows config replacement and framework-metadata binding. OpenCode V2 tests additionally cover native tool schemas, admission retry, membership reload, question snapshots, persisted form blockers and event-stream recovery. Three platform-specific cases run on Windows. Reservation tests use a controlled clock.
+The suite covers real sockets/MCP stdio, authorization attacks, routing, replay, session isolation, approvals, name lifecycle, exclusive persistence, malformed traffic, failed-write recovery, installer rollback, uncertain/late admission, private Windows config replacement and framework-metadata binding. OpenCode V2 tests additionally cover native tool schemas, admission retry, membership reload, question snapshots, persisted form blockers and event-stream recovery. Windows-specific cases cover native launcher delivery, private ACLs and notification shortcut identity. Reservation tests use a controlled clock.
 
 With OpenCode 2.0.28 installed, run the opt-in real-service test (isolated configuration and local model fixture, no paid API calls):
 
@@ -497,8 +556,10 @@ docs/                         Remote design, live proof, local deployment record
 
 ## Next work
 
-- [x] Control-plane foundation, authenticated broker/OpenCode/Codex governance, receipt-backed broker delivery effects, internal worktree grant/recovery contracts and native/offline snapshot observation. Live task/worktree execution and dashboard remain pending. [Implementation status and agreed behavior →](docs/control-plane.md)
-- [ ] React/Mantine operations dashboard, broker/adapter control integration, channel master elections and operational task scheduling.
+- [x] Control-plane foundation, authenticated broker/OpenCode/Codex governance, channel master elections, receipt-backed broker effects, opt-in existing-cwd task flows and native/offline snapshot observation. [Implementation status and agreed behavior →](docs/control-plane.md)
+- [x] Core authenticated loopback React/Mantine console, private control exports, bounded broker metadata telemetry and operator storage-pressure views. [Console setup and limits →](docs/operator-dashboard.md)
+- [x] Gate 2: operator-supervised stop and resume, with manual confirmation of external work and source shutdown. [Supported procedure →](docs/migration-resume.md)
+- [ ] Complete storage-capacity acceptance, installed alert/workflow surfaces and remaining Windows/IDE/live-model operational acceptance. [Full delivery gates →](docs/control-plane-roadmap.md)
 - [ ] Verified same-window, same-project `/new` handoff.
 - [x] Per-host credentials and scoped session capabilities (v0.2 candidate).
 - [ ] Formal accepted / turn-started / processed lifecycle receipts.

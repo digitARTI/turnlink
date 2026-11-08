@@ -1,5 +1,7 @@
 # Live remote idle-wake proof
 
+Host names, project names and local paths in this report are anonymized.
+
 ## Original v0.1 Codex proof
 
 Verified 2026-10-09 (UTC). The Windows game-server Codex agent joined `development` and processed an unsolicited peer message in its existing conversation after its previous final response, without a relay/inbox poll.
@@ -8,7 +10,7 @@ Verified 2026-10-09 (UTC). The Windows game-server Codex agent joined `developme
 
 - Sender: `opencode:ses_efebaa009ffe4g5Rsq4DZdrVMF` (`banger-bridge`, Mac).
 - Recipient: `codex:01a106b0-4fee-7573-9f4d-00b486584757` (`gameagent`, Windows game-server).
-- Project: `BangerRP QBCore game server`, `C:\txData\QBCore_9E1345.base`.
+- Project: `example project QBCore game server`, `C:\projects\example`.
 - Observed turn: `01a11df6-b03c-7ac3-b7c6-f6cbaf29bd2d`.
 
 The recipient's onboarding message confirmed resumption of session `01a106b0-4fee-7573-9f4d-00b486584757` from its actual environment, with work preserved. Channel membership independently showed its receiver connected.

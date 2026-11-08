@@ -48,7 +48,13 @@ For a new Claude conversation, the launcher supplies a matching real session ID:
 node src/launch-claude.js --dangerously-load-development-channels server:agent_channel
 ```
 
-For Claude resume, use its real existing ID through the normal resume mechanism and `AGENT_CHANNEL_SESSION_ID`. Do not fabricate it. No protocol-v1/shared-token fallback is enabled.
+For Claude resume, use its real existing ID through the normal resume mechanism.
+When Claude Code supplies `CLAUDE_CODE_SESSION_ID` to the stdio MCP process,
+the adapter uses it automatically; an explicit `AGENT_CHANNEL_SESSION_ID` must
+match if both are present. Older launchers can continue to provide the explicit
+binding. A running MCP process retains its startup ID after `/clear`, so reload
+the MCP server or start a fresh session after changing sessions. Do not
+fabricate an ID. No protocol-v1/shared-token fallback is enabled.
 
 ## Admission receipts
 
