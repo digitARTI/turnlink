@@ -7,11 +7,12 @@ import { tmpdir } from 'node:os';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { WebSocketServer } from 'ws';
+import { setTimeout as delay } from 'node:timers/promises';
 import { privateTemp } from '../src/storage.js';
 import { createBroker } from '../src/broker.js';
 import { ChannelClient } from '../src/client.js';
 import { createDashboard } from '../src/dashboard-server.js';
-import { channelPrecondition } from '../src/control/contracts.js';
+import { channelPrecondition, taskPrecondition } from '../src/control/contracts.js';
 
 const HOST = '1'.repeat(64), ADMIN = '2'.repeat(64), LOGIN = '4'.repeat(64);
 const rootFor = () => privateTemp(join(tmpdir(), 'turnlink-dashboard-'));
@@ -54,6 +55,14 @@ async function fixture(t, extra = {}) {
 }
 const configuration = () => ({ id: randomUUID(), op: 'channel.configure', channel: 'dev', mode: 'approval' });
 const prepare = (f, owner, command = configuration()) => f.call('/api/preview', { ...owner, input: { command } });
+async function claimant(t, f, sessionId) {
+  const client = new ChannelClient({ url: `ws://127.0.0.1:${f.broker.server.address().port}`, token: HOST, credentialDirectory: join(f.root, 'proofs') });
+  t.after(() => client.close());
+  const agentId = `opencode:${sessionId}`;
+  await client.request('join', { harness: 'opencode', sessionId, name: sessionId, role: 'Existing participant', channel: 'dev', project: { name: 'Fixture', root: '/fixture' } });
+  await client.subscribe(agentId);
+  return { client, agentId, run: (op, fields) => client.request('control_command', { agentId, command: { id: randomUUID(), channel: 'dev', op, ...fields } }) };
+}
 
 test('dashboard requires separate credentials, explicit channel scopes and safe static assets', () => {
   const root = rootFor(), assetDirectory = staticFiles(root);
@@ -290,4 +299,232 @@ test('a browser cannot approve an executor-disabled or unsupported recovery prop
   const owner = await f.signIn();
   const result = await prepare(f, owner, { id: randomUUID(), channel: 'dev', op: 'action.approve', actionID: action.id });
   assert.equal(result.status, 409); assert.equal(result.body.error, 'EFFECT_NOT_ENABLED');
+});
+
+test('recovery approval previews expose the exact wake policy and native recovery binding, and refuse changed proposals', async t => {
+  const action = { id: randomUUID(), status: 'awaiting_approval', operation: 'change_wake_policy', target: 'opencode:receiver',
+    wakePolicy: 'paused', evidence: 'not_applicable', generation: 3, policyRevision: 1, requester: 'opencode:master' };
+  let sends = 0;
+  const f = await stub(t, ({ request, respond, channel }) => {
+    if (request.method === 'control_query') respond(request.params.view === 'channel' ? { channel } : { entries: [action] });
+    if (request.method === 'control_info') respond({ available: true, effectsEnabled: true, effectOperations: ['change_wake_policy', 'retry_delivery'] });
+    if (request.method === 'control_command') { sends++; respond({ commandID: request.params.command.id }); }
+  });
+  const owner = await f.signIn();
+  const command = () => ({ id: randomUUID(), channel: 'dev', op: 'action.approve', actionID: action.id });
+  const wake = await prepare(f, owner, command()); assert.equal(wake.status, 200);
+  assert.equal(wake.body.proposal.wakePolicy, 'paused');
+  assert.equal(wake.body.proposal.actionID, action.id);
+  assert.equal(wake.body.proposal.requester, action.requester);
+  assert.equal(wake.body.proposal.generation, action.generation);
+  assert.equal(wake.body.proposal.policyRevision, action.policyRevision);
+  const rejection = await prepare(f, owner, { ...command(), op: 'action.reject' });
+  assert.equal(rejection.status, 200); assert.match(rejection.body.proposal.effect, /Rejects this proposal/);
+  action.wakePolicy = 'steer';
+  const stale = await f.call('/api/execute', { ...owner, input: { previewID: wake.body.previewID } });
+  assert.equal(stale.status, 409); assert.equal(stale.body.error, 'PREVIEW_STALE'); assert.equal(sends, 0);
+  Object.assign(action, { operation: 'retry_delivery', messageID: randomUUID(), evidence: 'native_idempotent',
+    admissionID: 'msg_original_native_prompt', recoveryEvidenceID: randomUUID() });
+  delete action.wakePolicy;
+  const retry = await prepare(f, owner, command()); assert.equal(retry.status, 200);
+  assert.equal(retry.body.proposal.admissionID, action.admissionID);
+  assert.equal(retry.body.proposal.recoveryEvidenceID, action.recoveryEvidenceID);
+  assert.equal(retry.body.proposal.wakePolicy, null);
+  assert.equal(retry.body.proposal.messageID, action.messageID);
+  assert.match(retry.body.proposal.effect, /schedules recovery/i);
+  action.recoveryEvidenceID = randomUUID();
+  const changed = await f.call('/api/execute', { ...owner, input: { previewID: retry.body.previewID } });
+  assert.equal(changed.status, 409); assert.equal(changed.body.error, 'PREVIEW_STALE'); assert.equal(sends, 0);
+});
+
+test('durable notifications reach the real dashboard; preview/read never acknowledge and confirmation changes no control authority', async t => {
+  const f = await fixture(t), owner = await f.signIn();
+  await f.command('task.create', { title: 'Deadline fixture', instructions: 'private content excluded', criteria: 'Keep unresolved', requiresWorktree: false, deadlineAt: 1000001 });
+  f.advance(2);
+  const deadline = Date.now() + 5000;
+  let inbox;
+  do { inbox = await f.call('/api/channels/dev/notifications?after=0', owner); if (inbox.body.entries?.length) break; await delay(20); } while (Date.now() < deadline);
+  assert.equal(inbox.status, 200); assert.equal(inbox.body.entries.length, 1);
+  const notification = inbox.body.entries[0], command = { op: 'notification.ack', channel: 'dev', id: notification.id };
+  assert.equal(notification.acknowledgedAt, null); assert.ok(!JSON.stringify(inbox.body).includes('private content excluded'));
+  assert.equal((await f.call('/api/channels/private/notifications', owner)).status, 403);
+  assert.equal((await f.call(`/api/notification?channel=private&id=${notification.id}`, owner)).status, 403);
+  assert.equal((await f.call('/api/preview', { cookie: owner.cookie, input: { command } })).status, 403);
+  assert.equal((await f.call('/api/channels/dev/notifications?offset=0', owner)).status, 400);
+  const state = f.broker.store, before = await f.admin.request('control_query', { channel: 'dev', view: 'incidents' });
+  const preview = await prepare(f, owner, command); assert.equal(preview.status, 200); assert.match(preview.body.notice, /does not resolve/);
+  assert.equal((await f.call(`/api/notification?channel=dev&id=${notification.id}`, owner)).body.acknowledgedAt, null);
+  const input = { previewID: preview.body.previewID };
+  const first = await f.call('/api/execute', { ...owner, input }); assert.equal(first.status, 200); assert.equal(first.body.result.acknowledgedAt, 1000002);
+  assert.deepEqual((await f.call('/api/execute', { ...owner, input })).body, first.body);
+  assert.deepEqual(await f.admin.request('control_query', { channel: 'dev', view: 'incidents' }), before);
+  assert.deepEqual(f.broker.store, state);
+  const lookup = await f.call(`/api/notification?channel=dev&id=${notification.id}`, owner); assert.equal(lookup.body.acknowledgedAt, 1000002);
+  assert.equal((await prepare(f, owner, command)).status, 409);
+});
+
+test('lost notification acknowledgement reply is not resent; its immutable ID supports read-only investigation', async t => {
+  const notification = { id: randomUUID(), channel: 'dev', sequence: 1, type: 'incident.opened', at: 1000, entityID: randomUUID(), acknowledgedAt: null };
+  let acknowledgements = 0;
+  const f = await stub(t, ({ request, respond, socket, channel }) => {
+    if (request.method === 'control_query') respond({ channel });
+    if (request.method === 'control_notifications') respond(notification);
+    if (request.method === 'control_notification_ack') { acknowledgements++; notification.acknowledgedAt = 1001; socket.close(); }
+  });
+  const owner = await f.signIn(), command = { op: 'notification.ack', channel: 'dev', id: notification.id };
+  const preview = await prepare(f, owner, command); assert.equal(preview.status, 200);
+  const input = { previewID: preview.body.previewID };
+  const result = await f.call('/api/execute', { ...owner, input }); assert.equal(result.body.error, 'COMMAND_OUTCOME_UNCERTAIN');
+  assert.equal((await f.call('/api/execute', { ...owner, input })).status, 409); assert.equal(acknowledgements, 1);
+  const lookup = await f.call(`/api/notification?channel=dev&id=${notification.id}`, owner);
+  assert.equal(lookup.body.acknowledgedAt, 1001); assert.equal(acknowledgements, 1);
+});
+
+test('replacement login while notification is revalidated prevents the old acknowledgement send', async t => {
+  const notification = { id: randomUUID(), channel: 'dev', sequence: 1, type: 'incident.opened', at: 1000, acknowledgedAt: null };
+  let queries = 0, sends = 0, release;
+  const f = await stub(t, ({ request, respond, events, channel }) => {
+    if (request.method === 'control_query') respond({ channel });
+    if (request.method === 'control_notifications') {
+      if (++queries === 2) { release = () => respond(notification); events.emit('checking'); } else respond(notification);
+    }
+    if (request.method === 'control_notification_ack') { sends++; respond({}); }
+  });
+  const owner = await f.signIn(), preview = await prepare(f, owner, { op: 'notification.ack', channel: 'dev', id: notification.id });
+  const checking = once(f.events, 'checking'), execute = f.call('/api/execute', { ...owner, input: { previewID: preview.body.previewID } });
+  await checking; await f.signIn(); release(); assert.equal((await execute).status, 401); assert.equal(sends, 0);
+});
+
+test('advanced task metadata survives guarded real-dashboard creation without claim, dispatch or implicit late-run decision', async t => {
+  const f = await fixture(t), owner = await f.signIn();
+  const dependency = await f.command('task.create', { title: 'Dependency', instructions: 'Existing work', criteria: 'Master review', requiresWorktree: false });
+  const command = { id: randomUUID(), op: 'task.create', channel: 'dev', title: 'Scheduled dependant', instructions: 'Keep approvals', criteria: 'Wait for dependency',
+    requiresWorktree: false, dependencies: [dependency.commandID], priority: 91, schedule: { at: 2000000, missed: 'ask', maxLatenessMs: 30000 }, deadlineAt: 3000000, progressTimeoutMs: 120000 };
+  const preview = await prepare(f, owner, command); assert.equal(preview.status, 200);
+  assert.equal(preview.body.proposal.scheduledStartUTC, new Date(2000000).toISOString());
+  assert.equal(preview.body.proposal.deadlineUTC, new Date(3000000).toISOString());
+  assert.equal(preview.body.proposal.missedPolicy, 'ask'); assert.deepEqual(preview.body.command.dependencies, [dependency.commandID]);
+  assert.equal((await f.admin.request('control_receipt', { channel: 'dev', commandID: command.id })).known, false);
+  const confirmed = await f.call('/api/execute', { ...owner, input: { previewID: preview.body.previewID } }); assert.equal(confirmed.status, 200);
+  const task = (await f.admin.request('control_query', { channel: 'dev', view: 'tasks', entityID: command.id })).entries[0];
+  for (const field of ['dependencies', 'priority', 'schedule', 'deadlineAt', 'progressTimeoutMs']) assert.deepEqual(task[field], command[field]);
+  assert.equal(task.status, 'open'); assert.equal(task.claimant, null); assert.equal(task.attempt, 0); assert.equal(task.requiresWorktree, false); assert.equal(task.missedDecision, undefined);
+});
+
+test('task preview rejects duplicate IDs, past/out-of-range dates and oversized dependency sets without task admission', async t => {
+  const f = await fixture(t), owner = await f.signIn(), id = randomUUID();
+  const base = { id: randomUUID(), op: 'task.create', channel: 'dev', title: 'Refused metadata', instructions: 'No effect', criteria: 'Refuse', requiresWorktree: false };
+  for (const [fields, code] of [[{ dependencies: [id, id] }, 'DUPLICATE_DEPENDENCY'], [{ deadlineAt: 1 }, 'DEADLINE_IN_PAST'],
+    [{ schedule: { at: Number.MAX_SAFE_INTEGER } }, 'TASK_TIME_OUT_OF_RANGE']]) {
+    const result = await prepare(f, owner, { ...base, ...fields }); assert.equal(result.status, 409); assert.equal(result.body.error, code);
+  }
+  assert.equal((await prepare(f, owner, { ...base, dependencies: Array.from({ length: 65 }, () => randomUUID()) })).status, 400);
+  assert.equal((await f.admin.request('control_query', { channel: 'dev', view: 'tasks' })).entries.length, 0);
+});
+
+test('deadline expiry and unknown dependency refuse precisely, not as inferred execution uncertainty or permission to replay', async t => {
+  const f = await fixture(t), owner = await f.signIn();
+  const base = { id: randomUUID(), op: 'task.create', channel: 'dev', title: 'Refused commit', instructions: 'No effect', criteria: 'Exact refusal', requiresWorktree: false };
+  const dated = { ...base, deadlineAt: 1000005 }, preview = await prepare(f, owner, dated); assert.equal(preview.status, 200);
+  f.advance(6);
+  const expired = await f.call('/api/execute', { ...owner, input: { previewID: preview.body.previewID } }); assert.equal(expired.status, 409); assert.equal(expired.body.error, 'DEADLINE_IN_PAST');
+  const unknown = { ...base, id: randomUUID(), dependencies: [randomUUID()] }, dependencyPreview = await prepare(f, owner, unknown);
+  assert.equal(dependencyPreview.status, 200);
+  const refused = await f.call('/api/execute', { ...owner, input: { previewID: dependencyPreview.body.previewID } });
+  assert.equal(refused.status, 409); assert.equal(refused.body.error, 'UNKNOWN_DEPENDENCY');
+  for (const commandID of [dated.id, unknown.id]) assert.equal((await f.admin.request('control_receipt', { channel: 'dev', commandID })).known, false);
+  assert.equal((await f.admin.request('control_query', { channel: 'dev', view: 'tasks' })).entries.length, 0);
+});
+
+test('an explicit deadline rejection at the actual broker commit is displayed without retry while lost replies remain uncertain', async t => {
+  let sends = 0;
+  const f = await stub(t, ({ request, respond, socket, channel }) => {
+    if (request.method === 'control_query') respond({ channel });
+    if (request.method === 'control_command') { sends++; socket.send(JSON.stringify({ v: 2, id: request.id, error: 'DEADLINE_IN_PAST' })); }
+  });
+  const owner = await f.signIn(), preview = await prepare(f, owner, { id: randomUUID(), op: 'task.create', channel: 'dev', title: 'Commit deadline', instructions: 'Keep policy', criteria: 'Refuse', requiresWorktree: false, deadlineAt: Date.now() + 60000 });
+  const input = { previewID: preview.body.previewID };
+  const result = await f.call('/api/execute', { ...owner, input }); assert.equal(result.status, 409); assert.equal(result.body.error, 'DEADLINE_IN_PAST');
+  assert.equal((await f.call('/api/execute', { ...owner, input })).status, 409); assert.equal(sends, 1);
+});
+
+test('reassignment previews bind exact claimant/attempt, reopen only after confirmation and never release a later claim on retry', async t => {
+  const f = await fixture(t), owner = await f.signIn(), a = await claimant(t, f, 'a'), b = await claimant(t, f, 'b');
+  const taskID = (await f.command('task.create', { title: 'Reassign fixture', instructions: 'Keep evidence', criteria: 'Voluntary claims', requiresWorktree: false })).commandID;
+  await a.run('task.claim', { taskID });
+  const command = { id: randomUUID(), op: 'task.reassign', channel: 'dev', taskID }, preview = await prepare(f, owner, command);
+  assert.equal(preview.status, 200); assert.equal(preview.body.proposal.claimant, a.agentId);
+  await a.run('task.release', { taskID }); await b.run('task.claim', { taskID });
+  const stale = await f.call('/api/execute', { ...owner, input: { previewID: preview.body.previewID } });
+  assert.equal(stale.status, 409); assert.equal(stale.body.error, 'PREVIEW_STALE');
+  const fresh = await prepare(f, owner, command); assert.equal(fresh.status, 200); assert.equal(fresh.body.proposal.claimant, b.agentId);
+  const input = { previewID: fresh.body.previewID }, committed = await f.call('/api/execute', { ...owner, input }); assert.equal(committed.status, 200);
+  const task = () => f.admin.request('control_query', { channel: 'dev', view: 'tasks', entityID: taskID });
+  assert.equal((await task()).entries[0].status, 'open'); assert.equal((await task()).entries[0].claimant, null);
+  await b.run('task.claim', { taskID }); const newer = (await task()).entries[0];
+  assert.deepEqual((await f.call('/api/execute', { ...owner, input })).body, committed.body); assert.deepEqual((await task()).entries[0], newer);
+});
+
+test('real broker enforces task digest at commit even when channel policy is unchanged', async t => {
+  const f = await fixture(t), a = await claimant(t, f, 'a'), b = await claimant(t, f, 'b');
+  const taskID = (await f.command('task.create', { title: 'Wire fence', instructions: 'Keep current owner', criteria: 'Refuse stale release', requiresWorktree: false })).commandID;
+  await a.run('task.claim', { taskID });
+  const expectedTask = taskPrecondition((await f.admin.request('control_query', { channel: 'dev', view: 'tasks', entityID: taskID })).entries[0]);
+  const expected = channelPrecondition((await f.admin.request('control_query', { channel: 'dev', view: 'channel' })).channel);
+  await a.run('task.release', { taskID }); await b.run('task.claim', { taskID });
+  const command = { id: randomUUID(), op: 'task.reassign', channel: 'dev', taskID };
+  await assert.rejects(f.admin.request('control_command', { command, expected, expectedTask }), /PRECONDITION_FAILED/);
+  assert.equal((await f.admin.request('control_receipt', { channel: 'dev', commandID: command.id })).known, false);
+  assert.equal((await f.admin.request('control_query', { channel: 'dev', view: 'tasks', entityID: taskID })).entries[0].claimant, b.agentId);
+});
+
+test('active-work reassignment remains blocked until stop evidence, and new uncertainty revokes that eligibility', async t => {
+  const f = await fixture(t, { taskDispatch: true }), owner = await f.signIn(), a = await claimant(t, f, 'a');
+  await f.admin.request('control_enroll_adapter', { hostId: 'local', credential: '3'.repeat(64) });
+  const taskID = (await f.command('task.create', { title: 'Active fixture', instructions: 'No blind release', criteria: 'Fresh stop marker', requiresWorktree: false })).commandID;
+  await a.run('task.claim', { taskID });
+  const pulled = await a.client.request('control_task_pull', { agentId: a.agentId, credential: '3'.repeat(64), channel: 'dev', cwd: '/fixture', scopeDigest: 'a'.repeat(64) });
+  const task = pulled.task;
+  const report = (op, fields) => a.client.request('control_adapter', { agentId: a.agentId, credential: '3'.repeat(64), command: { id: randomUUID(), op, channel: 'dev', taskID, attempt: task.attempt, ...fields } });
+  await report('task.admission', { outcome: 'admitted', receiptID: randomUUID(), admissionID: task.nativeAdmissionID });
+  await report('task.started', { evidenceID: randomUUID() });
+  const command = { id: randomUUID(), op: 'task.reassign', channel: 'dev', taskID };
+  assert.equal((await prepare(f, owner, command)).body.error, 'STOP_EVIDENCE_REQUIRED');
+  await report('task.stopped', { evidenceID: randomUUID() }); const preview = await prepare(f, owner, command); assert.equal(preview.status, 200);
+  await report('task.uncertain', {});
+  const result = await f.call('/api/execute', { ...owner, input: { previewID: preview.body.previewID } });
+  assert.equal(result.status, 409); assert.equal(result.body.error, 'STOP_EVIDENCE_REQUIRED');
+  assert.equal((await prepare(f, owner, { ...command, id: randomUUID() })).body.error, 'STOP_EVIDENCE_REQUIRED');
+  const observed = (await f.admin.request('control_query', { channel: 'dev', view: 'tasks', entityID: taskID })).entries[0];
+  assert.equal(observed.status, 'uncertain'); assert.equal(observed.claimant, a.agentId); assert.equal(observed.stoppedEvidence, undefined);
+});
+
+test('missed-schedule confirmation becomes stale when a participant claims the task during operator review', async t => {
+  const f = await fixture(t), owner = await f.signIn(), a = await claimant(t, f, 'a');
+  const taskID = (await f.command('task.create', { title: 'Missed ask', instructions: 'Keep claim fence', criteria: 'Explicit run decision', requiresWorktree: false, schedule: { at: 1, missed: 'ask', maxLatenessMs: 5 } })).commandID;
+  const preview = await prepare(f, owner, { id: randomUUID(), op: 'task.missed', channel: 'dev', taskID, run: true }); assert.equal(preview.status, 200);
+  await a.run('task.claim', { taskID });
+  const result = await f.call('/api/execute', { ...owner, input: { previewID: preview.body.previewID } }); assert.equal(result.status, 409); assert.equal(result.body.error, 'PREVIEW_STALE');
+  const task = (await f.admin.request('control_query', { channel: 'dev', view: 'tasks', entityID: taskID })).entries[0];
+  assert.equal(task.claimant, a.agentId); assert.equal(task.missedDecision, undefined);
+});
+
+test('dashboard sends both channel and exact canonical task fences at the actual reassignment/missed RPC boundary', async t => {
+  const task = { id: randomUUID(), channel: 'dev', title: 'Transport fixture', instructions: 'No privileges', criteria: 'Exact target fence',
+    dependencies: [], priority: 50, status: 'claimed', createdAt: 1, progressTimeoutMs: 300000, requiresWorktree: false,
+    claimant: 'opencode:owner', attempt: 0, claimGeneration: 1, admission: 'none', schedule: { at: 1, missed: 'ask', maxLatenessMs: 5 } };
+  let sends = 0;
+  const f = await stub(t, ({ request, respond, channel }) => {
+    if (request.method === 'control_query') respond(request.params.view === 'channel' ? { channel } : { entries: [task] });
+    if (request.method === 'control_command') {
+      sends++; assert.deepEqual(request.params.expectedTask, taskPrecondition(task)); assert.equal(request.params.expected.policyRevision, 1);
+      respond({ commandID: request.params.command.id, eventIDs: [], replayed: false });
+    }
+  });
+  const owner = await f.signIn();
+  for (const fields of [{ op: 'task.reassign' }, { op: 'task.missed', run: false }]) {
+    const preview = await prepare(f, owner, { id: randomUUID(), channel: 'dev', taskID: task.id, ...fields }); assert.equal(preview.status, 200);
+    assert.equal((await f.call('/api/execute', { ...owner, input: { previewID: preview.body.previewID } })).status, 200);
+  }
+  assert.equal(sends, 2);
 });

@@ -13,6 +13,10 @@ const pathSchema = z.string().min(1).max(2048).refine(v => !v.includes('\0') && 
 const snapshotSchema = z.object({ agentId: AgentID, directory: pathSchema, projectID: z.string().min(1).max(200),
   configurationDigest: hashSchema, authorityDigest: hashSchema,
   sources: z.array(z.strictObject({ path: pathSchema, digest: hashSchema })).min(1).max(128), idle: z.boolean(), blocked: z.boolean() });
+// A trusted harness port must read this from its own durable native completion
+// record. A destination directory alone cannot identify which transition ran.
+const nativeMovementObservation = z.strictObject({ agentId: AgentID, transitionID: UUID,
+  from: pathSchema, to: pathSchema, outcome: z.literal('moved') });
 const recordSchema = z.strictObject({ id: UUID, taskID: UUID, previewID: UUID, claimGeneration: stamp,
   phase: z.enum(['authorizing', 'prepared', 'inflight', 'observed', 'settled', 'uncertain']),
   grant: WorktreeTransition.optional(), receiptID: UUID, outcome: z.enum(['moved', 'failed', 'uncertain']).optional(),
@@ -152,7 +156,17 @@ export class WorktreeCoordinator {
       }
       const grant = await this.find('transitions', record.id); check(grant?.status === 'prepared', 'WORKTREE_TRANSITION_NOT_PENDING');
       record = this.journal.put({ ...record, grant, phase: 'prepared' });
-      try { await this.verify(preview, preview.claimGeneration); }
+      try {
+        await this.verify(preview, preview.claimGeneration);
+        // Fresh authenticated broker state, not a replayable command receipt.
+        // Native ownership/exclusion and final native authority checks remain
+        // mandatory; this response alone is not a native execution capability.
+        const authorized = await this.client.request('control_worktree_authorize', {
+          agentId: this.agentId, channel: this.channel, credential: await this.credential(), grant,
+        });
+        check(stamp.safeParse(authorized.checkedAt).success &&
+          JSON.stringify(WorktreeTransition.parse(authorized.grant)) === JSON.stringify(WorktreeTransition.parse(grant)), 'STALE_WORKTREE_GRANT');
+      }
       catch (error) {
         const actual = snapshotSchema.parse(await this.port.observe());
         if (actual.agentId === this.agentId && actual.directory === grant.from && actual.authorityDigest === grant.authorityDigest && actual.projectID === preview.binding.projectID)
@@ -198,6 +212,15 @@ export class WorktreeCoordinator {
         }
         const preview = await this.find('previews', grant.previewID), task = await this.find('tasks', grant.taskID);
         check(preview?.approved && task?.claimant === this.agentId && task.claimGeneration === grant.claimGeneration, 'STALE_TASK_CLAIM');
+        const observeMovement = async () => {
+          if (typeof this.port.observeMovement !== 'function') return false;
+          try {
+            const evidence = nativeMovementObservation.parse(await this.port.observeMovement({ agentId: this.agentId, transitionID: grant.id,
+              from: grant.from, to: grant.to }));
+            return evidence.agentId === this.agentId && evidence.transitionID === grant.id && evidence.from === grant.from && evidence.to === grant.to;
+          } catch { return false; }
+        };
+        const nativeMoved = ['inflight', 'uncertain'].includes(record.phase) && await observeMovement();
         const actual = snapshotSchema.parse(await this.port.observe());
         check(actual.agentId === this.agentId, 'TRANSITION_IDENTITY_MISMATCH');
         record = this.journal.put({ ...record, grant });
@@ -207,7 +230,8 @@ export class WorktreeCoordinator {
           unchanged = snapshot.configurationDigest === grant.configurationDigest && actual.authorityDigest === grant.authorityDigest &&
             actual.configurationDigest === (actual.directory === grant.to ? snapshot.destination : snapshot.source).configurationDigest;
         } catch { /* Changed/undiscoverable configuration cannot justify a moved or no-effect receipt. */ }
-        const outcome = actual.directory === grant.to && actual.projectID === preview.binding.projectID && unchanged && actual.idle && !actual.blocked ? 'moved' :
+        const stillNativeMoved = nativeMoved && await observeMovement();
+        const outcome = stillNativeMoved && actual.directory === grant.to && actual.projectID === preview.binding.projectID && unchanged && actual.idle && !actual.blocked ? 'moved' :
           actual.directory === grant.from && ['authorizing', 'prepared'].includes(record.phase) && unchanged ? 'failed' : 'uncertain';
         if (outcome === 'uncertain' && record.phase === 'uncertain' && record.settlement?.outcome === 'uncertain' &&
           record.settlement.actualLocation === actual.directory && record.settlement.authorityDigest === actual.authorityDigest) continue;

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "productionReady": false,
+  "image": "rust@sha256:bc2c4c21d4467cdbbac0ee7b95a6deb742a3467dfe0ff7647916c4b42ca56372",
+  "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "target": "aarch64-unknown-linux-gnu",
+  "patch": "../codex/instruction-preview-vm-review.patch",
+  "patchSha256": "c5b7f395ca48b48e42ce6b7a40736c729ce125b7b697a9c8a5a725678f3ba4ce",
+  "cargoLockSha256": "8b5426bba122a36aca0d406786d7b1c2c9da93b26c6965d7eaab50b41b3b1460",
+  "v8ManifestSha256": "94195fe3a70a6043474afabd145c0bbe322f409e95a52c745d64c9f929f80a22",
+  "appServerSha256": "06cc236fdc6d6d8cd4c3cd29585fb6684ca73e79b06b580c0ae3296c63958406",
+  "validation": "Offline build succeeded. A disposable no-network VM with no host mounts or secrets executed the binary and received an initialize response. A second guest test ran the app-server and a synthetic MCP server, recording an uncertain attempt through a guest Unix socket relay and vsock capability to a same-UID fixture owner.",
+  "limitations": "No independent second build or production image provenance has been verified. The guest lacked a verified bubblewrap installation. The grant, capability key and host owner were fixtures. Portable session export/import, host identity isolation, complete remote inventory and receiver release remain unproven."
+}

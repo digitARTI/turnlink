@@ -1,0 +1,1401 @@
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index a1b1133..4f11ed3 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -176,6 +176,7 @@ pub(crate) struct MessageProcessor {
+ 
+ #[derive(Debug)]
+ pub(crate) struct ConnectionSessionState {
++    pub(crate) continuity_owner: codex_protocol::protocol::ContinuityOwner,
+     pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
+     pub(crate) origin: crate::transport::ConnectionOrigin,
+     pub(crate) mcp_event_streams: McpEventStreams,
+@@ -195,6 +196,7 @@ pub(crate) struct InitializedConnectionSessionState {
+ impl ConnectionSessionState {
+     pub(crate) fn new(origin: crate::transport::ConnectionOrigin) -> Self {
+         Self {
++            continuity_owner: codex_protocol::protocol::ContinuityOwner::new(),
+             origin,
+             rpc_gate: Arc::new(ConnectionRpcGate::new()),
+             mcp_event_streams: McpEventStreams::default(),
+@@ -885,6 +887,10 @@ impl MessageProcessor {
+         connection_id: ConnectionId,
+         session_state: &ConnectionSessionState,
+     ) {
++        session_state.continuity_owner.close();
++        self.thread_processor
++            .continuity_connection_closed(&session_state.continuity_owner)
++            .await;
+         session_state.rpc_gate.close().await;
+         self.account_processor
+             .gateway_connection_closed(connection_id);
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 941e32e..da63faf 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -3831,6 +3831,17 @@ impl ThreadRequestProcessor {
+             .await;
+     }
+ 
++    pub(crate) async fn continuity_connection_closed(
++        &self,
++        owner: &codex_protocol::protocol::ContinuityOwner,
++    ) {
++        for id in self.thread_manager.list_thread_ids().await {
++            if let Ok(thread) = self.thread_manager.get_thread(id).await {
++                thread.continuity_connection_closed(owner).await;
++            }
++        }
++    }
++
+     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+         let thread_ids = self
+             .thread_state_manager
+diff --git a/codex-rs/core/src/codex_thread.rs b/codex-rs/core/src/codex_thread.rs
+index 0b5ea87..1ef2ef0 100644
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -259,6 +259,62 @@ impl CodexThread {
+         self.io.submit(op).await
+     }
+ 
++    /// The host supplies its captured transport identity, never RPC parameters.
++    pub async fn acquire_continuity(
++        &self,
++        owner: codex_protocol::protocol::ContinuityOwner,
++    ) -> CodexResult<codex_protocol::protocol::ContinuityReservation> {
++        let (reply, accepted) = oneshot::channel();
++        self.io
++            .submit(Op::ContinuityAcquire { owner, reply })
++            .await?;
++        accepted.await.unwrap_or(Err(CodexErr::InternalAgentDied))
++    }
++
++    pub async fn commit_continuity(
++        &self,
++        owner: codex_protocol::protocol::ContinuityOwner,
++        reservation: codex_protocol::protocol::ContinuityReservation,
++        transition_id: uuid::Uuid,
++        cwd: AbsolutePathBuf,
++    ) -> CodexResult<codex_protocol::protocol::ContinuityCommitReceipt> {
++        let (reply, accepted) = oneshot::channel();
++        self.io
++            .submit(Op::ContinuityCommit {
++                owner,
++                reservation,
++                transition_id,
++                cwd,
++                reply,
++            })
++            .await?;
++        accepted.await.unwrap_or(Err(CodexErr::InternalAgentDied))
++    }
++
++    pub async fn release_continuity(
++        &self,
++        owner: codex_protocol::protocol::ContinuityOwner,
++        reservation: codex_protocol::protocol::ContinuityReservation,
++    ) -> CodexResult<()> {
++        let (reply, accepted) = oneshot::channel();
++        self.io
++            .submit(Op::ContinuityRelease {
++                owner,
++                reservation,
++                reply,
++            })
++            .await?;
++        accepted.await.unwrap_or(Err(CodexErr::InternalAgentDied))
++    }
++
++    /// Invalidate immediately on transport loss, even while its queued RPC drains.
++    pub async fn continuity_connection_closed(
++        &self,
++        owner: &codex_protocol::protocol::ContinuityOwner,
++    ) {
++        self.session.continuity_invalidate(Some(owner)).await;
++    }
++
+     /// Returns the session telemetry handle for thread-scoped production instrumentation.
+     pub fn session_telemetry(&self) -> SessionTelemetry {
+         self.session.services.session_telemetry.clone()
+@@ -824,6 +880,7 @@ impl CodexThread {
+         &self,
+         update: crate::context::UserGoalUpdate,
+     ) -> CodexResult<()> {
++        let _continuity_admission = self.session.continuity_mutation()?;
+         self.session.record_user_goal_update(update).await?;
+         Ok(())
+     }
+@@ -844,6 +901,7 @@ impl CodexThread {
+         &self,
+         items: Vec<ResponseItem>,
+     ) -> CodexResult<()> {
++        let _continuity_admission = self.session.continuity_mutation()?;
+         if items.is_empty() {
+             return Err(CodexErr::InvalidRequest(
+                 "items must not be empty".to_string(),
+@@ -945,6 +1003,12 @@ impl CodexThread {
+         patch: ThreadMetadataPatch,
+         include_archived: bool,
+     ) -> ThreadStoreResult<StoredThread> {
++        let _continuity_admission =
++            self.session
++                .continuity_mutation()
++                .map_err(|_| ThreadStoreError::Conflict {
++                    message: "native continuity reservation held".into(),
++                })?;
+         let live_thread = self
+             .session
+             .live_thread_for_persistence("update thread metadata")
+@@ -956,6 +1020,12 @@ impl CodexThread {
+ 
+     /// Appends rollout items through the live thread so derived metadata stays in sync.
+     pub async fn append_rollout_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
++        let _continuity_admission =
++            self.session
++                .continuity_mutation()
++                .map_err(|_| ThreadStoreError::Conflict {
++                    message: "native continuity reservation held".into(),
++                })?;
+         let live_thread = self
+             .session
+             .live_thread_for_persistence("append rollout items")
+diff --git a/codex-rs/core/src/session/config_refresh.rs b/codex-rs/core/src/session/config_refresh.rs
+index 08a99f8..28f19c6 100644
+--- a/codex-rs/core/src/session/config_refresh.rs
++++ b/codex-rs/core/src/session/config_refresh.rs
+@@ -16,6 +16,8 @@ impl Session {
+     pub(crate) async fn disable_mcp_enterprise_auth(&self) {
+         {
+             let mut state = self.state.lock().await;
++            // Security revocations remain immediate and invalidate prepared plans.
++            state.continuity.invalidate();
+             let mut config = state
+                 .session_configuration
+                 .original_config_do_not_use
+@@ -119,6 +121,7 @@ impl Session {
+             ) {
+                 return ConfigRefreshOutcome::Stale;
+             }
++            state.continuity.invalidate();
+             // User-only refreshes retain the current managed inputs and their
+             // admission binding. Only MCP refreshes can publish a new policy.
+             let policy_guard = matches!(scope, RuntimeConfigRefresh::Mcp)
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+index 5ded792..71d018d 100644
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -351,6 +351,7 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
+ }
+ 
+ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
++    sess.continuity_invalidate(None).await;
+     shutdown_session_runtime(sess).await;
+     info!("Shutting down Codex instance");
+     let history = sess.clone_history().await;
+@@ -440,6 +441,46 @@ pub async fn review(
+     }
+ }
+ 
++async fn continuity_submission(sess: &Session, submission_id: String, op: Op) {
++    match op {
++        Op::ContinuityAcquire { owner, reply } => {
++            let _ = reply.send(sess.continuity_acquire(owner).await);
++        }
++        Op::ContinuityCommit {
++            owner,
++            reservation,
++            transition_id,
++            cwd,
++            reply,
++        } => {
++            let result =
++                Box::pin(sess.continuity_commit(&owner, &reservation, transition_id, cwd)).await;
++            let snapshot = if result.is_ok() {
++                Some(sess.thread_settings_snapshot().await)
++            } else {
++                None
++            };
++            // Completion follows native flush; event delivery must not hold its caller's lock.
++            let _ = reply.send(result);
++            if let Some(snapshot) = snapshot {
++                thread_settings::emit_applied(sess, submission_id, snapshot).await;
++            }
++        }
++        Op::ContinuityRelease {
++            owner,
++            reservation,
++            reply,
++        } => {
++            let _ = reply.send(sess.continuity_release(&owner, &reservation).await);
++        }
++        Op::ContinuityDisconnect { owner } => {
++            owner.close();
++            sess.continuity_invalidate(Some(&owner)).await;
++        }
++        _ => unreachable!("only native continuity operations reach this dispatcher"),
++    }
++}
++
+ pub(super) async fn submission_loop(
+     sess: Arc<Session>,
+     config: Arc<Config>,
+@@ -493,18 +534,87 @@ pub(super) async fn submission_loop(
+             "Submission"
+         );
+         let dispatch_span = submission_dispatch_span(&sub);
++        // Native reservations hold a writer permit. Ordinary operations cannot
++        // enter the mutation body while it is held, including future Op variants.
++        let control = matches!(
++            &sub.op,
++            Op::ContinuityAcquire { .. }
++                | Op::ContinuityCommit { .. }
++                | Op::ContinuityRelease { .. }
++                | Op::ContinuityDisconnect { .. }
++                | Op::Interrupt
++                | Op::Shutdown
++                | Op::CleanBackgroundTerminals
++                | Op::InterruptIfNoPendingInput { .. }
++        );
++        let _continuity_admission = if control {
++            None
++        } else {
++            match sess.continuity_mutation() {
++                Ok(permit) => Some(permit),
++                Err(_) => {
++                    match sub.op {
++                        Op::ThreadSettings {
++                            reply: Some(reply), ..
++                        } => {
++                            let _ = reply.send(Err(super::continuity::refused()));
++                        }
++                        Op::TurnInput { reply, .. } | Op::RecoverTurn { reply, .. } => {
++                            let _ = reply.send(Err(super::continuity::refused()));
++                        }
++                        _ => {
++                            sess.send_event_raw(Event {
++                                id: sub.id,
++                                msg: EventMsg::Error(ErrorEvent {
++                                    misalignment: None,
++                                    message:
++                                        "native continuity reservation unavailable or uncertain"
++                                            .into(),
++                                    codex_error_info: Some(CodexErrorInfo::Other),
++                                }),
++                            })
++                            .await;
++                        }
++                    }
++                    continue;
++                }
++            }
++        };
++        // The general dispatcher has a large debug poll frame. Keep native
++        // continuity persistence outside that frame without changing queue order.
++        if matches!(
++            &sub.op,
++            Op::ContinuityAcquire { .. }
++                | Op::ContinuityCommit { .. }
++                | Op::ContinuityRelease { .. }
++                | Op::ContinuityDisconnect { .. }
++        ) {
++            Box::pin(continuity_submission(&sess, sub.id, sub.op))
++                .instrument(dispatch_span)
++                .await;
++            continue;
++        }
+         let should_exit = async {
+             match sub.op {
++                Op::ContinuityAcquire { .. }
++                | Op::ContinuityCommit { .. }
++                | Op::ContinuityRelease { .. }
++                | Op::ContinuityDisconnect { .. } => {
++                    unreachable!("continuity operations use the native control dispatcher")
++                }
+                 Op::Interrupt => {
++                    sess.continuity_invalidate(None).await;
+                     interrupt(&sess).await;
+                     false
+                 }
+                 Op::InterruptIfNoPendingInput { turn_id, reply } => {
++                    sess.continuity_invalidate(None).await;
+                     sess.interrupt_turn_if_no_pending_input(&turn_id, reply)
+                         .await;
+                     false
+                 }
+                 Op::CleanBackgroundTerminals => {
++                    sess.continuity_invalidate(None).await;
+                     clean_background_terminals(&sess).await;
+                     false
+                 }
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 073e7a1..5302f56 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -259,6 +259,9 @@ mod reasoning_effort;
+ mod submission;
+ pub(crate) use reasoning_effort::RequestEffortUsage;
+ pub(crate) use submission::Submission;
++pub(crate) mod continuity;
++#[cfg(test)]
++mod continuity_tests;
+ mod input_queue;
+ mod mcp;
+ mod mcp_prewarm;
+@@ -2017,6 +2020,22 @@ impl Session {
+         &self,
+         updates: SessionSettingsUpdate,
+         should_commit: impl FnOnce(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
++    ) -> ConstraintResult<Option<SessionSettingsCommit>> {
++        let _continuity_admission = self
++            .continuity_mutation()
++            .map_err(|_| continuity::constrained())?;
++        self.update_settings_if_authorized(updates, should_commit, None)
++            .await
++    }
++
++    async fn update_settings_if_authorized(
++        &self,
++        updates: SessionSettingsUpdate,
++        should_commit: impl FnOnce(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
++        authority: Option<(
++            &codex_protocol::protocol::ContinuityOwner,
++            &codex_protocol::protocol::ContinuityReservation,
++        )>,
+     ) -> ConstraintResult<Option<SessionSettingsCommit>> {
+         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
+         let windows_sandbox_changed;
+@@ -2029,6 +2048,12 @@ impl Session {
+             credential_masking_warning,
+         ) = {
+             let mut state = self.state.lock().await;
++            if let Some((owner, reservation)) = authority {
++                state
++                    .continuity
++                    .check(owner, reservation)
++                    .map_err(|_| continuity::constrained())?;
++            }
+             let updated = match self.apply_session_settings(&state.session_configuration, &updates)
+             {
+                 Ok(updated) => updated,
+@@ -2079,6 +2104,11 @@ impl Session {
+                     .update_configured_selections(&updated.environments);
+             }
+             state.session_configuration = updated;
++            state.continuity.revision = state.continuity.revision.saturating_add(1);
++            if authority.is_some() {
++                let revision = state.continuity.revision;
++                state.continuity.published(revision);
++            }
+             if root_service_tier_changed {
+                 self.services.agent_control.propagate_config_update(
+                     AgentConfigUpdate::ServiceTier(
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index 9c415e6..06d3239 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -58,6 +58,7 @@ type McpToolApprovalMetadataMap =
+ ///
+ /// A session has at most 1 running task at a time, and can be interrupted by user input.
+ pub(crate) struct Session {
++    pub(crate) continuity_admission: Arc<tokio::sync::RwLock<()>>,
+     pub(crate) thread_id: ThreadId,
+     pub(crate) installation_id: String,
+     pub(super) tx_event: Sender<Event>,
+@@ -1865,6 +1866,7 @@ impl Session {
+             };
+             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
+             let sess = Arc::new(Session {
++                continuity_admission: Arc::new(tokio::sync::RwLock::new(())),
+                 thread_id,
+                 installation_id,
+                 tx_event: tx_event.clone(),
+@@ -1904,6 +1906,7 @@ impl Session {
+                 forked_from_ordinal_exclusive,
+                 next_internal_sub_id: AtomicU64::new(0),
+             });
++            sess.continuity_restore().await?;
+             if let Some(startup) = &startup {
+                 startup.set_session(Arc::clone(&sess));
+             }
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 182e03e..3c419d0 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -4974,7 +4974,7 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
+         .expect("thread should have rollout path")
+ }
+ 
+-async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
++pub(super) async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
+     let rollout_path = open_thread_persistence(session).await;
+     session
+         .ensure_rollout_materialized(PersistContext::Standard)
+@@ -6996,6 +6996,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+     };
+ 
+     let session = Session {
++        continuity_admission: Arc::new(tokio::sync::RwLock::new(())),
+         thread_id,
+         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+         tx_event,
+@@ -9281,6 +9282,7 @@ where
+     };
+ 
+     let session = Arc::new(Session {
++        continuity_admission: Arc::new(tokio::sync::RwLock::new(())),
+         thread_id,
+         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+         tx_event,
+diff --git a/codex-rs/core/src/session/turn_input.rs b/codex-rs/core/src/session/turn_input.rs
+index 8935c1c..ea103b6 100644
+--- a/codex-rs/core/src/session/turn_input.rs
++++ b/codex-rs/core/src/session/turn_input.rs
+@@ -699,6 +699,7 @@ impl Session {
+     pub(crate) async fn reserve_pending_work_turn(
+         &self,
+     ) -> Option<(Arc<tokio::sync::Mutex<TurnState>>, TurnStartOptions)> {
++        let _continuity_admission = self.continuity_mutation().ok()?;
+         let mut active_turn = self.active_turn.lock().await;
+         if active_turn.is_some() {
+             return None;
+diff --git a/codex-rs/core/src/state/session.rs b/codex-rs/core/src/state/session.rs
+index d122db2..38b66f1 100644
+--- a/codex-rs/core/src/state/session.rs
++++ b/codex-rs/core/src/state/session.rs
+@@ -67,6 +67,7 @@ impl ReasoningEffortPin {
+ 
+ /// Persistent, session-scoped state previously stored directly on `Session`.
+ pub(crate) struct SessionState {
++    pub(crate) continuity: crate::session::continuity::ContinuityState,
+     pub(crate) session_configuration: SessionConfiguration,
+     /// Plugin selection of the last admitted task; settings updates take effect on the next task.
+     pub(crate) active_disabled_plugin_ids: Vec<String>,
+@@ -124,6 +125,7 @@ impl SessionState {
+         history: ContextManager,
+     ) -> Self {
+         Self {
++            continuity: Default::default(),
+             active_disabled_plugin_ids: Vec::new(),
+             session_configuration,
+             base_instructions_provenance: None,
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index 727422c..c077ed4 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -648,12 +648,91 @@ pub struct AdditionalContextEntry {
+     pub kind: AdditionalContextKind,
+ }
+ 
++/// Submission operation
++/// Identity minted by the native transport host, never deserialized from RPC input.
++#[derive(Clone)]
++pub struct ContinuityOwner {
++    id: uuid::Uuid,
++    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
++}
++
++impl ContinuityOwner {
++    pub fn new() -> Self {
++        Self {
++            id: uuid::Uuid::new_v4(),
++            alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
++        }
++    }
++    pub fn close(&self) {
++        self.alive
++            .store(false, std::sync::atomic::Ordering::Release);
++    }
++    pub fn is_open(&self) -> bool {
++        self.alive.load(std::sync::atomic::Ordering::Acquire)
++    }
++}
++
++impl PartialEq for ContinuityOwner {
++    fn eq(&self, other: &Self) -> bool {
++        self.id == other.id && std::sync::Arc::ptr_eq(&self.alive, &other.alive)
++    }
++}
++impl Eq for ContinuityOwner {}
++
++impl Default for ContinuityOwner {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl fmt::Debug for ContinuityOwner {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("ContinuityOwner([native host identity])")
++    }
++}
++
++/// An issued reservation, meaningful only with its captured native host identity.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ContinuityReservation {
++    pub generation: uuid::Uuid,
++    pub revision: u64,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ContinuityCommitReceipt {
++    pub transition_id: uuid::Uuid,
++    pub reservation: ContinuityReservation,
++    pub source_cwd: AbsolutePathBuf,
++    pub cwd: AbsolutePathBuf,
++}
++
+ /// Submission operation
+ // Keep diagnostic fields explicit so new payload fields do not enter logs by default.
+ #[derive(derive_more::Debug)]
+ #[allow(clippy::large_enum_variant)]
+ #[non_exhaustive]
+ pub enum Op {
++    #[debug("ContinuityAcquire")]
++    ContinuityAcquire {
++        owner: ContinuityOwner,
++        reply: oneshot::Sender<CodexResult<ContinuityReservation>>,
++    },
++    #[debug("ContinuityCommit")]
++    ContinuityCommit {
++        owner: ContinuityOwner,
++        reservation: ContinuityReservation,
++        transition_id: uuid::Uuid,
++        cwd: AbsolutePathBuf,
++        reply: oneshot::Sender<CodexResult<ContinuityCommitReceipt>>,
++    },
++    #[debug("ContinuityRelease")]
++    ContinuityRelease {
++        owner: ContinuityOwner,
++        reservation: ContinuityReservation,
++        reply: oneshot::Sender<CodexResult<()>>,
++    },
++    #[debug("ContinuityDisconnect")]
++    ContinuityDisconnect { owner: ContinuityOwner },
+     /// Abort current task without terminating background terminal processes.
+     /// This server sends [`EventMsg::TurnAborted`] in response.
+     Interrupt,
+@@ -1042,6 +1121,10 @@ impl InterAgentCommunication {
+ impl Op {
+     pub fn kind(&self) -> &'static str {
+         match self {
++            Self::ContinuityAcquire { .. } => "continuity_acquire",
++            Self::ContinuityCommit { .. } => "continuity_commit",
++            Self::ContinuityRelease { .. } => "continuity_release",
++            Self::ContinuityDisconnect { .. } => "continuity_disconnect",
+             Self::Interrupt => "interrupt",
+             Self::InterruptIfNoPendingInput { .. } => "interrupt_if_no_pending_input",
+             Self::CleanBackgroundTerminals => "clean_background_terminals",
+diff --git a/codex-rs/core/src/session/continuity.rs b/codex-rs/core/src/session/continuity.rs
+new file mode 100644
+index 0000000..8a0f726
+--- /dev/null
++++ b/codex-rs/core/src/session/continuity.rs
+@@ -0,0 +1,464 @@
++//! Native core reservation and completion receipts. Legacy writers remain unsupported.
++use super::session::{Session, SessionSettingsUpdate};
++use codex_protocol::error::{CodexErr, Result as CodexResult};
++use codex_protocol::protocol::{
++    ContinuityCommitReceipt, ContinuityOwner, ContinuityReservation, EnvironmentConfigState,
++    TurnEnvironmentSelections,
++};
++use codex_utils_absolute_path::AbsolutePathBuf;
++use codex_utils_path_uri::PathUri;
++use serde::{Deserialize, Serialize};
++use std::fs::{self, File};
++use std::io::{Read, Write};
++use std::path::{Path, PathBuf};
++use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
++
++const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
++const MAX_RECEIPTS: usize = 64;
++
++#[derive(Default)]
++pub(crate) struct ContinuityState {
++    pub(crate) revision: u64,
++    held: Option<Held>,
++}
++
++struct Held {
++    owner: ContinuityOwner,
++    reservation: ContinuityReservation,
++    original: Option<ContinuityReservation>,
++    invalid: bool,
++    journal: Journal,
++    _admission: OwnedRwLockWriteGuard<()>,
++}
++
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Journal {
++    schema: u32,
++    thread_id: String,
++    phase: String,
++    reservation: ContinuityReservation,
++    source_cwd: AbsolutePathBuf,
++    transition_id: Option<uuid::Uuid>,
++    cwd: Option<AbsolutePathBuf>,
++    receipt: Option<ContinuityCommitReceipt>,
++    history: Vec<ContinuityCommitReceipt>,
++}
++
++pub(crate) fn refused() -> CodexErr {
++    CodexErr::InvalidRequest("native continuity reservation unavailable or uncertain".into())
++}
++
++pub(crate) fn constrained() -> crate::config::ConstraintError {
++    crate::config::ConstraintError::InvalidValue {
++        field_name: "native_continuity",
++        candidate: "competing mutation".into(),
++        allowed: "unreserved native thread".into(),
++        requirement_source: codex_config::RequirementSource::Unknown,
++    }
++}
++
++impl ContinuityState {
++    pub(crate) fn invalidate(&mut self) {
++        if let Some(held) = self.held.as_mut() {
++            held.invalid = true;
++        }
++        self.revision = self.revision.saturating_add(1);
++    }
++
++    pub(crate) fn check(
++        &self,
++        owner: &ContinuityOwner,
++        reservation: &ContinuityReservation,
++    ) -> CodexResult<()> {
++        let held = self.held.as_ref().ok_or_else(refused)?;
++        if !owner.is_open()
++            || held.invalid
++            || &held.owner != owner
++            || &held.reservation != reservation
++            || self.revision != reservation.revision
++            || self.revision == u64::MAX
++        {
++            return Err(refused());
++        }
++        Ok(())
++    }
++
++    pub(crate) fn published(&mut self, revision: u64) {
++        if let Some(held) = self.held.as_mut() {
++            held.reservation.revision = revision;
++        }
++    }
++}
++
++fn read_journal(path: &Path, thread_id: &str) -> CodexResult<Option<Journal>> {
++    let metadata = match fs::symlink_metadata(path) {
++        Ok(metadata) => metadata,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(_) => return Err(refused()),
++    };
++    if !metadata.is_file() || metadata.len() > MAX_JOURNAL_BYTES {
++        return Err(refused());
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::MetadataExt;
++        if metadata.mode() & 0o077 != 0
++            || metadata.nlink() != 1
++            || metadata.uid() != unsafe { libc::geteuid() }
++        {
++            return Err(refused());
++        }
++    }
++    let mut options = fs::OpenOptions::new();
++    options.read(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.custom_flags(libc::O_NOFOLLOW);
++    }
++    let mut bytes = Vec::new();
++    options
++        .open(path)
++        .map_err(|_| refused())?
++        .take(MAX_JOURNAL_BYTES + 1)
++        .read_to_end(&mut bytes)
++        .map_err(|_| refused())?;
++    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
++        return Err(refused());
++    }
++    let journal: Journal = serde_json::from_slice(&bytes).map_err(|_| refused())?;
++    if journal.schema != 1
++        || journal.thread_id != thread_id
++        || journal.history.len() > MAX_RECEIPTS
++        || ![
++            "acquired",
++            "submitting",
++            "committed",
++            "released",
++            "uncertain",
++        ]
++        .contains(&journal.phase.as_str())
++    {
++        return Err(refused());
++    }
++    Ok(Some(journal))
++}
++
++fn write_journal(path: &Path, journal: &Journal) -> CodexResult<()> {
++    let parent = path.parent().ok_or_else(refused)?;
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
++        let mut builder = fs::DirBuilder::new();
++        builder.mode(0o700);
++        match builder.create(parent) {
++            Ok(()) => {}
++            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
++            Err(_) => return Err(refused()),
++        }
++        let metadata = fs::symlink_metadata(parent).map_err(|_| refused())?;
++        if !metadata.is_dir()
++            || metadata.mode() & 0o077 != 0
++            || metadata.uid() != unsafe { libc::geteuid() }
++        {
++            return Err(refused());
++        }
++    }
++    // Native Windows ACL and durable-directory acceptance is a separate stage.
++    #[cfg(not(unix))]
++    {
++        return Err(refused());
++    }
++    let bytes = serde_json::to_vec(journal).map_err(|_| refused())?;
++    if bytes.len() as u64 > MAX_JOURNAL_BYTES || journal.history.len() > MAX_RECEIPTS {
++        return Err(refused());
++    }
++    let mut temporary = tempfile::Builder::new()
++        .prefix(".continuity-")
++        .tempfile_in(parent)
++        .map_err(|_| refused())?;
++    temporary.write_all(&bytes).map_err(|_| refused())?;
++    temporary.as_file().sync_all().map_err(|_| refused())?;
++    temporary.persist(path).map_err(|_| refused())?;
++    File::open(parent)
++        .and_then(|directory| directory.sync_all())
++        .map_err(|_| refused())?;
++    Ok(())
++}
++
++impl Session {
++    pub(crate) fn continuity_mutation(&self) -> CodexResult<OwnedRwLockReadGuard<()>> {
++        self.continuity_admission
++            .clone()
++            .try_read_owned()
++            .map_err(|_| refused())
++    }
++
++    pub(crate) async fn continuity_receipt_path(&self) -> PathBuf {
++        self.get_config()
++            .await
++            .codex_home
++            .join("native-continuity")
++            .join(format!("{}.json", self.thread_id))
++            .to_path_buf()
++    }
++
++    pub(crate) async fn continuity_restore(&self) -> CodexResult<()> {
++        let Some(journal) = read_journal(
++            &self.continuity_receipt_path().await,
++            &self.thread_id.to_string(),
++        )?
++        else {
++            return Ok(());
++        };
++        let mut state = self.state.lock().await;
++        state.continuity.revision = state.continuity.revision.max(journal.reservation.revision);
++        if journal.phase != "released" {
++            let admission = self
++                .continuity_admission
++                .clone()
++                .try_write_owned()
++                .map_err(|_| refused())?;
++            let owner = ContinuityOwner::new();
++            owner.close();
++            state.continuity.held = Some(Held {
++                owner,
++                reservation: journal.reservation.clone(),
++                original: None,
++                invalid: true,
++                journal,
++                _admission: admission,
++            });
++        }
++        Ok(())
++    }
++
++    pub(crate) async fn continuity_acquire(
++        &self,
++        owner: ContinuityOwner,
++    ) -> CodexResult<ContinuityReservation> {
++        if !owner.is_open() {
++            return Err(refused());
++        }
++        let admission = self
++            .continuity_admission
++            .clone()
++            .try_write_owned()
++            .map_err(|_| refused())?;
++        let path = self.continuity_receipt_path().await;
++        let previous = read_journal(&path, &self.thread_id.to_string())?;
++        if previous
++            .as_ref()
++            .is_some_and(|journal| journal.phase != "released")
++        {
++            return Err(refused());
++        }
++        let active = self.active_turn.lock().await;
++        if active.is_some()
++            || self.conversation.running_state().await.is_some()
++            || *self.services.elicitations.subscribe().borrow()
++            || !self.list_background_terminals().await.is_empty()
++            || self.input_queue.has_pending_mailbox_items().await
++        {
++            return Err(refused());
++        }
++        let mut state = self.state.lock().await;
++        if !owner.is_open()
++            || state.shutting_down
++            || state.continuity.held.is_some()
++            || state.continuity.revision == u64::MAX
++        {
++            return Err(refused());
++        }
++        let reservation = ContinuityReservation {
++            generation: uuid::Uuid::new_v4(),
++            revision: state.continuity.revision,
++        };
++        let journal = Journal {
++            schema: 1,
++            thread_id: self.thread_id.to_string(),
++            phase: "acquired".into(),
++            reservation: reservation.clone(),
++            source_cwd: state.session_configuration.legacy_fallback_cwd.clone(),
++            transition_id: None,
++            cwd: None,
++            receipt: None,
++            history: previous.map_or_else(Vec::new, |journal| journal.history),
++        };
++        state.continuity.held = Some(Held {
++            owner: owner.clone(),
++            reservation: reservation.clone(),
++            original: None,
++            invalid: false,
++            journal: journal.clone(),
++            _admission: admission,
++        });
++        if write_journal(&path, &journal).is_err() || !owner.is_open() {
++            state.continuity.invalidate();
++            return Err(refused());
++        }
++        Ok(reservation)
++    }
++
++    pub(crate) async fn continuity_release(
++        &self,
++        owner: &ContinuityOwner,
++        reservation: &ContinuityReservation,
++    ) -> CodexResult<()> {
++        let path = self.continuity_receipt_path().await;
++        let mut state = self.state.lock().await;
++        state.continuity.check(owner, reservation)?;
++        let held = state.continuity.held.as_mut().ok_or_else(refused)?;
++        let mut journal = held.journal.clone();
++        if let Some(receipt) = &journal.receipt {
++            journal.history.push(receipt.clone());
++        }
++        journal.phase = "released".into();
++        journal.reservation = reservation.clone();
++        if write_journal(&path, &journal).is_err() {
++            held.invalid = true;
++            return Err(refused());
++        }
++        state.continuity.held = None;
++        Ok(())
++    }
++
++    pub(crate) async fn continuity_commit(
++        &self,
++        owner: &ContinuityOwner,
++        reservation: &ContinuityReservation,
++        transition_id: uuid::Uuid,
++        cwd: AbsolutePathBuf,
++    ) -> CodexResult<ContinuityCommitReceipt> {
++        let path = self.continuity_receipt_path().await;
++        let _settings = super::thread_settings::acquire_persistence_lock(self).await;
++        let canonical = fs::canonicalize(cwd.as_path()).map_err(|_| refused())?;
++        if canonical != cwd.as_path() || !canonical.is_dir() {
++            return Err(refused());
++        }
++        let (updates, mut journal) = {
++            let mut state = self.state.lock().await;
++            let held = state.continuity.held.as_ref().ok_or_else(refused)?;
++            if !owner.is_open() || &held.owner != owner || held.invalid {
++                return Err(refused());
++            }
++            if let Some(receipt) = &held.journal.receipt {
++                return if held.original.as_ref() == Some(reservation)
++                    && receipt.transition_id == transition_id
++                    && receipt.cwd == cwd
++                {
++                    Ok(receipt.clone())
++                } else {
++                    Err(refused())
++                };
++            }
++            state.continuity.check(owner, reservation)?;
++            if held
++                .journal
++                .history
++                .iter()
++                .any(|receipt| receipt.transition_id == transition_id)
++            {
++                return Err(refused());
++            }
++            let current = &state.session_configuration;
++            if current.environments.len() != 1
++                || current.environments[0].environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID
++                || current.environments[0].config != EnvironmentConfigState::FromThread
++            {
++                return Err(refused());
++            }
++            let mut environments = current.environments.clone();
++            let source_uri = PathUri::from_abs_path(&current.legacy_fallback_cwd);
++            let destination_uri = PathUri::from_abs_path(&cwd);
++            environments[0].cwd = destination_uri.clone();
++            for root in &mut environments[0].workspace_roots {
++                if *root == source_uri {
++                    *root = destination_uri.clone();
++                }
++            }
++            let updates = SessionSettingsUpdate {
++                environments: Some(TurnEnvironmentSelections::new(cwd.clone(), environments)),
++                ..Default::default()
++            };
++            let candidate = self
++                .apply_session_settings(current, &updates)
++                .map_err(|_| refused())?;
++            if candidate.permission_profile() != current.permission_profile() {
++                return Err(refused());
++            }
++            let held = state.continuity.held.as_mut().ok_or_else(refused)?;
++            if held.journal.history.len() >= MAX_RECEIPTS {
++                return Err(refused());
++            }
++            held.original = Some(reservation.clone());
++            held.journal.phase = "submitting".into();
++            held.journal.transition_id = Some(transition_id);
++            held.journal.cwd = Some(cwd.clone());
++            if write_journal(&path, &held.journal).is_err() {
++                held.invalid = true;
++                return Err(refused());
++            }
++            (updates, held.journal.clone())
++        };
++        let effect = async {
++            let commit = self
++                .update_settings_if_authorized(updates, |_, _| true, Some((owner, reservation)))
++                .await
++                .map_err(|_| refused())?
++                .ok_or_else(refused)?;
++            let live = self.live_thread().ok_or_else(refused)?;
++            live.append_items(&[codex_history::RolloutItem::EventMsg(
++                codex_protocol::protocol::EventMsg::ThreadSettingsApplied(
++                    codex_protocol::protocol::ThreadSettingsAppliedEvent {
++                        thread_id: Some(self.thread_id),
++                        thread_settings: commit.snapshot,
++                    },
++                ),
++            )])
++            .await
++            .map_err(|_| refused())?;
++            live.flush().await.map_err(|_| refused())?;
++            let mut state = self.state.lock().await;
++            let held = state.continuity.held.as_mut().ok_or_else(refused)?;
++            if held.invalid || !owner.is_open() {
++                return Err(refused());
++            }
++            let receipt = ContinuityCommitReceipt {
++                transition_id,
++                reservation: held.reservation.clone(),
++                source_cwd: journal.source_cwd.clone(),
++                cwd,
++            };
++            journal.phase = "committed".into();
++            journal.reservation = receipt.reservation.clone();
++            journal.receipt = Some(receipt.clone());
++            write_journal(&path, &journal)?;
++            held.journal = journal.clone();
++            Ok(receipt)
++        }
++        .await;
++        if effect.is_err() {
++            let mut state = self.state.lock().await;
++            state.continuity.invalidate();
++            if let Some(held) = state.continuity.held.as_mut() {
++                held.journal.phase = "uncertain".into();
++                let _ = write_journal(&path, &held.journal);
++            }
++        }
++        effect
++    }
++
++    pub(crate) async fn continuity_invalidate(&self, owner: Option<&ContinuityOwner>) {
++        let path = self.continuity_receipt_path().await;
++        let mut state = self.state.lock().await;
++        if let Some(held) = state.continuity.held.as_mut()
++            && owner.is_none_or(|owner| owner == &held.owner)
++        {
++            held.invalid = true;
++            held.journal.phase = "uncertain".into();
++            let _ = write_journal(&path, &held.journal);
++        }
++    }
++}
+diff --git a/codex-rs/core/src/session/continuity_tests.rs b/codex-rs/core/src/session/continuity_tests.rs
+new file mode 100644
+index 0000000..1a595ed
+--- /dev/null
++++ b/codex-rs/core/src/session/continuity_tests.rs
+@@ -0,0 +1,337 @@
++//! Native queue acceptance tests. Host identities never arrive in JSON parameters.
++use super::Submission;
++use super::handlers::submission_loop;
++use super::tests::make_session_and_context;
++use codex_protocol::protocol::{
++    ContinuityOwner, ContinuityReservation, Op, ThreadSettingsOverrides,
++};
++use std::sync::Arc;
++use tokio::sync::oneshot;
++
++async fn queue() -> (
++    async_channel::Sender<Submission>,
++    tokio::task::JoinHandle<()>,
++    Arc<super::session::Session>,
++) {
++    let (mut session, context) = make_session_and_context().await;
++    super::tests::attach_thread_persistence(&mut session).await;
++    let session = Arc::new(session);
++    let (tx, rx) = async_channel::bounded(16);
++    let runner = tokio::spawn(submission_loop(Arc::clone(&session), context.config, rx));
++    (tx, runner, session)
++}
++
++async fn submit(tx: &async_channel::Sender<Submission>, op: Op) {
++    tx.send(Submission {
++        id: uuid::Uuid::new_v4().to_string(),
++        op,
++        turn_extension_init: None,
++        trace: None,
++        parent_turn_id: None,
++        root_turn_id: None,
++        residency_guard: None,
++        message_delivery: None,
++    })
++    .await
++    .expect("queue native operation");
++}
++
++async fn acquire(
++    tx: &async_channel::Sender<Submission>,
++    owner: &ContinuityOwner,
++) -> codex_protocol::error::Result<ContinuityReservation> {
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        tx,
++        Op::ContinuityAcquire {
++            owner: owner.clone(),
++            reply,
++        },
++    )
++    .await;
++    accepted.await.expect("native acquire reply")
++}
++
++#[tokio::test]
++async fn continuity_queue_reservation_refuses_other_host_and_ordinary_mutations() {
++    let (tx, runner, _) = queue().await;
++    let owner = ContinuityOwner::new();
++    let held = acquire(&tx, &owner)
++        .await
++        .expect("acquire idle native thread");
++    assert!(acquire(&tx, &ContinuityOwner::new()).await.is_err());
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ThreadSettings {
++            thread_settings: ThreadSettingsOverrides::default(),
++            reply: Some(reply),
++        },
++    )
++    .await;
++    assert!(accepted.await.expect("ordinary settings reply").is_err());
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityRelease {
++            owner: ContinuityOwner::new(),
++            reservation: held.clone(),
++            reply,
++        },
++    )
++    .await;
++    assert!(accepted.await.expect("foreign release reply").is_err());
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityRelease {
++            owner: owner.clone(),
++            reservation: held,
++            reply,
++        },
++    )
++    .await;
++    accepted
++        .await
++        .expect("release reply")
++        .expect("exact native owner releases before any mutation");
++    assert!(acquire(&tx, &owner).await.is_ok());
++    runner.abort();
++}
++
++#[tokio::test]
++async fn continuity_queue_stale_generation_and_disconnect_never_reauthorize() {
++    let (tx, runner, _) = queue().await;
++    let owner = ContinuityOwner::new();
++    let old = acquire(&tx, &owner).await.expect("first acquire");
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityRelease {
++            owner: owner.clone(),
++            reservation: old.clone(),
++            reply,
++        },
++    )
++    .await;
++    accepted.await.expect("release reply").expect("release");
++    let fresh = acquire(&tx, &owner).await.expect("second acquire");
++    assert_ne!(old.generation, fresh.generation);
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityRelease {
++            owner: owner.clone(),
++            reservation: old,
++            reply,
++        },
++    )
++    .await;
++    assert!(accepted.await.expect("old release reply").is_err());
++    submit(
++        &tx,
++        Op::ContinuityDisconnect {
++            owner: owner.clone(),
++        },
++    )
++    .await;
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityRelease {
++            owner: owner.clone(),
++            reservation: fresh,
++            reply,
++        },
++    )
++    .await;
++    assert!(accepted.await.expect("disconnected release reply").is_err());
++    assert!(acquire(&tx, &owner).await.is_err());
++    runner.abort();
++}
++
++#[tokio::test]
++async fn continuity_queue_human_interrupt_stays_immediate_and_invalidates_reservation() {
++    let (tx, runner, _) = queue().await;
++    let owner = ContinuityOwner::new();
++    let held = acquire(&tx, &owner).await.expect("acquire");
++    submit(&tx, Op::Interrupt).await;
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityRelease {
++            owner,
++            reservation: held,
++            reply,
++        },
++    )
++    .await;
++    assert!(accepted.await.expect("interrupted release reply").is_err());
++    runner.abort();
++}
++
++#[tokio::test]
++async fn continuity_queue_closed_host_cannot_acquire_even_if_its_request_was_queued() {
++    let (tx, runner, _) = queue().await;
++    let owner = ContinuityOwner::new();
++    owner.close();
++    assert!(acquire(&tx, &owner).await.is_err());
++    assert!(acquire(&tx, &ContinuityOwner::new()).await.is_ok());
++    runner.abort();
++}
++
++#[tokio::test]
++async fn continuity_queue_commit_publishes_exact_cwd_and_retries_only_its_durable_receipt() {
++    let (tx, runner, session) = queue().await;
++    let before = session.thread_settings_snapshot().await;
++    let destination = tempfile::tempdir().expect("private destination");
++    let cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
++        std::fs::canonicalize(destination.path()).expect("canonical destination"),
++    )
++    .expect("absolute destination");
++    let owner = ContinuityOwner::new();
++    let held = acquire(&tx, &owner).await.expect("native owner");
++    let transition_id = uuid::Uuid::new_v4();
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityCommit {
++            owner: owner.clone(),
++            reservation: held.clone(),
++            transition_id,
++            cwd: cwd.clone(),
++            reply,
++        },
++    )
++    .await;
++    let receipt = accepted
++        .await
++        .expect("completed commit reply")
++        .expect("native persisted commit");
++    let persisted: serde_json::Value = serde_json::from_slice(
++        &std::fs::read(session.continuity_receipt_path().await)
++            .expect("durable native receipt file"),
++    )
++    .expect("native receipt JSON");
++    assert_eq!(persisted["phase"], "committed");
++    assert_eq!(
++        persisted["receipt"]["transition_id"],
++        transition_id.to_string()
++    );
++    assert_eq!(receipt.cwd, cwd);
++    assert!(receipt.reservation.revision > held.revision);
++    let after = session.thread_settings_snapshot().await;
++    assert_eq!(after.cwd, cwd);
++    assert_eq!(after.approval_policy, before.approval_policy);
++    assert_eq!(after.permission_profile, before.permission_profile);
++    assert_eq!(after.approvals_reviewer, before.approvals_reviewer);
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityCommit {
++            owner: owner.clone(),
++            reservation: held.clone(),
++            transition_id,
++            cwd: cwd.clone(),
++            reply,
++        },
++    )
++    .await;
++    assert_eq!(
++        accepted
++            .await
++            .expect("retry reply")
++            .expect("exact persisted retry"),
++        receipt
++    );
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityCommit {
++            owner: owner.clone(),
++            reservation: held,
++            transition_id,
++            cwd: before.cwd,
++            reply,
++        },
++    )
++    .await;
++    assert!(accepted.await.expect("changed retry reply").is_err());
++    let (reply, accepted) = oneshot::channel();
++    submit(
++        &tx,
++        Op::ContinuityRelease {
++            owner,
++            reservation: receipt.reservation,
++            reply,
++        },
++    )
++    .await;
++    accepted
++        .await
++        .expect("release reply")
++        .expect("release exact completed native generation");
++    runner.abort();
++}
++
++#[tokio::test]
++async fn continuity_queue_completed_transition_id_cannot_be_reused_after_release() {
++    let (tx, runner, session) = queue().await;
++    let owner = ContinuityOwner::new();
++    let transition_id = uuid::Uuid::new_v4();
++    let first = tempfile::tempdir().expect("first destination");
++    let second = tempfile::tempdir().expect("second destination");
++    let destination = |directory: &tempfile::TempDir| {
++        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
++            std::fs::canonicalize(directory.path()).expect("canonical destination"),
++        )
++        .expect("absolute destination")
++    };
++    let first_cwd = destination(&first);
++    for (index, cwd) in [first_cwd.clone(), destination(&second)]
++        .into_iter()
++        .enumerate()
++    {
++        let held = acquire(&tx, &owner)
++            .await
++            .expect("fresh native reservation");
++        let (reply, accepted) = oneshot::channel();
++        submit(
++            &tx,
++            Op::ContinuityCommit {
++                owner: owner.clone(),
++                reservation: held.clone(),
++                transition_id,
++                cwd,
++                reply,
++            },
++        )
++        .await;
++        let result = accepted.await.expect("commit reply");
++        let release = if index == 0 {
++            result.expect("first transition completes").reservation
++        } else {
++            assert!(
++                result.is_err(),
++                "a completed transition ID must not publish another destination"
++            );
++            assert_eq!(session.thread_settings_snapshot().await.cwd, first_cwd);
++            held
++        };
++        let (reply, accepted) = oneshot::channel();
++        submit(
++            &tx,
++            Op::ContinuityRelease {
++                owner: owner.clone(),
++                reservation: release,
++                reply,
++            },
++        )
++        .await;
++        accepted
++            .await
++            .expect("release reply")
++            .expect("release exact unchanged reservation");
++    }
++    runner.abort();
++}

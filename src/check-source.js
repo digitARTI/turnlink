@@ -1,4 +1,5 @@
-import { readdirSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -14,4 +15,16 @@ function scan(directory) {
   }
 }
 for (const directory of ['src', 'adapters', 'deploy', 'test']) scan(join(root, directory));
+for (const [directory, expected] of [['codex', ['native-continuity.patch', 'instruction-preview.patch']], ['opencode', ['execution-reservation.patch']]]) {
+  const base = join(root, 'native', directory);
+  const manifest = JSON.parse(readFileSync(join(base, 'manifest.json'), 'utf8'));
+  const records = directory === 'codex' ? [manifest, manifest.instructionPreview] : [manifest];
+  for (const [index, record] of records.entries()) {
+    if (record?.patch !== expected[index]) throw new Error(`Unexpected ${directory} patch in manifest`);
+    const bytes = readFileSync(join(base, record.patch));
+    if (record.bytes !== bytes.length || record.sha256 !== createHash('sha256').update(bytes).digest('hex'))
+      throw new Error(`${directory} patch integrity mismatch: ${record.patch}`);
+  }
+}
 console.log('JavaScript syntax checks passed.');
+console.log('Native patch manifest integrity checks passed.');

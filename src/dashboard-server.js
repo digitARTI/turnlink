@@ -6,17 +6,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { ChannelClient } from './client.js';
 import { Channel } from './protocol.js';
-import { Command, channelPrecondition } from './control/contracts.js';
+import { Command, channelPrecondition, taskPrecondition } from './control/contracts.js';
+import { NotificationAck } from './control/notification-contracts.js';
 import { digest, matches, validateCredential, stateDir, adminToken, token, url } from './config.js';
 import { diagnosticCode } from './diagnostics.js';
 
-const views = new Set(['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'evidence', 'previews', 'transitions', 'activity']);
-const commands = new Set(['channel.configure', 'master.appoint', 'master.revoke', 'action.approve', 'action.reject', 'task.missed', 'task.create']);
+const views = new Set(['channel', 'tasks', 'actions', 'incidents', 'events', 'messages', 'evidence', 'previews', 'transitions', 'activity', 'health', 'notifications']);
+const commands = new Set(['channel.configure', 'master.appoint', 'master.revoke', 'action.approve', 'action.reject', 'task.missed', 'task.create', 'task.reassign', 'notification.ack']);
 const fail = (status, code) => { const error = new Error(code); Object.assign(error, { status, code }); throw error; };
 const check = (value, status, code) => { if (!value) fail(status, code); };
 const hex = () => randomBytes(32).toString('hex');
 const Login = z.strictObject({ password: z.string().regex(/^[a-f0-9]{64}$/) });
-const Preview = z.strictObject({ command: Command });
+const Preview = z.strictObject({ command: z.union([Command, NotificationAck]) });
 const Execute = z.strictObject({ previewID: z.string().uuid() });
 
 function assets(directory) {
@@ -87,6 +88,34 @@ export function createDashboard({ port = 47322, channels, loginSecret, brokerTok
       mode: channel.mode, generation: channel.generation, policyRevision: channel.policyRevision,
       master: channel.active?.agentId ?? null, proposedMaster: channel.proposal?.agentId ?? null,
     } };
+    if (command.op === 'notification.ack') {
+      context.notification = await rpc('control_notifications', { channel: command.channel, id: command.id });
+      check(context.notification.acknowledgedAt === null, 409, 'NOTIFICATION_ALREADY_ACKNOWLEDGED');
+      context.proposal = context.notification;
+    }
+    if (command.op === 'task.create') {
+      check(new Set(command.dependencies).size === command.dependencies.length, 409, 'DUPLICATE_DEPENDENCY');
+      check(command.deadlineAt === undefined || command.deadlineAt > now(), 409, 'DEADLINE_IN_PAST');
+      check((command.schedule?.at ?? 0) <= 8640000000000000 && (command.deadlineAt ?? 0) <= 8640000000000000, 409, 'TASK_TIME_OUT_OF_RANGE');
+      context.proposal = { kind: 'task_metadata', dependencies: command.dependencies, priority: command.priority,
+        scheduledStartUTC: command.schedule ? new Date(command.schedule.at).toISOString() : null,
+        missedPolicy: command.schedule?.missed ?? null, maxLatenessSeconds: command.schedule ? command.schedule.maxLatenessMs / 1000 : null,
+        deadlineUTC: command.deadlineAt === undefined ? null : new Date(command.deadlineAt).toISOString(),
+        progressTimeoutSeconds: command.progressTimeoutMs / 1000, claim: 'voluntary', execution: 'existing_cwd_only' };
+    }
+    if (['task.reassign', 'task.missed'].includes(command.op)) {
+      const result = await rpc('control_query', { channel: command.channel, view: 'tasks', entityID: command.taskID, limit: 1 });
+      const task = result.entries[0]; check(task, 409, 'TASK_NOT_FOUND');
+      if (command.op === 'task.reassign') {
+        check(['claimed', 'running', 'uncertain'].includes(task.status), 409, 'TASK_NOT_REASSIGNABLE');
+        check(task.admission === 'unadmitted' || task.stoppedEvidence || (task.status === 'claimed' && task.admission === 'none' && !task.dispatchIntentID), 409, 'STOP_EVIDENCE_REQUIRED');
+      }
+      if (command.op === 'task.missed') check(task.schedule && ['open', 'claimed'].includes(task.status), 409, 'TASK_NOT_SCHEDULED');
+      context.task = taskPrecondition(task);
+      context.proposal = { taskID: task.id, status: task.status, claimant: task.claimant, attempt: task.attempt, claimGeneration: task.claimGeneration,
+        admission: task.admission, dispatchIntentID: task.dispatchIntentID ?? null, stoppedEvidenceID: task.stoppedEvidence ?? null,
+        schedule: task.schedule ?? null, decision: command.op === 'task.reassign' ? 'Reopen unclaimed; no new participant is assigned and no native work is stopped.' : command.run ? 'Allow late eligibility only; native approvals, dependencies and capacity still apply.' : 'Skip this scheduled task; no native interruption is requested.' };
+    }
     if (command.op.startsWith('action.')) {
       const result = await rpc('control_query', { channel: command.channel, view: 'actions', entityID: command.actionID, limit: 1 });
       const action = result.entries[0]; check(action && action.status === 'awaiting_approval', 409, 'ACTION_NOT_PENDING');
@@ -95,8 +124,16 @@ export function createDashboard({ port = 47322, channels, loginSecret, brokerTok
         check(info.available && info.effectsEnabled && info.effectOperations.includes(action.operation), 409, 'EFFECT_NOT_ENABLED');
       }
       context.action = digest(JSON.stringify(action));
-      context.proposal = { operation: action.operation, target: action.target, messageID: action.messageID ?? null,
-        evidence: action.evidence, status: action.status };
+      context.proposal = { actionID: action.id, requester: action.requester, generation: action.generation,
+        policyRevision: action.policyRevision, operation: action.operation, target: action.target,
+        messageID: action.messageID ?? null, wakePolicy: action.wakePolicy ?? null,
+        admissionID: action.admissionID ?? null, recoveryEvidenceID: action.recoveryEvidenceID ?? null,
+        evidence: action.evidence, status: action.status,
+        effect: command.op === 'action.reject' ? 'Rejects this proposal without applying recovery.'
+          : action.operation === 'retry_delivery' ? 'Schedules recovery; native admission requires a separate receiver outcome.'
+          : action.operation === 'change_wake_policy' ? 'Changes subsequent adapter admission policy; native permissions remain authoritative.'
+          : action.operation === 'remove_member' ? 'Ends control roles and removes channel membership; does not stop native work.'
+          : 'Applies this broker operation only; native permissions remain authoritative.' };
     }
     return context;
   }
@@ -157,6 +194,14 @@ export function createDashboard({ port = 47322, channels, loginSecret, brokerTok
         const input = z.strictObject({ channel: Channel, commandID: z.string().uuid() }).parse(fields); scoped(input.channel);
         json(200, await rpc('control_receipt', input)); return;
       }
+      if (path === '/api/notification' && req.method === 'GET') {
+        const fields = {};
+        for (const [key, value] of target.searchParams) {
+          check(['channel', 'id'].includes(key) && target.searchParams.getAll(key).length === 1, 400, 'INVALID_QUERY'); fields[key] = value;
+        }
+        const input = z.strictObject({ channel: Channel, id: z.string().uuid() }).parse(fields); scoped(input.channel);
+        json(200, await rpc('control_notifications', input)); return;
+      }
       const view = /^\/api\/channels\/([^/]+)\/([^/]+)$/.exec(path);
       if (view && req.method === 'GET') {
         const channel = scoped(decodeURIComponent(view[1])), name = view[2]; check(views.has(name), 404, 'NOT_FOUND');
@@ -165,9 +210,9 @@ export function createDashboard({ port = 47322, channels, loginSecret, brokerTok
           check(['after', 'offset'].includes(key) && target.searchParams.getAll(key).length === 1 && /^(0|[1-9]\d*)$/.test(value), 400, 'INVALID_QUERY');
           params[key] = Number(value); check(Number.isSafeInteger(params[key]) && params[key] <= (key === 'offset' ? 100000 : Number.MAX_SAFE_INTEGER), 400, 'INVALID_QUERY');
         }
-        if (name === 'activity') {
+        if (['activity', 'notifications'].includes(name)) {
           check(params.offset === undefined, 400, 'INVALID_QUERY'); delete params.view;
-          json(200, await rpc('control_activity', params));
+          json(200, await rpc(name === 'activity' ? 'control_activity' : 'control_notifications', params));
         } else json(200, await rpc('control_query', params));
         return;
       }
@@ -185,7 +230,7 @@ export function createDashboard({ port = 47322, channels, loginSecret, brokerTok
         const preview = { id: randomUUID(), command, context, expiresAt: time + previewMs, state: 'ready' };
         owner.previews.set(preview.id, preview);
         json(200, { previewID: preview.id, command, current: context.current, proposal: context.proposal, expiresAt: preview.expiresAt,
-          notice: 'Confirm this exact broker command. Native permissions and approvals remain authoritative.' }); return;
+          notice: command.op === 'notification.ack' ? 'Mark only this notification as seen. This does not resolve an incident, accept a task, approve recovery or prove cleanup.' : 'Confirm this exact broker command. Native permissions and approvals remain authoritative.' }); return;
       }
       if (path === '/api/execute' && req.method === 'POST' && !target.search) {
         const { previewID } = Execute.parse(await body(req, 1024)), preview = owner.previews.get(previewID);
@@ -211,12 +256,19 @@ export function createDashboard({ port = 47322, channels, loginSecret, brokerTok
           // No await between the final session check and the actual native RPC
           // send. A reconnect must not admit a command for a replaced login.
           invoked = true;
-          const result = await client.rpc('control_command', { command: preview.command, expected: preview.context.channel });
+          const result = preview.command.op === 'notification.ack'
+            ? await client.rpc('control_notification_ack', { channel: preview.command.channel, id: preview.command.id, expected: preview.context.channel })
+            : await client.rpc('control_command', { command: preview.command, expected: preview.context.channel, ...(preview.context.task ? { expectedTask: preview.context.task } : {}) });
           preview.result = { commandID: preview.command.id, result }; preview.state = 'completed'; json(200, preview.result);
         } catch (error) {
           if (!invoked) { preview.state = 'stale'; throw error; }
           if (error.code === 'PRECONDITION_FAILED') {
             preview.state = 'stale'; json(409, { error: 'PREVIEW_STALE', commandID: preview.command.id }); return;
+          }
+          if (preview.command.op === 'task.create' && ['UNKNOWN_DEPENDENCY', 'DUPLICATE_DEPENDENCY', 'DEADLINE_IN_PAST'].includes(error.code)) {
+            // These explicit reducer refusals roll back before any task/receipt
+            // commit. A missing/lost response is still uncertain, never this path.
+            preview.state = 'stale'; json(409, { error: error.code, commandID: preview.command.id }); return;
           }
           preview.state = 'uncertain'; json(error.status || 503, { error: 'COMMAND_OUTCOME_UNCERTAIN', commandID: preview.command.id });
         }

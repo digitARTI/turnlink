@@ -2,12 +2,13 @@
 import { readdirSync, createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 
 const sessionId = process.argv[2];
 const messageId = process.argv[3];
 const when = Date.parse(process.argv[4]);
 if (!sessionId || !messageId || !Number.isFinite(when)) throw new Error('Usage: wake-evidence sessionId messageUUID createdAt');
-const root = 'C:\\Users\\Administrator\\.codex\\sessions';
+const root = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'sessions');
 function search(directory) {
   const files = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {

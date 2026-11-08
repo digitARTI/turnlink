@@ -106,7 +106,7 @@ test('activity exports include metadata and loss counters and survive archive re
   const { store, root } = storeFor(t, { telemetryLimit: 1 }); store.recordActivity(observation()); store.recordActivity(observation());
   const archives = new ControlArchives(join(root, 'exports')), id = randomUUID(); store.exportTo(archives, id, 1001);
   const rows = readFileSync(archives.path(id), 'utf8').trimEnd().split('\n').map(line => JSON.parse(line));
-  assert.equal(rows[0].schemaVersion, 5);
+  assert.equal(rows[0].schemaVersion, 36);
   assert.equal(rows.filter(r => r.kind === 'activity').length, 1);
   assert.equal(rows.find(r => r.kind === 'activity_status').value.rejected, 1);
   assert.deepEqual(new ControlArchives(join(root, 'exports')).describe(id), archives.describe(id));
@@ -117,11 +117,11 @@ test('schema 4 migration adds telemetry without changing control state, commands
   store.apply({ id: randomUUID(), channel: 'dev', op: 'channel.configure' }, { actor: { kind: 'operator' }, now: 1000, members: [] });
   const before = store.snapshot(), events = store.events('dev'), receipts = store.db.prepare('SELECT * FROM commands').all(); store.close();
   const db = new DatabaseSync(join(root, 'control', 'control.db'));
-  db.exec('DROP TABLE activity; DROP TABLE activity_meta; PRAGMA user_version=4;'); db.close();
+  db.exec('DROP TABLE notification_acks; DROP TABLE activity; DROP TABLE activity_meta; DROP TABLE adapter_health; PRAGMA user_version=4;'); db.close();
   const reopened = new ControlStore(join(root, 'control')); t.after(() => reopened.close());
   assert.deepEqual(reopened.snapshot(), before); assert.deepEqual(reopened.events('dev'), events);
   assert.deepEqual(reopened.db.prepare('SELECT * FROM commands').all(), receipts);
-  assert.equal(reopened.activityStatus().rows, 0); assert.equal(reopened.db.prepare('PRAGMA user_version').get().user_version, 5);
+  assert.equal(reopened.activityStatus().rows, 0); assert.equal(reopened.db.prepare('PRAGMA user_version').get().user_version, 36);
 });
 
 test('gateway protects pending/exposed messages, control evidence and open incidents without guessing after failure', t => {

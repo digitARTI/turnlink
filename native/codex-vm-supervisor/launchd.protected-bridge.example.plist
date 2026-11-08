@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>org.turnlink.protected-proof</string>
+  <key>Disabled</key><true/>
+  <key>ProgramArguments</key><array>
+    <string>/private/var/turnlink-vm-proof/bin/turnlink-protected-bridge</string><string>--start</string>
+  </array>
+  <key>UserName</key><string>_turnlinkvm</string>
+  <key>GroupName</key><string>_turnlinkvm</string>
+  <key>Umask</key><integer>63</integer>
+  <key>MachServices</key><dict><key>org.turnlink.protected-proof</key><true/></dict>
+</dict></plist>

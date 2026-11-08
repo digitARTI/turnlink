@@ -9,16 +9,30 @@
   "scripts": {
     "start": "node src/broker.js",
     "test": "node src/run-tests.js",
-    "test:control": "node --test test/control.test.js test/control-hardening.test.js test/control-broker.test.js test/control-effects.test.js test/control-storage.test.js test/control-telemetry.test.js test/worktree-transition.test.js test/worktree-snapshot.test.js test/opencode-control.test.js test/opencode-tasks.test.js test/codex-control.test.js test/codex-tasks.test.js test/codex-task-proxy.test.js test/codex-admission-fence.test.js",
+    "test:control": "node --test test/control.test.js test/control-hardening.test.js test/control-broker.test.js test/broker-rate-limit.test.js test/control-effects.test.js test/control-storage.test.js test/control-telemetry.test.js test/receiver-handoff.test.js test/worktree-snapshot.test.js test/opencode-control.test.js test/opencode-alerts.test.js test/opencode-tasks.test.js test/codex-control.test.js test/codex-runtime-version.test.js test/codex-tasks.test.js test/codex-task-proxy.test.js test/codex-admission-fence.test.js test/codex-cancellation-verifier-transport.test.js test/opencode-completion-verifier-transport.test.js test/opencode-endpoint-gate.test.js test/provider-establishment.test.js test/mcp-establishment.test.js",
+    "test:opencode-alerts": "node --test test/opencode-alerts.test.js test/opencode-tui-service.test.js",
     "control-admin": "node src/control-admin.js",
+    "manual-worktree": "node src/manual-managed-worktree.js",
     "dashboard": "node src/dashboard-server.js",
     "dashboard:build": "npm --prefix dashboard run build",
     "test:dashboard": "node --test test/dashboard.test.js",
+    "test:contained-mcp": "node --test test/codex-contained-mcp.test.js test/codex-contained-mcp-inventory.test.js test/codex-contained-mcp-recovery.test.js",
     "test:dashboard:browser": "npm --prefix dashboard run test:e2e",
     "test:worktrees": "node src/run-worktree-gates.js",
+    "test:worktree-lifecycle": "node --test test/worktree-lifecycle.test.js",
+    "test:managed-records": "node --test test/managed-worktree-records.test.js",
+    "test:worktree-host": "node --test test/worktree-host.test.js",
+    "test:health": "node --test test/adapter-health.test.js",
+    "test:notifications": "node --test test/control-notifications.test.js test/dashboard.test.js test/notification-watch.test.js",
     "check": "node src/check-source.js",
     "mcp": "node src/mcp.js",
-    "doctor": "node src/doctor.js"
+    "codex": "node src/codex-tui.js",
+    "doctor": "node src/doctor.js",
+    "operator-attention": "node src/operator-attention.js",
+    "test:attention": "node --test test/operator-attention.test.js test/windows-attention-setup.test.js test/attention-supervisor.test.js",
+    "test:storage": "node --test test/control-storage.test.js test/control-telemetry.test.js test/control-reclamation.test.js test/control-reclamation-service.test.js test/control-history-reclamation.test.js test/control-history-service.test.js",
+    "attention-service": "node deploy/render-attention-supervisor.js",
+    "verify:codex-desktop-isolation": "node deploy/verify-codex-desktop-isolation.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
@@ -31,6 +45,12 @@
   },
   "bin": {
     "turnlink-codex": "./src/codex-proxy.js",
-    "agent-channel-codex": "./src/codex-proxy.js"
+    "turnlink-codex-tui": "./src/codex-tui.js",
+    "agent-channel-codex": "./src/codex-proxy.js",
+    "turnlink-opencode-completion-owner": "./src/opencode-completion-owner.js",
+    "turnlink-opencode-source-recovery-owner": "./src/opencode-source-recovery-owner.js",
+    "turnlink-opencode-contained-host": "./src/opencode-contained-host.js",
+    "turnlink-opencode-endpoint-discovery": "./src/opencode-endpoint-discovery.js",
+    "turnlink-contained-mcp": "./src/codex-contained-mcp-stdio.js"
   }
 }

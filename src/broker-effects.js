@@ -18,6 +18,20 @@ export function applyBrokerEffect(previous, action, now) {
     if (!message || !Array.isArray(message.offered) || message.offered.includes(action.target) ||
       message.delivered.includes(action.target) || message.cancelled[action.target]) outcome = 'failed';
     else message.cancelled[action.target] = 'control_cancelled_unoffered';
+  } else if (action.operation === 'remove_member') {
+    for (const message of state.messages) if (message.recipients.includes(action.target) && !message.delivered.includes(action.target)) message.cancelled[action.target] = 'control_removed_member';
+    delete state.agents[action.target];
+    if (state.deliveryPauses) delete state.deliveryPauses[action.target];
+    if (state.wakePolicies) delete state.wakePolicies[action.target];
+  } else if (action.operation === 'change_wake_policy') {
+    if (!['steer', 'queue', 'paused'].includes(action.wakePolicy)) outcome = 'failed';
+    else { state.wakePolicies ??= {}; state.wakePolicies[action.target] = { channel: action.channel, policy: action.wakePolicy, actionID: action.id }; }
+  } else if (action.operation === 'retry_delivery') {
+    const message = state.messages.find(m => m.id === action.messageID && m.channel === action.channel && m.recipients.includes(action.target));
+    if (!message || message.delivered.includes(action.target) || message.cancelled[action.target] ||
+      !['known_unadmitted', 'native_idempotent'].includes(action.evidence) || !action.recoveryEvidenceID ||
+      (action.evidence === 'native_idempotent' && (!action.target.startsWith('opencode:') || !action.admissionID))) outcome = 'failed';
+    else { state.deliveryRetries ??= {}; state.deliveryRetries[action.id] = { channel: action.channel, target: action.target, messageID: action.messageID }; }
   } else {
     state.deliveryPauses ??= {};
     if (action.operation === 'pause_delivery') state.deliveryPauses[action.target] = { channel: action.channel, actionID: action.id };

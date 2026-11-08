@@ -169,7 +169,11 @@ test('only the operator can inspect detailed storage, subscribe to alerts or cre
 });
 
 test('operator storage watches alert only on severity changes, work without a master, and never wake participants', async t => {
-  const f = await brokerFixture(t, { commandLimit: 5 }); const alerts = [], hostAlerts = [];
+  // This case tests command-quota severity transitions. Real machine disk
+  // pressure has its own test and can legitimately dominate overall severity.
+  const f = await brokerFixture(t, { commandLimit: 5,
+    diskStats: () => ({ bsize: 4096, blocks: 262144, bavail: 131072 }),
+  }); const alerts = [], hostAlerts = [];
   f.admin.on('control_storage', frame => alerts.push(frame.status)); f.host.on('control_storage', frame => hostAlerts.push(frame));
   await f.admin.request('control_storage_watch'); await f.host.connect();
   for (let i = 0; i < 4; i++) await f.configure();
