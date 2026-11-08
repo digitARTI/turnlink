@@ -15,7 +15,9 @@ import { ChannelClient } from '../src/client.js';
 import { downloadControlExport } from '../src/control-export-client.js';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
-const rootFor = t => { const root = privateTemp(join(tmpdir(), 'turnlink-control-storage-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root; };
+const roots = new Set();
+test.after(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
+const rootFor = () => { const root = privateTemp(join(tmpdir(), 'turnlink-control-storage-')); roots.add(root); return root; };
 const context = { actor: { kind: 'operator' }, now: 1000000, members: [] };
 const configure = (store, id = randomUUID()) => store.apply({ id, channel: 'dev', op: 'channel.configure' }, context);
 const records = () => function* () { yield { kind: 'state', value: { version: 1, lastNow: 0, channels: [], tasks: [], actions: [], incidents: [], evidence: [], previews: [], transitions: [] } }; };
