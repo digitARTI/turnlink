@@ -4,10 +4,10 @@ let heldAdmission;
 createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line);
   if (request.method === 'initialize') send({ id: request.id, result: { userAgent: 'fixture' } });
-  else if (request.method === 'thread/start') send({ id: request.id, result: { thread: { id: request.params.fixtureId || 'thread-b' } } });
+  else if (['thread/start', 'thread/resume'].includes(request.method)) send({ id: request.id, result: { thread: { id: request.params.fixtureId || 'thread-b' } } });
   else if (request.method === 'turn/start') {
     const text = request.params.input?.[0]?.text || '';
-    if (text.includes('delay-admission')) heldAdmission = { id: request.id, result: { turn: { id: 'turn-active' } } };
+    if (text.includes('delay-admission') || (process.env.TURNLINK_FIXTURE_DELAY_ROLE === '1' && text.includes('Turnlink supplemental master role'))) heldAdmission = { id: request.id, result: { turn: { id: 'turn-active' } } };
     else if (!text.includes('never-respond')) send({ id: request.id, result: { turn: { id: 'turn-active' } } });
     send({ method: 'turn/started', params: { threadId: request.params.threadId, turn: { id: 'turn-active' } } });
     send({ method: 'fixture/received', params: { method: request.method, ...request.params } });
@@ -17,7 +17,7 @@ createInterface({ input: process.stdin }).on('line', line => {
   } else if (request.method === 'fixture/release-admission') {
     if (heldAdmission) { send(heldAdmission); heldAdmission = null; }
     send({ id: request.id, result: {} });
-  } else if (request.method === 'fixture/finish') {
+  } else if (request.method === 'fixture/finish' || request.method === 'turn/interrupt') {
     send({ id: request.id, result: {} });
     send({ method: 'turn/completed', params: { threadId: request.params.threadId, turn: { id: 'turn-active', status: 'completed' } } });
   } else if (request.method === 'fixture/approval') {

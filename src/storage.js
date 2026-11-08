@@ -1,6 +1,6 @@
 import { constants, openSync, closeSync, writeFileSync, fsyncSync, renameSync, unlinkSync,
-  mkdirSync, lstatSync, fstatSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+  mkdirSync, mkdtempSync, lstatSync, fstatSync, readFileSync } from 'node:fs';
+import { dirname, toNamespacedPath } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import lockfile from 'proper-lockfile';
 import { execFileSync } from 'node:child_process';
@@ -11,12 +11,27 @@ const verifiedWindows = new Set();
 function windowsPermissions(path, created = false) {
   if (process.platform !== 'win32' || verifiedWindows.has(path)) return;
   const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const env = { ...process.env };
+  // Use only the matching Windows PowerShell built-in modules. A pwsh parent
+  // can otherwise supply incompatible modules or a slow profile lookup path.
+  for (const key of Object.keys(env)) if (['PSMODULEPATH', 'PSMODULEANALYSISCACHEPATH'].includes(key.toUpperCase())) delete env[key];
+  // Module auto-discovery is disabled; the helper imports its required system
+  // assemblies explicitly from $PSHOME.
+  env.PSModulePath = '';
   try {
     execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
-      fileURLToPath(new URL('./windows-permissions.ps1', import.meta.url)), '-Path', path, '-Created', created ? 'true' : 'false'],
-    { windowsHide: true, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
-    verifiedWindows.add(path);
+      fileURLToPath(new URL('./windows-permissions.ps1', import.meta.url)), '-Path', toNamespacedPath(path), '-Created', created === true ? 'true' : created === 'file' ? 'file' : 'false'],
+    { env, windowsHide: true, timeout: 10000, stdio: ['ignore', 'ignore', 'ignore'] });
+    if (created !== 'file') verifiedWindows.add(path);
   } catch { throw new Error('Private Windows path needs owner/administrator/SYSTEM-only ACLs'); }
+}
+// Only a newly and exclusively created directory may have its ACL initialized.
+// Existing caller-supplied directories retain fail-closed verification.
+export function privateTemp(prefix) {
+  const path = mkdtempSync(prefix);
+  windowsPermissions(path, true);
+  privateDirectory(path);
+  return path;
 }
 
 export function privateDirectory(path) {
@@ -27,6 +42,15 @@ export function privateDirectory(path) {
     throw new Error('Private directory must belong to this user and have mode 0700');
   }
   windowsPermissions(path, created !== undefined);
+}
+// Metadata-only verification for binary state such as SQLite; never decode it as a credential string.
+export function assertPrivateFile(path) {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Private path must be a regular file');
+  if (process.platform !== 'win32' && ((stat.mode & 0o077) || stat.uid !== process.getuid())) {
+    throw new Error('Private file must belong to this user and have mode 0600');
+  }
+  windowsPermissions(path); return stat;
 }
 export function readPrivate(path, maxBytes = 64 * 1024 * 1024) {
   const initial = lstatSync(path);
@@ -55,6 +79,7 @@ export function atomicWrite(path, value) {
   let fd;
   try {
     fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    if (process.platform === 'win32' && !verifiedWindows.has(dirname(path))) windowsPermissions(temporary, 'file');
     writeFileSync(fd, value); fsyncSync(fd); closeSync(fd); fd = undefined;
     renameSync(temporary, path);
     // Windows does not support fsync on directories. Unix rename durability does.
